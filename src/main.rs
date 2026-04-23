@@ -20,7 +20,7 @@ fn main() -> anyhow::Result<()> {
         .build()?;
 
     if cli.should_start_interactive() {
-        return run_interactive_session(&cli, &cwd, &runtime);
+        return run_interactive_session(&cli, &cwd, runtime);
     }
 
     match cli.command.clone().expect("checked above") {
@@ -102,7 +102,7 @@ fn main() -> anyhow::Result<()> {
 fn run_interactive_session(
     cli: &Cli,
     cwd: &Path,
-    runtime: &tokio::runtime::Runtime,
+    runtime: tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
     let resolved = resolve_provider_session(cli.provider.to_provider(), &cli.model)?;
     let display_model = resolved.display_model.clone();
@@ -126,5 +126,5 @@ fn run_interactive_session(
         }
     }
 
-    charm::tui::app::run_session_tui(&mut session_runtime, runtime, events)
+    charm::tui::app::run_session_tui(session_runtime, runtime, events)
 }

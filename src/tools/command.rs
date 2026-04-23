@@ -1,6 +1,7 @@
 use crate::core::ToolResult;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::process::Stdio;
 use std::sync::Mutex;
 use tokio::process::Command;
 use uuid::Uuid;
@@ -69,23 +70,7 @@ pub async fn run_command(args: Value, default_cwd: &std::path::Path) -> anyhow::
         });
     }
 
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(&effective_command)
-        .current_dir(&cwd)
-        .kill_on_drop(true);
-    let mut child = cmd.spawn()?;
-
-    let cid = command_id.clone();
-    tokio::spawn(async move {
-        let status = child.wait().await;
-        let mut store = COMMAND_STORE.lock().unwrap();
-        if let Some(entry) = store.get_mut(&cid) {
-            entry.running = false;
-            entry.exit_code = status.ok().and_then(|s| s.code());
-        }
-    });
-
+    // Insert entry FIRST to avoid race condition with background task
     {
         let mut store = COMMAND_STORE.lock().unwrap();
         store.insert(
@@ -98,6 +83,29 @@ pub async fn run_command(args: Value, default_cwd: &std::path::Path) -> anyhow::
             },
         );
     }
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(&effective_command)
+        .current_dir(&cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = cmd.spawn()?;
+
+    let cid = command_id.clone();
+    tokio::spawn(async move {
+        let output = child.wait_with_output().await;
+        let mut store = COMMAND_STORE.lock().unwrap();
+        if let Some(entry) = store.get_mut(&cid) {
+            entry.running = false;
+            if let Ok(out) = output {
+                entry.exit_code = out.status.code();
+                entry.stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                entry.stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            }
+        }
+    });
 
     Ok(ToolResult {
         success: true,
@@ -159,4 +167,136 @@ pub async fn poll_command(args: Value) -> anyhow::Result<ToolResult> {
             serde_json::json!({ "running": entry.running, "exit_code": entry.exit_code }),
         ),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn nonblocking_command_starts_in_running_state() {
+        let args = serde_json::json!({
+            "command": "sleep 5",
+            "blocking": false
+        });
+        let cwd = std::env::current_dir().unwrap();
+
+        let result = run_command(args, &cwd).await.unwrap();
+        assert!(result.success);
+
+        let meta = result.metadata.unwrap();
+        let command_id = meta["command_id"].as_str().unwrap();
+
+        // Poll immediately - should be running
+        let poll_args = serde_json::json!({"command_id": command_id});
+        let poll_result = poll_command(poll_args).await.unwrap();
+
+        let poll_meta = poll_result.metadata.unwrap();
+        assert!(poll_meta["running"].as_bool().unwrap());
+        assert!(poll_meta["exit_code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn nonblocking_command_captures_stdout_after_completion() {
+        let args = serde_json::json!({
+            "command": "echo 'hello world'",
+            "blocking": false
+        });
+        let cwd = std::env::current_dir().unwrap();
+
+        let result = run_command(args, &cwd).await.unwrap();
+        let command_id = result.metadata.unwrap()["command_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Wait for command to complete
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Poll after completion
+        let poll_args = serde_json::json!({"command_id": command_id});
+        let poll_result = poll_command(poll_args).await.unwrap();
+
+        let poll_meta = poll_result.metadata.unwrap();
+        assert!(!poll_meta["running"].as_bool().unwrap());
+        assert_eq!(poll_meta["exit_code"].as_i64(), Some(0));
+        assert!(poll_result.output.contains("hello world"));
+    }
+
+    #[tokio::test]
+    async fn nonblocking_command_captures_stderr() {
+        let args = serde_json::json!({
+            "command": "echo 'error msg' >&2",
+            "blocking": false
+        });
+        let cwd = std::env::current_dir().unwrap();
+
+        let result = run_command(args, &cwd).await.unwrap();
+        let command_id = result.metadata.unwrap()["command_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Wait for command to complete
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Poll after completion
+        let poll_args = serde_json::json!({"command_id": command_id});
+        let poll_result = poll_command(poll_args).await.unwrap();
+
+        assert!(poll_result.output.contains("error msg"));
+        assert!(poll_result.output.contains("---stderr---"));
+    }
+
+    #[tokio::test]
+    async fn nonblocking_command_reports_failed_exit_code() {
+        let args = serde_json::json!({
+            "command": "exit 42",
+            "blocking": false
+        });
+        let cwd = std::env::current_dir().unwrap();
+
+        let result = run_command(args, &cwd).await.unwrap();
+        let command_id = result.metadata.unwrap()["command_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Wait for command to complete
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Poll after completion
+        let poll_args = serde_json::json!({"command_id": command_id});
+        let poll_result = poll_command(poll_args).await.unwrap();
+
+        let poll_meta = poll_result.metadata.unwrap();
+        assert!(!poll_meta["running"].as_bool().unwrap());
+        assert_eq!(poll_meta["exit_code"].as_i64(), Some(42));
+    }
+
+    #[tokio::test]
+    async fn blocking_command_works_correctly() {
+        let args = serde_json::json!({
+            "command": "echo 'blocking test'",
+            "blocking": true
+        });
+        let cwd = std::env::current_dir().unwrap();
+
+        let result = run_command(args, &cwd).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("blocking test"));
+        let meta = result.metadata.unwrap();
+        assert_eq!(meta["exit_code"].as_i64(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn poll_command_returns_error_for_invalid_id() {
+        let args = serde_json::json!({"command_id": "invalid-id-does-not-exist"});
+        let result = poll_command(args).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
 }

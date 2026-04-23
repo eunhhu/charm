@@ -70,11 +70,27 @@ pub struct DiagnosticSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LspServerSnapshot {
+    pub language: String,
+    pub command: String,
+    pub ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SymbolJump {
+    pub name: String,
+    pub file_path: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct LspSnapshot {
     pub ready: bool,
     pub active_roots: Vec<String>,
     pub diagnostics: Vec<DiagnosticSummary>,
     pub symbol_provider: String,
+    pub servers: Vec<LspServerSnapshot>,
+    pub symbol_jumps: Vec<SymbolJump>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,6 +154,14 @@ pub enum RuntimeEvent {
     MessageDelta {
         role: String,
         content: String,
+    },
+    StreamDelta {
+        role: String,
+        content: String,
+        model: Option<String>,
+    },
+    StreamDone {
+        model: Option<String>,
     },
     RouterStateChanged {
         intent: RouterIntent,

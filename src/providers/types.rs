@@ -1,6 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    pub id: String,
+    pub display_name: String,
+    pub provider: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -17,6 +24,8 @@ pub struct ChatRequest {
     pub reasoning: Option<ReasoningConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

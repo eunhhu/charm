@@ -116,6 +116,11 @@ impl ToolParser {
                     })
                     .unwrap_or_default(),
             }),
+            "poll_command" => Some(ToolCall::PollCommand {
+                command_id: args["command_id"].as_str()?.to_string(),
+                output_priority: parse_output_priority(args["output_priority"].as_str()),
+                max_lines: args["max_lines"].as_u64().map(|v| v as usize),
+            }),
             _ => None,
         }
     }
@@ -152,5 +157,13 @@ fn parse_memory_scope(scope: Option<&str>) -> crate::core::MemoryScope {
         Some("project") => crate::core::MemoryScope::Project,
         Some("user") => crate::core::MemoryScope::User,
         _ => crate::core::MemoryScope::Session,
+    }
+}
+
+fn parse_output_priority(priority: Option<&str>) -> crate::core::OutputPriority {
+    match priority {
+        Some("top") => crate::core::OutputPriority::Top,
+        Some("split") => crate::core::OutputPriority::Split,
+        _ => crate::core::OutputPriority::Bottom,
     }
 }

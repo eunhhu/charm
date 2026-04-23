@@ -1,4 +1,6 @@
 pub mod app;
+pub mod event;
+pub mod theme;
 
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};

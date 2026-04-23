@@ -153,7 +153,7 @@ impl PromptAssembler {
         ));
 
         parts.push(format!(
-            "## LSP\n- Ready: {}\n- Roots: {}\n- Diagnostics: {}\n- Symbols: {}\n",
+            "## LSP\n- Ready: {}\n- Roots: {}\n- Diagnostics: {}\n- Symbols: {}\n- Servers: {}\n- Jumps: {}\n",
             lsp.ready,
             if lsp.active_roots.is_empty() {
                 "none".to_string()
@@ -161,7 +161,26 @@ impl PromptAssembler {
                 lsp.active_roots.join(", ")
             },
             lsp.diagnostics.len(),
-            lsp.symbol_provider
+            lsp.symbol_provider,
+            if lsp.servers.is_empty() {
+                "none".to_string()
+            } else {
+                lsp.servers
+                    .iter()
+                    .map(|server| format!("{}:{}:{}", server.language, server.command, server.ready))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            if lsp.symbol_jumps.is_empty() {
+                "none".to_string()
+            } else {
+                lsp.symbol_jumps
+                    .iter()
+                    .take(5)
+                    .map(|jump| format!("{}@{}:{}", jump.name, jump.file_path, jump.line))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
         ));
 
         parts.push(format!(

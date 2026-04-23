@@ -130,6 +130,7 @@ impl AgentRunner {
                     None
                 },
                 parallel_tool_calls: Some(true),
+                stream: Some(false),
             };
 
             let spinner = tui::Spinner::new("Thinking...");

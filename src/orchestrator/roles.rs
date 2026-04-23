@@ -57,6 +57,7 @@ Respond in JSON format:
             max_tokens: Some(4000),
             reasoning: None,
             parallel_tool_calls: None,
+            stream: Some(false),
         };
 
         let (response, _) = self.client.chat(request).await?;
@@ -129,6 +130,7 @@ Rules:
             max_tokens: Some(2000),
             reasoning: None,
             parallel_tool_calls: None,
+            stream: Some(false),
         };
 
         let (response, _) = self.client.chat(request).await?;

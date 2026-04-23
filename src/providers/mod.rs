@@ -7,4 +7,5 @@ pub mod openai;
 pub mod openai_codex;
 pub mod openai_compatible;
 pub mod openrouter;
+pub mod sse;
 pub mod types;

@@ -1,18 +1,24 @@
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 use super::openai_compatible::OpenAiCompatibleClient;
-use super::types::{ChatRequest, ChatResponse, Message, Usage};
+use super::sse::StreamChunk;
+use super::types::{ChatRequest, ChatResponse, Message, ModelInfo, Usage};
 
 #[derive(Clone)]
 pub struct AnthropicClient(OpenAiCompatibleClient);
 
 impl AnthropicClient {
     pub fn new(api_key: String) -> Self {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static("2023-06-01"),
+        );
         Self(OpenAiCompatibleClient::new(
             "Anthropic",
             api_key,
             "https://api.anthropic.com/v1",
-            HeaderMap::new(),
+            headers,
         ))
     }
 
@@ -22,5 +28,16 @@ impl AnthropicClient {
 
     pub async fn chat_raw(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
         self.0.chat_raw(request).await
+    }
+
+    pub async fn chat_stream(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>> {
+        self.0.chat_stream(request).await
+    }
+
+    pub async fn list_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        self.0.list_models().await
     }
 }
