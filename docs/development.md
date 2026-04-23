@@ -45,6 +45,22 @@ src/
 └── tui/                # 터미널 UI
 ```
 
+## 설계 기준 문서
+
+제품 철학과 장기 설계 방향은 다음 문서를 기준으로 합니다.
+
+- `docs/charm-strategy.md`: Charm의 목표, 철학, 차별성, tool-first/reference-first/token-minified 전략
+- `docs/devin-windsurf-harness-research.md`: Devin/Windsurf 하네스 분석과 Charm 이식 방향
+- `OPTIMIZATION_ROADMAP.md`: 구현 우선순위와 성능 목표
+
+코드 변경이 다음 영역에 닿으면 관련 문서도 같이 업데이트하세요.
+
+- `PromptAssembler`, `SessionRuntime`, `ToolRegistry`: prompt/compiler/tool policy 문서 확인
+- `indexer`, `retrieval`: evidence/context 전략 확인
+- `providers`, `runtime/mcp`: reference-first와 MCP 전략 확인
+- `tools/command`, `tools/search`, `tools/test_runner`: TokenSaver/minification 전략 확인
+- `orchestrator`: delegation 전략 확인
+
 ## 의존성
 
 ### 핵심
@@ -97,3 +113,5 @@ RUST_LOG=debug charm ...
 1. 새로운 provider 추가 시 `providers/factory.rs`에 등록
 2. 새로운 도구 추가 시 `tools/mod.rs`에 등록
 3. CLI 변경 시 `README.md`와 `docs/` 업데이트
+4. 외부 API/SDK 동작을 구현할 때는 공식 문서나 Context7 같은 reference source를 확인하고 source URL을 PR/문서/trace에 남기기
+5. 코딩 작업 자동화 기능은 raw output 보존과 model-facing minified view 분리를 고려하기

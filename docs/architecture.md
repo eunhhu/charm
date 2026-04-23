@@ -4,6 +4,14 @@
 
 Charm은 모듈식 설계를 따르며, 각 컴포넌트는 명확한 책임을 가집니다.
 
+장기적으로 Charm은 단순한 대화형 코딩 CLI가 아니라 evidence-first local agent harness를 지향합니다. 핵심 철학은 `docs/charm-strategy.md`에 정의되어 있으며, 아키텍처는 다음 원칙을 중심으로 진화합니다.
+
+- 도구 호출은 기본값이며, 생략은 정책 gate가 판단합니다.
+- 외부 API와 프레임워크 작업은 Context7 같은 docs MCP와 공식 레퍼런스를 우선합니다.
+- 추상적인 요청은 실행 전 task contract로 구체화합니다.
+- raw tool output은 trace에 보존하고, prompt에는 minified view만 전달합니다.
+- 모든 편집은 evidence와 verification으로 추적 가능해야 합니다.
+
 ## 모듈 구조
 
 ### `cli` (`src/cli.rs`)
@@ -89,6 +97,46 @@ Charm은 모듈식 설계를 따르며, 각 컴포넌트는 명확한 책임을 
 3. Session Runtime 부트 (TUI + Agent 초기화)
 4. Agent Loop: LLM 호출 → 도구 선택 → 실행 → 결과 → LLM
 5. TUI에 결과 표시
+
+## 목표 하네스 흐름
+
+현재 구현은 위 기본 흐름을 따르지만, 최종형은 다음 하네스 레이어를 목표로 합니다.
+
+```
+[CLI/TUI]
+   ↓
+[SessionRuntime]
+   ↓
+[IntentRouter]
+   ↓
+[TaskConcretizer]
+   ↓
+[ReferenceGate + ReferenceBroker]
+   ↓
+[FastContextWorker]
+   ↓
+[TokenSaver]
+   ↓
+[PromptCompiler]
+   ↓
+[ModelClient ↔ ToolRuntime]
+   ↓
+[VerificationGate]
+   ↓
+[AgentTraceStore]
+   ↓
+[SessionInsights]
+```
+
+### 핵심 목표 컴포넌트
+
+- **TaskConcretizer**: 사용자 요청을 objective, scope, acceptance, verification, side effects가 있는 task contract로 변환합니다.
+- **ReferenceBroker**: Context7, local package source, official docs, GitHub issues, StackOverflow 등을 통해 reference pack을 만듭니다.
+- **FastContextWorker**: repo 내부 증거를 file/line/symbol 단위로 수집합니다.
+- **TokenSaver**: command output, test log, docs, search results, code snippets를 모델용 minified view로 변환합니다.
+- **PromptCompiler**: rules, memories, references, evidence, plan, tool policy를 typed prompt section으로 컴파일합니다.
+- **AgentTraceStore**: raw output, evidence, tool calls, edits, tests, references를 연결해 audit/replay를 가능하게 합니다.
+- **SessionInsights**: 반복 실패, 놓친 context, 필요한 rule/workflow/memory 후보를 추출합니다.
 
 ## 주요 디자인 패턴
 

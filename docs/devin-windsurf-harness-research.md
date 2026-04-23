@@ -25,6 +25,27 @@ Charm should therefore optimize around:
 4. A trace store that connects user intent, tool calls, edits, tests, and outcomes.
 5. Delegation primitives that can run local or remote child agents with isolated state.
 
+## Charm Philosophy Addendum
+
+Charm's product direction is not "start small and add more context when the model asks." The intended direction is:
+
+```text
+Start from the full 10-level engineering workflow,
+then subtract unnecessary work safely through gates and token-minified views.
+```
+
+This means Charm should default to:
+
+- tool-first execution,
+- reference-first API and framework work,
+- task concretization before implementation,
+- token-minified prompt views,
+- and trace-first auditability.
+
+The model should not be responsible for remembering current APIs, deciding from scratch whether tools are needed, or silently guessing vague scope. The harness should make those decisions explicit.
+
+For the canonical product philosophy, see `docs/charm-strategy.md`.
+
 ## Product Model Comparison
 
 | Dimension | Windsurf Cascade | Devin |
@@ -77,18 +98,23 @@ A competitive harness should run this loop:
 ```text
 1. Ingest user input
 2. Classify intent: explore / plan / implement / verify
-3. Build workspace snapshot
-4. Activate rules, skills, workflows, memories
-5. Run fast context retrieval if task needs code evidence
-6. Compile prompt layers under token budget
-7. Call model
-8. Execute tool calls with risk policy and checkpoints
-9. Update plan, trace, session, and memory
-10. Verify with tests/checks when behavior changed
-11. Summarize outcome and next action
+3. Concretize vague work into a task contract
+4. Decide whether tools can be safely skipped
+5. Build workspace snapshot
+6. Activate rules, skills, workflows, memories
+7. Run fast context retrieval if task needs code evidence
+8. Run reference lookup if task touches external APIs, libraries, or known errors
+9. Compile prompt layers under token budget
+10. Call model
+11. Execute tool calls with risk policy and checkpoints
+12. Update plan, trace, session, and memory
+13. Verify with tests/checks when behavior changed
+14. Summarize outcome and next action
 ```
 
 Key point: retrieval should not be left entirely to the main model. A small retrieval worker can find evidence faster and cheaper, then pass a compact evidence pack into the main reasoning turn.
+
+Reference lookup should follow the same principle. If a problem depends on current package behavior, official docs, Context7 snippets, package source, changelogs, or issue precedents should be brought in before repeated guessing.
 
 ## Context System Design
 
@@ -123,6 +149,44 @@ Output shape:
   "misses": ["areas searched but not found"],
   "recommended_next_reads": []
 }
+```
+
+### Reference Broker
+
+Purpose: retrieve verified external knowledge when model pretraining is likely stale or insufficient.
+
+Sources, in priority order:
+
+1. Current repository source.
+2. Installed package source and type definitions.
+3. Official docs through Context7 or equivalent docs MCP.
+4. Official GitHub issues, discussions, changelogs, and migration guides.
+5. StackOverflow and reputable community fixes.
+6. Model pretraining as last-resort background knowledge.
+
+Reference lookup is required for:
+
+- unfamiliar library or framework APIs,
+- dependency upgrades and migrations,
+- SDK/provider-specific behavior,
+- toolchain/build/compiler errors,
+- package-specific error signatures,
+- and any debugging task that already failed twice locally.
+
+Output should be a `ReferencePack`, not raw documentation spam:
+
+```text
+ReferencePack:
+  source_kind: official_docs | github_issue | stackoverflow | package_source
+  library: package or framework name
+  version: resolved version when available
+  query: lookup query
+  relevant_rules: exact rules or API behavior
+  minimal_examples: short verified snippets
+  caveats: known pitfalls or version changes
+  anti_patterns: deprecated or wrong approaches
+  source_refs: URLs, doc IDs, issue links
+  confidence: high | medium | low
 ```
 
 ### Codemap
@@ -298,7 +362,49 @@ Minimal trace schema:
 
 ## Charm Implementation Roadmap
 
-### Phase 1: Prompt Compiler
+### Phase 1: Task Concretizer
+
+Add a task contract layer before prompt compilation:
+
+```text
+Objective
+Scope
+Repo anchors
+Acceptance
+Verification
+Side effects
+Assumptions
+Open questions
+Execution depth
+```
+
+The concretizer should score abstraction and decide whether to ask a high-leverage question, inspect the repo, assume conservatively, or proceed.
+
+### Phase 2: Reference Broker
+
+Add Context7 or equivalent docs MCP as a first-class provider.
+
+Required behavior:
+
+- Resolve library/package names and versions.
+- Fetch current docs/examples when external API behavior matters.
+- Search official issues/changelogs before repeated blind debugging.
+- Compile raw findings into `ReferencePack`.
+- Preserve source refs in trace.
+
+### Phase 3: Token Saver
+
+Add a token-saver layer between every data source and the prompt compiler.
+
+Required behavior:
+
+- Store raw outputs in trace/storage.
+- Create minified model-facing views.
+- Preserve line numbers, spans, error messages, API signatures, and source refs.
+- Deduplicate repeated tool output and search results.
+- Enforce prompt section budgets.
+
+### Phase 4: Prompt Compiler
 
 Replace ad hoc prompt assembly with typed sections:
 
@@ -321,7 +427,7 @@ Required behavior:
 - Provider-specific rendering.
 - Test snapshots for compiled prompts.
 
-### Phase 2: Fast Context Worker
+### Phase 5: Fast Context Worker
 
 Add a worker that returns structured evidence from search/index/LSP.
 
@@ -333,7 +439,7 @@ Required behavior:
 - Separate exact evidence from inferred relevance.
 - No vague summaries when exact snippets fit budget.
 
-### Phase 3: Rules, Skills, Workflows
+### Phase 6: Rules, Skills, Workflows
 
 Add registries:
 
@@ -343,7 +449,7 @@ Add registries:
 
 Keep their activation models separate.
 
-### Phase 4: Agent Trace Store
+### Phase 7: Agent Trace Store
 
 Persist traces under `.charm/traces`.
 
@@ -354,7 +460,7 @@ Required behavior:
 - Store command exit status and output hash.
 - Store edit summaries and file paths.
 
-### Phase 5: Delegation Controller
+### Phase 8: Delegation Controller
 
 Upgrade the current broker into a robust child-session manager.
 
@@ -366,7 +472,7 @@ Required behavior:
 - Result merge.
 - Final verification gate.
 
-### Phase 6: Session Insights
+### Phase 9: Session Insights
 
 After completion, generate:
 
@@ -405,4 +511,3 @@ Do not auto-commit durable memories without review.
 - SWE-grep: https://cognition.ai/blog/swe-grep
 - Devin API overview: https://docs.devin.ai/api-reference/overview
 - Devin MCP: https://docs.devin.ai/work-with-devin/devin-mcp
-
