@@ -1,6 +1,6 @@
 use crate::agent::provider_prompts::ProviderPrompts;
 use crate::agent::rules::RulesLoader;
-use crate::core::{ContextStack, WorkspaceState};
+use crate::core::WorkspaceState;
 use crate::harness::{MemoryManager, PlanManager};
 use crate::runtime::types::{
     AutonomyLevel, LspSnapshot, McpSnapshot, RouterIntent, WorkspacePreflight,

@@ -1,5 +1,5 @@
 use crate::indexer::types::{Index, Symbol};
-use tree_sitter::{Node, Parser, Query, QueryCursor};
+use tree_sitter::{Node, Parser};
 
 pub struct Indexer;
 

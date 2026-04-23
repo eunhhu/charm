@@ -720,7 +720,6 @@ impl SessionApp {
     }
 
     pub async fn fetch_available_models(&mut self) {
-        use crate::providers::client::ProviderClient;
         use crate::providers::factory::{Provider, resolve_provider_auth};
 
         let providers = [
@@ -1814,7 +1813,6 @@ fn style_line(line: &str, base_color: ratatui::style::Color, theme: &Theme) -> V
         )];
     }
     if trimmed.starts_with('`') && trimmed.ends_with('`') && trimmed.len() > 2 {
-        let inner = &trimmed[1..trimmed.len() - 1];
         return vec![Span::styled(
             trimmed.to_string(),
             Style::default().fg(theme.accent),

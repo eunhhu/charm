@@ -1,7 +1,7 @@
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 
-use super::sse::{StreamChunk, accumulate_stream_to_response, parse_sse_line};
+use super::sse::{StreamChunk, parse_sse_line};
 use super::types::{ChatRequest, ChatResponse, Message, ModelInfo, Usage};
 
 #[derive(Debug, Deserialize)]

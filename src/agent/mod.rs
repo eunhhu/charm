@@ -5,3 +5,4 @@ pub mod prompt;
 pub mod provider_prompts;
 pub mod rules;
 pub mod runner;
+pub mod task_concretizer;

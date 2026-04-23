@@ -1,5 +1,5 @@
 use crate::core::ToolResult;
-use crate::indexer::{store::IndexStore, types::Index};
+use crate::indexer::store::IndexStore;
 use serde_json::Value;
 
 pub async fn semantic_search(args: Value, cwd: &std::path::Path) -> anyhow::Result<ToolResult> {

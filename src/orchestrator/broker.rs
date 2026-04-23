@@ -1,6 +1,6 @@
 use crate::agent::runner::AgentRunner;
 use crate::orchestrator::types::{
-    Subtask, SubtaskResult, TaskDecomposition, Verdict, Verification,
+    Subtask, SubtaskResult, TaskDecomposition,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -32,7 +32,7 @@ impl Broker {
                 subtask.id, subtask.description
             );
 
-            let mut retries = 0;
+            let _retries = 0;
             loop {
                 let task_text = format!("[Subtask {}] {}", subtask.id, subtask.description);
                 let subtask_results = runner.run_task(&task_text).await?;

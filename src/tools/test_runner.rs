@@ -137,7 +137,7 @@ pub async fn run_tests(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> {
     })
 }
 
-pub async fn analyze_test_results(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> {
+pub async fn analyze_test_results(args: Value, _cwd: &Path) -> anyhow::Result<ToolResult> {
     let test_output = args
         .get("output")
         .and_then(|v| v.as_str())

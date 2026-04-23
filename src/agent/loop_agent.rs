@@ -1,5 +1,4 @@
 use crate::core::{ToolCall, ToolResult};
-use crate::harness::{CheckpointManager, PlanManager};
 use crate::tools::ToolRegistry;
 
 pub struct AgentLoop {

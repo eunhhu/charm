@@ -2,7 +2,7 @@ use crate::agent::parser::ToolParser;
 use crate::agent::prompt::{AgentMode, PromptAssembler};
 use crate::core::{ProgressState, ToolCall, ToolResult, VerificationStatus, WorkspaceState};
 use crate::harness::{
-    CheckpointManager, PlanManager, SessionStore,
+    SessionStore,
     session::{Session, SessionStatus},
 };
 use crate::prism::DependencyGraph;

@@ -1,7 +1,7 @@
 use crate::providers::types::{
-    ChatResponse, Choice, CompletionTokensDetails, Message, PromptTokensDetails, Usage,
+    ChatResponse, Choice, Message, Usage,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -80,7 +80,6 @@ pub fn accumulate_stream_to_response(chunks: &[StreamChunk]) -> Result<ChatRespo
     let mut tool_calls_map: std::collections::HashMap<u32, (String, String, String)> =
         std::collections::HashMap::new();
     let mut id = String::new();
-    let mut model = String::new();
     let mut finish_reason = None::<String>;
     let mut usage = None::<Usage>;
 
@@ -88,8 +87,8 @@ pub fn accumulate_stream_to_response(chunks: &[StreamChunk]) -> Result<ChatRespo
         if let Some(ref chunk_id) = chunk.id {
             id = chunk_id.clone();
         }
-        if let Some(ref chunk_model) = chunk.model {
-            model = chunk_model.clone();
+        if let Some(ref _chunk_model) = chunk.model {
+            // Model tracking disabled - add when needed
         }
         if let Some(ref chunk_usage) = chunk.usage {
             usage = Some(chunk_usage.clone());

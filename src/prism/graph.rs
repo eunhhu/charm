@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct DependencyGraph {
@@ -112,7 +112,7 @@ impl DependencyGraph {
     fn analyze_python(
         content: &str,
         imports: &mut Vec<String>,
-        exports: &mut Vec<String>,
+        _exports: &mut Vec<String>,
         symbols: &mut Vec<String>,
     ) {
         for line in content.lines() {

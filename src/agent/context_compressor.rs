@@ -81,7 +81,7 @@ impl ContextCompressor {
     fn summarize(msgs: &[Message]) -> String {
         let mut tool_calls = 0usize;
         let mut tool_successes = 0usize;
-        let mut files_read: HashSet<String> = HashSet::new();
+        let _files_read: HashSet<String> = HashSet::new();
         let mut files_edited: HashSet<String> = HashSet::new();
 
         for msg in msgs {
