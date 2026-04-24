@@ -1,4 +1,4 @@
-use crate::core::ToolResult;
+use crate::core::{ToolResult, resolve_workspace_path};
 use serde_json::Value;
 use std::path::Path;
 use tokio::fs;
@@ -8,10 +8,18 @@ pub async fn read_range(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> {
     let offset = args["offset"].as_u64().map(|v| v as usize).unwrap_or(1);
     let limit = args["limit"].as_u64().map(|v| v as usize);
 
-    let resolved = if Path::new(file_path).is_absolute() {
-        Path::new(file_path).to_path_buf()
-    } else {
-        cwd.join(file_path)
+    let resolved = match resolve_workspace_path(file_path, cwd) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e),
+                metadata: Some(serde_json::json!({
+                    "file_path": file_path,
+                })),
+            });
+        }
     };
 
     let content = match fs::read_to_string(&resolved).await {
@@ -61,10 +69,18 @@ pub async fn write_file(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> {
     let file_path = args["file_path"].as_str().unwrap_or("");
     let content = args["content"].as_str().unwrap_or("");
 
-    let resolved = if Path::new(file_path).is_absolute() {
-        Path::new(file_path).to_path_buf()
-    } else {
-        cwd.join(file_path)
+    let resolved = match resolve_workspace_path(file_path, cwd) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e),
+                metadata: Some(serde_json::json!({
+                    "file_path": file_path,
+                })),
+            });
+        }
     };
 
     if let Some(parent) = resolved.parent() {

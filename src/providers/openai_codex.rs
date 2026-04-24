@@ -1,5 +1,6 @@
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::{Map, Value};
+use std::time::Duration;
 
 use super::types::{
     ChatRequest, ChatResponse, Choice, CompletionTokensDetails, FunctionCall, Message,
@@ -16,8 +17,12 @@ pub struct OpenAiCodexClient {
 
 impl OpenAiCodexClient {
     pub fn new(access_token: String, account_id: Option<String>) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            client: reqwest::Client::new(),
+            client,
             access_token,
             account_id,
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
@@ -52,6 +57,7 @@ impl OpenAiCodexClient {
             .post(&url)
             .headers(headers)
             .json(&responses_payload(request))
+            .timeout(Duration::from_secs(120))
             .send()
             .await?;
 

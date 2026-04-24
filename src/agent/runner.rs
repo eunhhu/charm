@@ -36,7 +36,7 @@ impl AgentRunner {
         mode: AgentMode,
     ) -> anyhow::Result<Self> {
         let registry = ToolRegistry::new(workspace_root);
-        let workspace = Self::detect_workspace(workspace_root)?;
+        let workspace = crate::core::detect_workspace(workspace_root)?;
 
         let prism_graph = DependencyGraph::analyze_workspace(workspace_root).ok();
         if let Some(ref graph) = prism_graph {
@@ -158,17 +158,38 @@ impl AgentRunner {
                 );
             }
 
-            let tool_calls = ToolParser::parse_tool_calls(&response);
-            if tool_calls.is_empty() {
+            let parsed_calls = ToolParser::parse_tool_calls_with_ids(&response);
+            if parsed_calls.is_empty() {
                 println!("  No tool calls. Task complete or agent stopped.");
                 break;
             }
 
-            let mut tool_results: Vec<ToolResult> = Vec::new();
-            for call in tool_calls {
+            let all_tool_call_ids: Vec<String> = response
+                .tool_calls
+                .as_ref()
+                .map(|tcs| tcs.iter().map(|tc| tc.id.clone()).collect())
+                .unwrap_or_default();
+
+            let mut tool_results: Vec<(String, ToolResult)> = Vec::new();
+            let mut budget_exhausted = false;
+
+            for parsed in parsed_calls {
+                let id = parsed.id;
+                let call = parsed.call;
+
                 if self.tool_budget == 0 {
                     println!("  Tool budget exhausted.");
-                    break;
+                    budget_exhausted = true;
+                    tool_results.push((
+                        id,
+                        ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some("Tool budget exhausted".to_string()),
+                            metadata: None,
+                        },
+                    ));
+                    continue;
                 }
                 self.tool_budget -= 1;
 
@@ -187,7 +208,18 @@ impl AgentRunner {
                     ToolCall::PlanUpdate { .. } => "plan_update",
                     ToolCall::MemoryStage { .. } => "memory_stage",
                     ToolCall::MemoryCommit { .. } => "memory_commit",
-                    _ => continue,
+                    _ => {
+                        tool_results.push((
+                            id,
+                            ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some("Unrecognized tool variant".to_string()),
+                                metadata: None,
+                            },
+                        ));
+                        continue;
+                    }
                 };
 
                 match &call {
@@ -222,26 +254,39 @@ impl AgentRunner {
                                 }
                             }
                         }
-                        tool_results.push(result.clone());
+                        tool_results.push((id, result.clone()));
                         all_results.push(result);
                     }
                     Err(e) => {
                         println!("{}", tui::tool_error(&e.to_string()));
-                        tool_results.push(ToolResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some(e.to_string()),
-                            metadata: None,
-                        });
+                        tool_results.push((
+                            id,
+                            ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(e.to_string()),
+                                metadata: None,
+                            },
+                        ));
                     }
                 }
             }
 
-            let tool_call_ids: Vec<String> = response
-                .tool_calls
-                .as_ref()
-                .map(|tcs| tcs.iter().map(|tc| tc.id.clone()).collect())
-                .unwrap_or_default();
+            let result_ids: HashSet<String> =
+                tool_results.iter().map(|(id, _)| id.clone()).collect();
+            for id in &all_tool_call_ids {
+                if !result_ids.contains(id) {
+                    tool_results.push((
+                        id.clone(),
+                        ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some("Tool call parsing failed".to_string()),
+                            metadata: None,
+                        },
+                    ));
+                }
+            }
 
             messages.push(Message {
                 role: "assistant".to_string(),
@@ -252,15 +297,19 @@ impl AgentRunner {
                 reasoning_details: response.reasoning_details,
             });
 
-            for (i, result) in tool_results.iter().enumerate() {
+            for (id, result) in tool_results {
                 messages.push(Message {
                     role: "tool".to_string(),
-                    content: Some(serde_json::to_string(result)?),
+                    content: Some(serde_json::to_string(&result)?),
                     tool_calls: None,
-                    tool_call_id: tool_call_ids.get(i).cloned(),
+                    tool_call_id: Some(id),
                     reasoning: None,
                     reasoning_details: None,
                 });
+            }
+
+            if budget_exhausted {
+                break;
             }
         }
 
@@ -309,36 +358,5 @@ impl AgentRunner {
             reasoning: None,
             reasoning_details: None,
         });
-    }
-
-    fn detect_workspace(root: &Path) -> anyhow::Result<WorkspaceState> {
-        let branch = std::process::Command::new("git")
-            .args(["branch", "--show-current"])
-            .current_dir(root)
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .unwrap_or_else(|| "unknown".to_string())
-            .trim()
-            .to_string();
-
-        let dirty = std::process::Command::new("git")
-            .args(["status", "--short"])
-            .current_dir(root)
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .unwrap_or_default()
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect();
-
-        Ok(WorkspaceState {
-            root_path: root.to_string_lossy().to_string(),
-            branch,
-            dirty_files: dirty,
-            open_files: Vec::new(),
-        })
     }
 }

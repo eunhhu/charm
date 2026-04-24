@@ -1,9 +1,59 @@
 use crate::core::ToolCall;
 use serde_json::Value;
 
+/// A tool call parsed from a provider response, paired with its
+/// provider-assigned `tool_call_id`.  Keeping the ID alongside the
+/// parsed call guarantees 1-to-1 alignment between every result
+/// message we emit and the original call, even when some calls fail
+/// to parse or are skipped due to budget exhaustion.
+pub struct ParsedToolCall {
+    pub id: String,
+    pub call: ToolCall,
+}
+
 pub struct ToolParser;
 
 impl ToolParser {
+    /// Parse tool calls from a provider response, returning each call
+    /// together with its provider-assigned `tool_call_id`.
+    ///
+    /// Calls whose `type` is not `"function"`, whose arguments fail to
+    /// parse as JSON, or whose name is not recognised are **silently
+    /// skipped** here.  The caller is responsible for producing error
+    /// results for any `tool_call_id`s that appear in the raw response
+    /// but are absent from the returned list.
+    pub fn parse_tool_calls_with_ids(
+        message: &crate::providers::types::Message,
+    ) -> Vec<ParsedToolCall> {
+        let mut calls = Vec::new();
+
+        if let Some(tool_calls) = &message.tool_calls {
+            for tc in tool_calls {
+                if tc.r#type != "function" {
+                    continue;
+                }
+                let name = &tc.function.name;
+                let args: Value = match serde_json::from_str(&tc.function.arguments) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Failed to parse tool args for {}: {}", name, e);
+                        continue;
+                    }
+                };
+
+                if let Some(call) = Self::map_to_tool_call(name, args) {
+                    calls.push(ParsedToolCall {
+                        id: tc.id.clone(),
+                        call,
+                    });
+                }
+            }
+        }
+
+        calls
+    }
+
+    /// Backward-compatible wrapper that discards the `id` field.
     pub fn parse_tool_calls(message: &crate::providers::types::Message) -> Vec<ToolCall> {
         let mut calls = Vec::new();
 

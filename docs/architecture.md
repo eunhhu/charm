@@ -12,6 +12,21 @@ Charm은 모듈식 설계를 따르며, 각 컴포넌트는 명확한 책임을 
 - raw tool output은 trace에 보존하고, prompt에는 minified view만 전달합니다.
 - 모든 편집은 evidence와 verification으로 추적 가능해야 합니다.
 
+이 아키텍처의 목적은 모델이 강할 때만 잘 동작하는 에이전트가 아니라, 모델이 바뀌어도 일정 수준 이상의 개발 절차를 유지하는 하네스입니다. 따라서 모델 선택은 성능 최적화 계층이고, 정확성의 기본선은 `TaskConcretizer`, evidence 수집, reference gate, verification gate, trace store가 담당해야 합니다.
+
+## 현재 구현 경계
+
+현재 실행 가능한 기본 경로는 `SessionRuntime -> PromptAssembler -> ProviderClient -> ToolRegistry`입니다. 이 경로는 대화형 세션, 도구 호출, 승인 정책, TUI 렌더링을 제공하지만, 최종 목표인 gate-first 하네스를 완전히 강제하지는 않습니다.
+
+일부 목표 컴포넌트는 이미 모듈로 존재하거나 스켈레톤이 있습니다.
+
+- `TaskConcretizer`: task contract와 abstraction score의 시작점.
+- `ReferenceBroker`: reference pack 구조와 provider fallback의 시작점.
+- `TokenSaver`: raw output과 minified view 분리의 시작점.
+- `PromptCompiler`: typed prompt section과 budget/provenance 모델의 시작점.
+
+다음 아키텍처 작업의 핵심은 새 모듈을 늘리는 것이 아니라, 이 컴포넌트들을 세션의 필수 경로에 연결하는 것입니다.
+
 ## 모듈 구조
 
 ### `cli` (`src/cli.rs`)
@@ -60,6 +75,10 @@ Charm은 모듈식 설계를 따르며, 각 컴포넌트는 명확한 책임을 
 - **`runner.rs`**: 에이전트 실행 오케스트레이션
 - **`loop_agent.rs`**: 메인 에이전트 루프 (LLM ↔ 도구 호출)
 - **`prompt.rs`**: 프롬프트 템플릿, 모드 관리 (Plan/Act/Build)
+- **`task_concretizer.rs`**: 사용자 요청을 task contract와 abstraction score로 변환
+- **`reference_broker.rs`**: 외부 문서, 패키지 소스, issue 검색 결과를 reference pack으로 정리
+- **`token_saver.rs`**: command/test/search/docs output을 모델용 minified view로 축약
+- **`prompt_compiler.rs`**: rules, memories, evidence, references, plan을 typed prompt section으로 컴파일
 - **`context_compressor.rs`**: 긴 컨텍스트 압축
 
 ### `indexer` (`src/indexer/`)
@@ -97,6 +116,8 @@ Charm은 모듈식 설계를 따르며, 각 컴포넌트는 명확한 책임을 
 3. Session Runtime 부트 (TUI + Agent 초기화)
 4. Agent Loop: LLM 호출 → 도구 선택 → 실행 → 결과 → LLM
 5. TUI에 결과 표시
+
+이 경로에서 모델은 아직 많은 판단을 직접 수행합니다. 목표 하네스는 모델이 판단하기 전에 런타임이 먼저 필요한 evidence, reference, verification 조건을 계산하도록 바꿉니다.
 
 ## 목표 하네스 흐름
 
@@ -137,6 +158,14 @@ Charm은 모듈식 설계를 따르며, 각 컴포넌트는 명확한 책임을 
 - **PromptCompiler**: rules, memories, references, evidence, plan, tool policy를 typed prompt section으로 컴파일합니다.
 - **AgentTraceStore**: raw output, evidence, tool calls, edits, tests, references를 연결해 audit/replay를 가능하게 합니다.
 - **SessionInsights**: 반복 실패, 놓친 context, 필요한 rule/workflow/memory 후보를 추출합니다.
+
+### 세션 경로에 들어가야 할 gate
+
+- **Skip-Tool Gate**: repo/current-state claim이 있으면 tool use를 기본값으로 둡니다.
+- **Concretization Gate**: 요청이 모호하면 task contract를 만들고, 필요한 경우 질문 하나만 합니다.
+- **Reference Gate**: 외부 API, dependency, toolchain, 반복 실패 디버깅에는 공식 docs/source/issue evidence를 요구합니다.
+- **Verification Gate**: 완료 선언 전에 테스트, 빌드, 타입체크, 수동 검증 중 가능한 증거를 요구합니다.
+- **Trace Gate**: raw output, minified view, tool call, edit, verification 사이 연결을 보존합니다.
 
 ## 주요 디자인 패턴
 

@@ -1,4 +1,5 @@
 use crate::core::ToolResult;
+use crate::tools::url_guard;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -86,6 +87,7 @@ async fn search_duckduckgo(
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
     let response = client.get(&url).send().await?;
@@ -157,13 +159,19 @@ pub async fn fetch_search_result(args: Value) -> anyhow::Result<ToolResult> {
         .and_then(|v| v.as_str())
         .context("Missing 'url' parameter")?;
 
+    let validated_url = url_guard::validate_url(url)?;
+
     let extract_content = args
         .get("extract_content")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+    let client = validated_url
+        .pin_dns(
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none()),
+        )
         .build()?;
 
     let response = client
@@ -200,7 +208,7 @@ pub async fn fetch_search_result(args: Value) -> anyhow::Result<ToolResult> {
     let truncated = if content.len() > 10000 {
         format!(
             "{}...\n\n[Content truncated to 10000 characters]",
-            &content[..10000]
+            url_guard::truncate_str(&content, 10000)
         )
     } else {
         content

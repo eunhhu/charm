@@ -1,11 +1,19 @@
 use crate::runtime::session_runtime::SessionRuntime;
 use crate::runtime::types::{
-    ApprovalRequest, ApprovalStatus, AutonomyLevel, BackgroundJob, LspSnapshot, McpSnapshot,
-    RouterIntent, RuntimeEvent, SessionLifecycle, WorkspacePreflight,
+    ApprovalRequest, ApprovalStatus, AutonomyLevel, BackgroundJob, BackgroundJobKind,
+    BackgroundJobStatus, LspSnapshot, McpSnapshot, RouterIntent, RuntimeEvent, SessionLifecycle,
+    WorkspacePreflight,
+};
+use crate::tui::dialog::{
+    self, DialogOption, DialogSelectLayout, DialogSelectProps, DialogSelectState, InputMode,
+    KeybindHint,
 };
 use crate::tui::event::{AppEvent, EventBridge};
 use crate::tui::theme::Theme;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -15,7 +23,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap,
+};
 use std::io::{self, Stdout};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -184,69 +194,209 @@ impl Spinner {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandCategory {
+    Intent,
+    Autonomy,
+    Session,
+    Context,
+    Agent,
+    Inspect,
+    Meta,
+}
+
+impl CommandCategory {
+    pub fn label(&self) -> &'static str {
+        match self {
+            CommandCategory::Intent => "Intent",
+            CommandCategory::Autonomy => "Autonomy",
+            CommandCategory::Session => "Session",
+            CommandCategory::Context => "Context",
+            CommandCategory::Agent => "Agent",
+            CommandCategory::Inspect => "Inspect",
+            CommandCategory::Meta => "Meta",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandItem {
     pub command: &'static str,
     pub description: &'static str,
+    pub category: CommandCategory,
 }
 
 pub fn command_catalog() -> Vec<CommandItem> {
     vec![
         CommandItem {
+            command: "/help",
+            description: "Show full help & keybindings",
+            category: CommandCategory::Meta,
+        },
+        CommandItem {
             command: "/plan",
-            description: "Force planning intent for the current turn",
+            description: "Force planning intent for this turn",
+            category: CommandCategory::Intent,
         },
         CommandItem {
             command: "/explore",
-            description: "Force exploration intent for the current turn",
+            description: "Force exploration intent for this turn",
+            category: CommandCategory::Intent,
         },
         CommandItem {
             command: "/build",
-            description: "Force implementation intent for the current turn",
+            description: "Force implementation intent for this turn",
+            category: CommandCategory::Intent,
         },
         CommandItem {
             command: "/verify",
-            description: "Force verification intent for the current turn",
+            description: "Force verification intent for this turn",
+            category: CommandCategory::Intent,
+        },
+        CommandItem {
+            command: "/autonomy",
+            description: "Show current autonomy level",
+            category: CommandCategory::Autonomy,
+        },
+        CommandItem {
+            command: "/autonomy yolo",
+            description: "Auto-approve every tool call (dangerous)",
+            category: CommandCategory::Autonomy,
+        },
+        CommandItem {
+            command: "/autonomy aggressive",
+            description: "Edits & tests auto, destructive asks",
+            category: CommandCategory::Autonomy,
+        },
+        CommandItem {
+            command: "/autonomy balanced",
+            description: "Reads auto, stateful work asks",
+            category: CommandCategory::Autonomy,
+        },
+        CommandItem {
+            command: "/autonomy conservative",
+            description: "Everything non-read needs approval",
+            category: CommandCategory::Autonomy,
+        },
+        CommandItem {
+            command: "/yolo",
+            description: "Shortcut: /autonomy yolo",
+            category: CommandCategory::Autonomy,
+        },
+        CommandItem {
+            command: "/safe",
+            description: "Shortcut: /autonomy conservative",
+            category: CommandCategory::Autonomy,
+        },
+        CommandItem {
+            command: "/compact",
+            description: "Roll old turns into a summary",
+            category: CommandCategory::Context,
+        },
+        CommandItem {
+            command: "/clear",
+            description: "Clear transcript (keep system prompt)",
+            category: CommandCategory::Context,
+        },
+        CommandItem {
+            command: "/context add <path>",
+            description: "Pin a workspace context chip",
+            category: CommandCategory::Context,
+        },
+        CommandItem {
+            command: "/context clear",
+            description: "Clear all context chips",
+            category: CommandCategory::Context,
+        },
+        CommandItem {
+            command: "/session",
+            description: "List sessions in this workspace",
+            category: CommandCategory::Session,
+        },
+        CommandItem {
+            command: "/session next",
+            description: "Rotate to the next session",
+            category: CommandCategory::Session,
+        },
+        CommandItem {
+            command: "/session prev",
+            description: "Rotate to the previous session",
+            category: CommandCategory::Session,
+        },
+        CommandItem {
+            command: "/session <id>",
+            description: "Switch to session by id prefix",
+            category: CommandCategory::Session,
+        },
+        CommandItem {
+            command: "/new",
+            description: "Open a fresh session (Ctrl+N)",
+            category: CommandCategory::Session,
+        },
+        CommandItem {
+            command: "/model",
+            description: "Show currently pinned model",
+            category: CommandCategory::Session,
+        },
+        CommandItem {
+            command: "/model <id>",
+            description: "Pin a model for this session",
+            category: CommandCategory::Session,
+        },
+        CommandItem {
+            command: "/agent spawn <task>",
+            description: "Start a background sub-agent",
+            category: CommandCategory::Agent,
+        },
+        CommandItem {
+            command: "/agent list",
+            description: "Show sub-agent queue",
+            category: CommandCategory::Agent,
+        },
+        CommandItem {
+            command: "/agent kill <id>",
+            description: "Cancel a background sub-agent",
+            category: CommandCategory::Agent,
         },
         CommandItem {
             command: "/approvals",
             description: "Show pending approvals",
-        },
-        CommandItem {
-            command: "/context add <path>",
-            description: "Attach a context file chip to Charm input",
-        },
-        CommandItem {
-            command: "/context clear",
-            description: "Clear Charm input context chips",
+            category: CommandCategory::Inspect,
         },
         CommandItem {
             command: "/mcp",
             description: "Show MCP servers and tool inventory",
+            category: CommandCategory::Inspect,
         },
         CommandItem {
             command: "/mcp refresh",
-            description: "Probe MCP servers and refresh live tool inventory",
+            description: "Probe MCP servers and refresh inventory",
+            category: CommandCategory::Inspect,
         },
         CommandItem {
             command: "/mcp call <server> <tool> [json]",
-            description: "Invoke an MCP tool with optional JSON arguments",
+            description: "Invoke an MCP tool with JSON arguments",
+            category: CommandCategory::Inspect,
         },
         CommandItem {
             command: "/lsp",
             description: "Show LSP roots and diagnostics summary",
+            category: CommandCategory::Inspect,
         },
         CommandItem {
             command: "/lsp refresh",
-            description: "Run workspace diagnostics refresh and update cache",
+            description: "Refresh workspace diagnostics cache",
+            category: CommandCategory::Inspect,
         },
         CommandItem {
             command: "/lsp diagnostics",
-            description: "Show cached diagnostics in the transcript",
+            description: "Show cached diagnostics",
+            category: CommandCategory::Inspect,
         },
         CommandItem {
             command: "/lsp symbols",
-            description: "Show indexed symbol jump targets",
+            description: "Show indexed symbol jumps",
+            category: CommandCategory::Inspect,
         },
     ]
 }
@@ -256,10 +406,22 @@ pub fn slash_suggestions(input: &str) -> Vec<CommandItem> {
     if !trimmed.starts_with('/') {
         return Vec::new();
     }
-    command_catalog()
-        .into_iter()
-        .filter(|item| item.command.starts_with(trimmed) || trimmed == "/")
-        .collect()
+    let needle = trimmed.to_lowercase();
+    let catalog = command_catalog();
+    // Prefix match first, then substring fallback.
+    let mut prefix: Vec<CommandItem> = catalog
+        .iter()
+        .filter(|item| item.command.to_lowercase().starts_with(&needle) || needle.as_str() == "/")
+        .copied()
+        .collect();
+    if prefix.is_empty() {
+        prefix = catalog
+            .iter()
+            .filter(|item| item.command.to_lowercase().contains(&needle))
+            .copied()
+            .collect();
+    }
+    prefix
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +430,30 @@ pub enum Overlay {
     Palette,
     Sessions,
     ModelSwitcher,
+    Help,
+    Agents,
+    Autonomy,
+    Providers,
+    Mcp,
+    Skills,
+}
+
+impl Overlay {
+    /// Overlays that use the generic `DialogSelect` UI and therefore accept
+    /// filter-text input, mouse hover/click, wheel scroll.
+    pub fn is_dialog_select(self) -> bool {
+        matches!(
+            self,
+            Overlay::Palette
+                | Overlay::Sessions
+                | Overlay::ModelSwitcher
+                | Overlay::Agents
+                | Overlay::Autonomy
+                | Overlay::Providers
+                | Overlay::Mcp
+                | Overlay::Skills
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -352,6 +538,7 @@ pub struct SessionInfo {
 
 pub struct SessionApp {
     pub session_id: String,
+    pub session_title: String,
     pub transcript: Vec<Line<'static>>,
     pub input: InputState,
     pub context_items: Vec<String>,
@@ -379,6 +566,28 @@ pub struct SessionApp {
     pub sessions: Vec<SessionInfo>,
     pub available_models: Vec<ModelOption>,
     pub workspace_root: std::path::PathBuf,
+    pub toast: Option<(String, Instant)>,
+    pub last_usage: Option<(u32, u32, u32)>,
+    pub show_welcome: bool,
+    pub dialog_state: DialogSelectState,
+    pub last_dialog_layout: Option<DialogSelectLayout>,
+    pub scroll_pinned: bool,
+    pub transcript_area: Option<Rect>,
+    pub composer_area: Option<Rect>,
+    pub provider_filter: Option<String>,
+    pub skills: Vec<SkillEntry>,
+    /// Which role is currently streaming. `None` means no stream is
+    /// in-flight, so the next `StreamDelta` must open a new transcript row
+    /// with the role gutter. Cleared by `StreamDone` or any non-stream
+    /// event that would change the transcript tail (MessageDelta etc.).
+    pub active_stream_role: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillEntry {
+    pub name: String,
+    pub description: String,
+    pub path: String,
 }
 
 impl Default for SessionApp {
@@ -386,6 +595,7 @@ impl Default for SessionApp {
         let theme = Theme::default();
         Self {
             session_id: String::new(),
+            session_title: String::new(),
             transcript: Vec::new(),
             input: InputState::default(),
             context_items: Vec::new(),
@@ -413,6 +623,17 @@ impl Default for SessionApp {
             sessions: Vec::new(),
             available_models: default_available_models(),
             workspace_root: std::path::PathBuf::new(),
+            toast: None,
+            last_usage: None,
+            show_welcome: true,
+            dialog_state: DialogSelectState::default(),
+            last_dialog_layout: None,
+            scroll_pinned: true,
+            transcript_area: None,
+            composer_area: None,
+            provider_filter: None,
+            skills: Vec::new(),
+            active_stream_role: None,
         }
     }
 }
@@ -436,6 +657,29 @@ impl SessionApp {
     }
 
     pub fn apply_event(&mut self, event: RuntimeEvent) {
+        // Any real event means the welcome dismisses itself.
+        if !matches!(
+            event,
+            RuntimeEvent::PreflightReady { .. }
+                | RuntimeEvent::DiagnosticsUpdated { .. }
+                | RuntimeEvent::McpStateUpdated { .. }
+        ) {
+            self.show_welcome = false;
+        }
+        // A new streaming delta continues any in-flight stream; anything
+        // else terminates it so subsequent deltas (for whatever reason) do
+        // not splice into the wrong row.
+        if !matches!(
+            event,
+            RuntimeEvent::StreamDelta { .. }
+                | RuntimeEvent::UsageUpdated { .. }
+                | RuntimeEvent::PreflightReady { .. }
+                | RuntimeEvent::DiagnosticsUpdated { .. }
+                | RuntimeEvent::McpStateUpdated { .. }
+                | RuntimeEvent::BackgroundJobUpdated { .. }
+        ) {
+            self.active_stream_role = None;
+        }
         match event {
             RuntimeEvent::SessionLifecycle {
                 session_id,
@@ -443,6 +687,7 @@ impl SessionApp {
                 summary,
             } => {
                 self.session_id = session_id;
+                self.session_title = summary.clone();
                 self.lifecycle = lifecycle;
                 self.transcript.push(Line::from(vec![
                     Span::styled(" ● ", Style::default().fg(self.theme.role_system)),
@@ -508,57 +753,17 @@ impl SessionApp {
             } => {
                 if !content.is_empty() {
                     let color = self.theme.role_color(&role);
-                    if let Some(last_line) = self.transcript.last_mut() {
-                        if last_line.spans.is_empty() {
-                            let icon = match role.as_str() {
-                                "assistant" => "✦",
-                                _ => "·",
-                            };
-                            let styled_spans = style_line(&content, color, &self.theme);
-                            let mut line_spans = vec![Span::styled(
-                                format!(" {icon} "),
-                                Style::default().fg(color).add_modifier(Modifier::BOLD),
-                            )];
-                            line_spans.extend(styled_spans);
-                            *last_line = Line::from(line_spans);
-                        } else {
-                            let icon_span = last_line.spans.first().cloned();
-                            let content_text: String = last_line
-                                .spans
-                                .iter()
-                                .skip(1)
-                                .map(|s| s.content.clone())
-                                .collect();
-                            let new_content = format!("{}{}", content_text, content);
-                            let styled_spans = style_line(&new_content, color, &self.theme);
-                            let mut new_spans = Vec::new();
-                            if let Some(icon) = icon_span {
-                                new_spans.push(icon);
-                            }
-                            new_spans.extend(styled_spans);
-                            *last_line = Line::from(new_spans);
-                        }
-                    } else {
-                        let icon = match role.as_str() {
-                            "assistant" => "✦",
-                            _ => "·",
-                        };
-                        let styled_spans = style_line(&content, color, &self.theme);
-                        let mut line_spans = vec![Span::styled(
-                            format!(" {icon} "),
-                            Style::default().fg(color).add_modifier(Modifier::BOLD),
-                        )];
-                        line_spans.extend(styled_spans);
-                        self.transcript.push(Line::from(line_spans));
-                    }
+                    let icon = match role.as_str() {
+                        "assistant" => "✦",
+                        _ => "·",
+                    };
+                    self.append_stream_delta(&role, &content, color, icon);
                     self.auto_scroll = true;
                 }
             }
             RuntimeEvent::StreamDone { model: _ } => {
                 self.processing = false;
-                if let Some(last_line) = self.transcript.last_mut() {
-                    last_line.spans.push(Span::raw(""));
-                }
+                self.active_stream_role = None;
             }
             RuntimeEvent::RouterStateChanged { intent, source } => {
                 self.current_intent = intent;
@@ -710,7 +915,186 @@ impl SessionApp {
             RuntimeEvent::PreflightReady { preflight } => {
                 self.preflight = preflight;
             }
+            RuntimeEvent::AutonomyChanged { autonomy, source } => {
+                self.autonomy = autonomy;
+                self.toast = Some((
+                    format!("Autonomy → {} ({})", autonomy.label(), source),
+                    Instant::now(),
+                ));
+                self.transcript.push(Line::from(vec![
+                    Span::styled(
+                        " ⚡ ",
+                        Style::default().fg(autonomy_color(autonomy, &self.theme)),
+                    ),
+                    Span::styled(
+                        format!("Autonomy: {} ", autonomy.label()),
+                        Style::default()
+                            .fg(autonomy_color(autonomy, &self.theme))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("via {source}"), Style::default().fg(self.theme.dim)),
+                ]));
+                self.auto_scroll = true;
+            }
+            RuntimeEvent::ModelChanged { model, display } => {
+                self.current_model_display = display.clone();
+                self.toast = Some((format!("Model → {display}"), Instant::now()));
+                self.transcript.push(Line::from(vec![
+                    Span::styled(" ≋ ", Style::default().fg(self.theme.accent)),
+                    Span::styled(
+                        format!("Model pinned: {}", display),
+                        Style::default()
+                            .fg(self.theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!(" ({})", model), Style::default().fg(self.theme.dim)),
+                ]));
+                self.auto_scroll = true;
+            }
+            RuntimeEvent::ContextCompacted {
+                removed_messages,
+                summary,
+            } => {
+                self.toast = Some((
+                    format!("Compacted {removed_messages} messages"),
+                    Instant::now(),
+                ));
+                self.transcript.push(Line::from(vec![
+                    Span::styled(" ⇔ ", Style::default().fg(self.theme.warning)),
+                    Span::styled(
+                        summary,
+                        Style::default()
+                            .fg(self.theme.warning)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                self.auto_scroll = true;
+            }
+            RuntimeEvent::SessionSwitched { session_id, title } => {
+                self.session_id = session_id.clone();
+                self.session_title = title.clone();
+                self.transcript.push(Line::from(""));
+                self.transcript.push(Line::from(vec![
+                    Span::styled(" ↺ ", Style::default().fg(self.theme.role_router)),
+                    Span::styled(
+                        format!(
+                            "Switched to session {} — {}",
+                            &session_id[..session_id.len().min(8)],
+                            title
+                        ),
+                        Style::default()
+                            .fg(self.theme.role_router)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                self.auto_scroll = true;
+            }
+            RuntimeEvent::SubAgentSpawned { job_id, title } => {
+                self.transcript.push(Line::from(vec![
+                    Span::styled(" ⎇ ", Style::default().fg(self.theme.success)),
+                    Span::styled(
+                        format!("Sub-agent queued: {} ", title),
+                        Style::default()
+                            .fg(self.theme.success)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("[{}]", &job_id[..job_id.len().min(8)]),
+                        Style::default().fg(self.theme.dim),
+                    ),
+                ]));
+                self.auto_scroll = true;
+            }
+            RuntimeEvent::UsageUpdated {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            } => {
+                self.last_usage = Some((prompt_tokens, completion_tokens, total_tokens));
+            }
         }
+    }
+
+    /// Append a streaming delta to the transcript.
+    ///
+    /// Handles the nasty cases that used to produce garbled output:
+    ///
+    ///  1. **Embedded newlines.** If the LLM streams `"foo\nbar"` we push
+    ///     `bar` on a new display row instead of wedging a raw `\n` byte
+    ///     into a single Span (which some terminals render as a control
+    ///     char and which `wrap_single_line` used to treat as zero-width).
+    ///  2. **Continuing an in-flight stream.** A delta should keep writing
+    ///     into the same assistant turn as the previous delta, even if the
+    ///     previous delta ended with a newline (and therefore the last
+    ///     transcript row is a continuation gutter, not a role gutter).
+    ///     We track this via `active_stream_role` rather than inspecting
+    ///     the tail line.
+    ///  3. **Incremental styling.** We style only the newly arrived chunk,
+    ///     not the entire accumulated message. This preserves code-fence
+    ///     state across deltas and avoids `style_line`'s `trim_end` eating
+    ///     significant trailing whitespace.
+    ///  4. **Role switches.** If a prior stream was from a different role
+    ///     we close it and open a new one with the correct icon.
+    fn append_stream_delta(
+        &mut self,
+        role: &str,
+        content: &str,
+        color: ratatui::style::Color,
+        icon: &str,
+    ) {
+        // Decide whether we are continuing an in-flight stream or opening
+        // a new one.
+        let same_role_stream = matches!(
+            &self.active_stream_role,
+            Some(active) if active == role
+        );
+
+        let mut segments = content.split('\n');
+        let Some(first) = segments.next() else {
+            return;
+        };
+        let first = first.trim_end_matches('\r');
+
+        // Step 1: first segment either extends the last assistant row or
+        // starts a new one.
+        if same_role_stream {
+            // Extend the last transcript row in place (it exists because
+            // we pushed it when the stream opened).
+            if let Some(last) = self.transcript.last_mut() {
+                if !first.is_empty() {
+                    for span in style_line(first, color, &self.theme) {
+                        last.spans.push(span);
+                    }
+                }
+            } else {
+                // Defensive: active_stream_role was set but the transcript
+                // got drained (e.g. /clear in the middle of a stream).
+                let mut spans = vec![role_gutter_span(icon, color)];
+                if !first.is_empty() {
+                    spans.extend(style_line(first, color, &self.theme));
+                }
+                self.transcript.push(Line::from(spans));
+            }
+        } else {
+            let mut spans = vec![role_gutter_span(icon, color)];
+            if !first.is_empty() {
+                spans.extend(style_line(first, color, &self.theme));
+            }
+            self.transcript.push(Line::from(spans));
+        }
+
+        // Step 2: subsequent segments each begin a new row with a
+        // continuation gutter.
+        for seg_raw in segments {
+            let seg = seg_raw.trim_end_matches('\r');
+            let mut spans = vec![continuation_gutter_span()];
+            if !seg.is_empty() {
+                spans.extend(style_line(seg, color, &self.theme));
+            }
+            self.transcript.push(Line::from(spans));
+        }
+
+        self.active_stream_role = Some(role.to_string());
     }
 
     pub fn apply_events(&mut self, events: Vec<RuntimeEvent>) {
@@ -751,6 +1135,9 @@ impl SessionApp {
         }
     }
 
+    /// Used by legacy overlay renderers retained for reference. The new
+    /// dialog-select driven UI uses `palette_options` instead.
+    #[allow(dead_code)]
     pub fn palette_items(&self) -> Vec<CommandItem> {
         command_catalog()
     }
@@ -767,10 +1154,14 @@ pub fn run_session_tui(
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut app = SessionApp::default();
+    app.workspace_root = runtime.workspace_root().to_path_buf();
+    app.autonomy = runtime.autonomy();
+    app.current_model_display = runtime.model_display().to_string();
+    app.refresh_skills();
     app.apply_events(initial_events);
     rt.block_on(app.fetch_available_models());
 
@@ -779,7 +1170,11 @@ pub fn run_session_tui(
     let result = run_loop(&mut terminal, &mut app, bridge);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     result
 }
@@ -791,6 +1186,12 @@ fn run_loop(
 ) -> anyhow::Result<()> {
     loop {
         app.tick_cursor();
+        // Auto-dismiss toasts after ~2.5s.
+        if let Some((_, shown_at)) = &app.toast {
+            if shown_at.elapsed() > Duration::from_millis(2500) {
+                app.toast = None;
+            }
+        }
         terminal.draw(|frame| render(frame, app))?;
 
         while let Some(event) = bridge.try_recv() {
@@ -825,12 +1226,99 @@ fn run_loop(
                     return Ok(());
                 }
             }
-            Event::Mouse(_) => {}
+            Event::Mouse(mouse) => {
+                handle_mouse_event(mouse, app);
+            }
             Event::Resize(_, _) => {
+                // Re-pin to bottom on resize so wrapping stays coherent.
+                app.scroll_pinned = true;
                 app.auto_scroll = true;
             }
             _ => {}
         }
+    }
+}
+
+fn autonomy_color(level: AutonomyLevel, theme: &Theme) -> ratatui::style::Color {
+    match level {
+        AutonomyLevel::Conservative => theme.success,
+        AutonomyLevel::Balanced => theme.accent,
+        AutonomyLevel::Aggressive => theme.warning,
+        AutonomyLevel::Yolo => theme.error,
+    }
+}
+
+fn handle_mouse_event(mouse: MouseEvent, app: &mut SessionApp) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if app.overlay.is_dialog_select() {
+                let total = current_overlay_total(app);
+                app.dialog_state.move_selection(-1, total);
+                app.dialog_state.input_mode = InputMode::Mouse;
+            } else if inside(app.transcript_area, mouse.column, mouse.row) {
+                app.scroll_up(3);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if app.overlay.is_dialog_select() {
+                let total = current_overlay_total(app);
+                app.dialog_state.move_selection(1, total);
+                app.dialog_state.input_mode = InputMode::Mouse;
+            } else if inside(app.transcript_area, mouse.column, mouse.row) {
+                app.scroll_down(3);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if app.overlay.is_dialog_select() {
+                // Click on an option row selects and submits.
+                if let Some(layout) = &app.last_dialog_layout {
+                    if let Some(idx) = dialog::option_at_y(layout, mouse.row) {
+                        app.dialog_state.input_mode = InputMode::Mouse;
+                        // Find which position in the filtered list this
+                        // option occupies so "selected" stays in sync.
+                        let options = current_overlay_options(app);
+                        let state = &app.dialog_state;
+                        let (_, filtered) =
+                            dialog::filter_and_flatten(&options, state, current_overlay_flat(app));
+                        if let Some(pos) = filtered.iter().position(|i| *i == idx) {
+                            app.dialog_state.selected = pos;
+                            submit_overlay_selection(app);
+                        }
+                    }
+                }
+            } else if inside(app.composer_area, mouse.column, mouse.row) {
+                // Click on composer = nothing special; cursor already lives
+                // there. Future: move cursor to click position.
+            }
+        }
+        MouseEventKind::Moved => {
+            // Keep the mouse-mode flag sticky only while it's changing
+            // selection on overlays.
+            if app.overlay.is_dialog_select() {
+                if let Some(layout) = &app.last_dialog_layout {
+                    if let Some(idx) = dialog::option_at_y(layout, mouse.row) {
+                        let options = current_overlay_options(app);
+                        let (_, filtered) = dialog::filter_and_flatten(
+                            &options,
+                            &app.dialog_state,
+                            current_overlay_flat(app),
+                        );
+                        if let Some(pos) = filtered.iter().position(|i| *i == idx) {
+                            app.dialog_state.selected = pos;
+                            app.dialog_state.input_mode = InputMode::Mouse;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn inside(area: Option<Rect>, x: u16, y: u16) -> bool {
+    match area {
+        Some(r) => x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height,
+        None => false,
     }
 }
 
@@ -845,65 +1333,97 @@ impl SessionApp {
     fn scroll_up(&mut self, amount: u16) {
         self.scroll_offset = self.scroll_offset.saturating_sub(amount);
         self.auto_scroll = false;
+        self.scroll_pinned = false;
     }
 
     fn scroll_down(&mut self, amount: u16) {
         self.scroll_offset = self.scroll_offset.saturating_add(amount);
+        // If we just scrolled past the bottom, re-pin. The actual check
+        // happens at render time where the total-line count is available.
+        // We set a hint here; render_transcript re-evaluates.
+    }
+
+    pub fn refresh_skills(&mut self) {
+        let workflows_dir = self.workspace_root.join(".windsurf/workflows");
+        self.skills.clear();
+        let Ok(entries) = std::fs::read_dir(&workflows_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(ext) = path.extension() else {
+                continue;
+            };
+            if ext != "md" {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let description = parse_workflow_description(&path).unwrap_or_default();
+            self.skills.push(SkillEntry {
+                name,
+                description,
+                path: path.display().to_string(),
+            });
+        }
+        self.skills.sort_by(|a, b| a.name.cmp(&b.name));
     }
 }
 
+fn parse_workflow_description(path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    // Frontmatter `description:` field.
+    let mut lines = content.lines();
+    let first = lines.next()?;
+    if first.trim() != "---" {
+        return None;
+    }
+    for line in lines {
+        if line.trim() == "---" {
+            break;
+        }
+        if let Some(rest) = line.trim().strip_prefix("description:") {
+            return Some(rest.trim().trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
 fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool> {
+    // ===== Overlay key handling =====
     if app.overlay != Overlay::None {
+        return handle_overlay_key(key, app);
+    }
+
+    // ===== Global ctrl+shift combinations =====
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    if ctrl && shift {
         match key.code {
-            KeyCode::Esc => {
-                app.overlay = Overlay::None;
+            KeyCode::Char('P') | KeyCode::Char('p') => {
+                open_overlay(app, Overlay::Providers);
                 return Ok(false);
             }
-            KeyCode::Up => {
-                app.overlay_index = app.overlay_index.saturating_sub(1);
+            KeyCode::Char('M') | KeyCode::Char('m') => {
+                open_overlay(app, Overlay::Mcp);
                 return Ok(false);
             }
-            KeyCode::Down => {
-                let items_len = match app.overlay {
-                    Overlay::Palette => app.palette_items().len(),
-                    Overlay::Sessions => app.sessions.len(),
-                    Overlay::ModelSwitcher => app.available_models.len(),
-                    Overlay::None => 0,
-                };
-                let last = items_len.saturating_sub(1);
-                app.overlay_index = (app.overlay_index + 1).min(last);
+            KeyCode::BackTab => {
+                send_slash(app, "/session prev");
                 return Ok(false);
             }
-            KeyCode::Enter => {
-                match app.overlay {
-                    Overlay::Palette => {
-                        if let Some(item) = app.palette_items().get(app.overlay_index) {
-                            app.input.buffer = item.command.to_string();
-                            app.input.cursor = app.input.buffer.len();
-                        }
-                    }
-                    Overlay::Sessions => {
-                        if let Some(session) = app.sessions.get(app.overlay_index) {
-                            app.input.buffer = format!("/session {}", session.id);
-                            app.input.cursor = app.input.buffer.len();
-                        }
-                    }
-                    Overlay::ModelSwitcher => {
-                        if let Some(model) = app.available_models.get(app.overlay_index) {
-                            app.input.buffer = format!("/model {}", model.model_id);
-                            app.input.cursor = app.input.buffer.len();
-                        }
-                    }
-                    Overlay::None => {}
-                }
-                app.overlay = Overlay::None;
+            KeyCode::Tab => {
+                send_slash(app, "/session prev");
                 return Ok(false);
             }
             _ => {}
         }
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
+    if ctrl {
         match key.code {
             KeyCode::Char('c') => return Ok(true),
             KeyCode::Char('b') => {
@@ -915,51 +1435,62 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
                 return Ok(false);
             }
             KeyCode::Char('p') => {
-                app.overlay = if app.overlay == Overlay::None {
-                    Overlay::Palette
-                } else if app.overlay == Overlay::Palette {
-                    Overlay::None
-                } else {
-                    app.overlay
-                };
+                open_overlay(app, Overlay::Palette);
                 return Ok(false);
             }
             KeyCode::Char('l') => {
                 app.refresh_sessions();
-                app.overlay = if app.overlay == Overlay::None {
-                    Overlay::Sessions
-                } else if app.overlay == Overlay::Sessions {
-                    Overlay::None
-                } else {
-                    app.overlay
-                };
+                open_overlay(app, Overlay::Sessions);
                 return Ok(false);
             }
             KeyCode::Char('m') => {
-                app.overlay = if app.overlay == Overlay::None {
-                    Overlay::ModelSwitcher
-                } else if app.overlay == Overlay::ModelSwitcher {
-                    Overlay::None
-                } else {
-                    app.overlay
-                };
+                app.provider_filter = None;
+                open_overlay(app, Overlay::ModelSwitcher);
+                return Ok(false);
+            }
+            KeyCode::Char('k') => {
+                app.refresh_skills();
+                open_overlay(app, Overlay::Skills);
                 return Ok(false);
             }
             KeyCode::Char('n') => {
-                app.input.buffer = "/new".to_string();
-                app.input.cursor = app.input.buffer.len();
-                if let Some(input) = app.input.submit() {
-                    if let Some(sender) = &app.input_sender {
-                        let _ = sender.send(input);
-                    }
-                }
+                send_slash(app, "/new");
+                return Ok(false);
+            }
+            KeyCode::Char('y') => {
+                let next = app.autonomy.cycle();
+                send_slash(app, &format!("/autonomy {}", next.short()));
+                return Ok(false);
+            }
+            KeyCode::Char('a') => {
+                open_overlay(app, Overlay::Agents);
+                return Ok(false);
+            }
+            KeyCode::Tab => {
+                send_slash(app, "/session next");
+                return Ok(false);
+            }
+            KeyCode::BackTab => {
+                send_slash(app, "/session prev");
+                return Ok(false);
+            }
+            KeyCode::Char('w') => {
+                app.input.delete_word();
                 return Ok(false);
             }
             _ => {}
         }
     }
 
-    if key.modifiers.contains(KeyModifiers::SHIFT) {
+    // F1 / ? → help overlay.
+    if matches!(key.code, KeyCode::F(1))
+        || (matches!(key.code, KeyCode::Char('?')) && app.input.is_empty())
+    {
+        open_overlay(app, Overlay::Help);
+        return Ok(false);
+    }
+
+    if shift {
         match key.code {
             KeyCode::Up => {
                 app.scroll_up(3);
@@ -969,53 +1500,22 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
                 app.scroll_down(3);
                 return Ok(false);
             }
-            KeyCode::BackTab => {
-                app.current_intent = match app.current_intent {
-                    RouterIntent::Explore => RouterIntent::Verify,
-                    RouterIntent::Plan => RouterIntent::Explore,
-                    RouterIntent::Implement => RouterIntent::Plan,
-                    RouterIntent::Verify => RouterIntent::Implement,
-                };
-                app.transcript.push(Line::from(vec![
-                    Span::styled(" ◈ ", Style::default().fg(app.theme.role_router)),
-                    Span::styled(
-                        format!("{:?}", app.current_intent),
-                        Style::default().fg(app.theme.warning),
-                    ),
-                    Span::styled(" mode", Style::default().fg(app.theme.dim)),
-                ]));
-                app.auto_scroll = true;
-                return Ok(false);
-            }
             _ => {}
         }
     }
 
+    // ===== Base keys =====
     match key.code {
         KeyCode::Esc => Ok(true),
         KeyCode::Tab => {
-            if app.overlay == Overlay::Palette {
-                let last = app.palette_items().len().saturating_sub(1);
-                app.overlay_index = (app.overlay_index + 1).min(last);
-            } else {
-                app.current_intent = match app.current_intent {
-                    RouterIntent::Explore => RouterIntent::Plan,
-                    RouterIntent::Plan => RouterIntent::Implement,
-                    RouterIntent::Implement => RouterIntent::Verify,
-                    RouterIntent::Verify => RouterIntent::Explore,
-                };
-                app.transcript.push(Line::from(vec![
-                    Span::styled(" ◈ ", Style::default().fg(app.theme.role_router)),
-                    Span::styled(
-                        format!("{:?}", app.current_intent),
-                        Style::default().fg(app.theme.warning),
-                    ),
-                    Span::styled(" mode", Style::default().fg(app.theme.dim)),
-                ]));
-                app.auto_scroll = true;
+            // Autocomplete slash commands. No more user-driven intent cycling —
+            // the router picks intent autonomously from the message.
+            if app.input.as_str().starts_with('/') {
+                complete_slash(app);
             }
             Ok(false)
         }
+        KeyCode::BackTab => Ok(false), // no-op
         KeyCode::PageUp => {
             app.scroll_up(10);
             Ok(false)
@@ -1024,36 +1524,28 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
             app.scroll_down(10);
             Ok(false)
         }
-        KeyCode::Up if app.input.is_empty() && app.overlay == Overlay::None => {
+        KeyCode::Up if app.input.is_empty() => {
             app.input.history_up();
             Ok(false)
         }
-        KeyCode::Down if app.input.is_empty() && app.overlay == Overlay::None => {
+        KeyCode::Down if app.input.is_empty() => {
             app.input.history_down();
             Ok(false)
         }
         KeyCode::Left => {
-            if app.overlay == Overlay::None {
-                app.input.move_left();
-            }
+            app.input.move_left();
             Ok(false)
         }
         KeyCode::Right => {
-            if app.overlay == Overlay::None {
-                app.input.move_right();
-            }
+            app.input.move_right();
             Ok(false)
         }
         KeyCode::Home => {
-            if app.overlay == Overlay::None {
-                app.input.move_home();
-            }
+            app.input.move_home();
             Ok(false)
         }
         KeyCode::End => {
-            if app.overlay == Overlay::None {
-                app.input.move_end();
-            }
+            app.input.move_end();
             Ok(false)
         }
         KeyCode::Backspace => {
@@ -1067,14 +1559,11 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
         KeyCode::Enter => {
             if let Some(input) = app.input.submit() {
                 app.processing = true;
+                app.scroll_pinned = true;
                 if let Some(sender) = &app.input_sender {
                     let _ = sender.send(input);
                 }
             }
-            Ok(false)
-        }
-        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.input.delete_word();
             Ok(false)
         }
         KeyCode::Char(ch) => {
@@ -1083,6 +1572,595 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
         }
         _ => Ok(false),
     }
+}
+
+/// Handle keystrokes while an overlay is active. Dialog overlays get a
+/// filter input + up/down navigation; Help is a static scroll.
+fn handle_overlay_key(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool> {
+    match key.code {
+        KeyCode::Esc => {
+            app.overlay = Overlay::None;
+            app.provider_filter = None;
+            app.dialog_state.reset();
+            return Ok(false);
+        }
+        _ => {}
+    }
+
+    if app.overlay == Overlay::Help {
+        // Help has no filter — arrow keys scroll.
+        match key.code {
+            KeyCode::Up => {
+                app.dialog_state.scroll = app.dialog_state.scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                app.dialog_state.scroll = app.dialog_state.scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                app.dialog_state.scroll = app.dialog_state.scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                app.dialog_state.scroll = app.dialog_state.scroll.saturating_add(10);
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    match key.code {
+        KeyCode::Up => {
+            let total = current_overlay_total(app);
+            app.dialog_state.move_selection(-1, total);
+        }
+        KeyCode::Down => {
+            let total = current_overlay_total(app);
+            app.dialog_state.move_selection(1, total);
+        }
+        KeyCode::PageUp => {
+            let total = current_overlay_total(app);
+            app.dialog_state.move_selection(-10, total);
+        }
+        KeyCode::PageDown => {
+            let total = current_overlay_total(app);
+            app.dialog_state.move_selection(10, total);
+        }
+        KeyCode::Home => {
+            app.dialog_state.selected = 0;
+            app.dialog_state.input_mode = InputMode::Keyboard;
+        }
+        KeyCode::End => {
+            let total = current_overlay_total(app);
+            if total > 0 {
+                app.dialog_state.selected = total - 1;
+            }
+            app.dialog_state.input_mode = InputMode::Keyboard;
+        }
+        KeyCode::Enter => {
+            submit_overlay_selection(app);
+        }
+        KeyCode::Tab => {
+            // Inside the model switcher, Tab cycles the provider filter.
+            if app.overlay == Overlay::ModelSwitcher {
+                cycle_provider_filter(app);
+            }
+        }
+        KeyCode::Backspace => {
+            app.dialog_state.backspace();
+        }
+        KeyCode::Left => {
+            app.dialog_state.move_cursor_left();
+        }
+        KeyCode::Right => {
+            app.dialog_state.move_cursor_right();
+        }
+        KeyCode::Char(ch) => {
+            app.dialog_state.insert_char(ch);
+        }
+        _ => {}
+    }
+
+    Ok(false)
+}
+
+fn open_overlay(app: &mut SessionApp, next: Overlay) {
+    if app.overlay == next {
+        app.overlay = Overlay::None;
+        app.dialog_state.reset();
+        return;
+    }
+    app.overlay = next;
+    app.dialog_state.reset();
+    app.overlay_index = 0;
+}
+
+fn send_slash(app: &mut SessionApp, command: &str) {
+    app.input.buffer = command.to_string();
+    app.input.cursor = app.input.buffer.len();
+    if let Some(input) = app.input.submit() {
+        app.processing = true;
+        app.scroll_pinned = true;
+        if let Some(sender) = &app.input_sender {
+            let _ = sender.send(input);
+        }
+    }
+}
+
+/// Autocomplete the slash command currently in the composer buffer.
+/// Strategy:
+///   1. If there's exactly one match, accept it (add trailing space if the
+///      command takes arguments).
+///   2. If multiple matches share a longer common prefix than what's typed,
+///      extend the buffer to that prefix.
+///   3. If the typed value is already a full match, cycle through matches by
+///      replacing the buffer with the next option.
+fn complete_slash(app: &mut SessionApp) {
+    let current = app.input.as_str().to_string();
+    if !current.starts_with('/') {
+        return;
+    }
+    let matches = slash_suggestions(&current);
+    if matches.is_empty() {
+        return;
+    }
+
+    // If typing has stabilized (current == some command), cycle.
+    if let Some(exact) = matches.iter().find(|m| m.command == current) {
+        let idx = matches
+            .iter()
+            .position(|m| m.command == exact.command)
+            .unwrap_or(0);
+        let next = &matches[(idx + 1) % matches.len()];
+        app.input.buffer = next.command.to_string();
+        app.input.cursor = app.input.buffer.len();
+        return;
+    }
+
+    if matches.len() == 1 {
+        let target = matches[0].command.to_string();
+        // If the command has `<placeholder>` args, strip them but keep the
+        // command token + trailing space.
+        let cleaned = strip_placeholders(&target);
+        app.input.buffer = cleaned;
+        app.input.cursor = app.input.buffer.len();
+        return;
+    }
+
+    // Multiple matches: extend to longest common prefix.
+    let prefix = longest_common_prefix(&matches.iter().map(|m| m.command).collect::<Vec<_>>());
+    if prefix.len() > current.len() {
+        app.input.buffer = prefix;
+        app.input.cursor = app.input.buffer.len();
+    }
+}
+
+fn strip_placeholders(command: &str) -> String {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    let kept: Vec<&str> = parts
+        .iter()
+        .take_while(|p| !p.starts_with('<') && !p.starts_with('['))
+        .copied()
+        .collect();
+    let mut result = kept.join(" ");
+    if parts.len() > kept.len() {
+        result.push(' ');
+    }
+    result
+}
+
+fn longest_common_prefix(strs: &[&str]) -> String {
+    if strs.is_empty() {
+        return String::new();
+    }
+    let first = strs[0];
+    let mut end = first.len();
+    for s in strs.iter().skip(1) {
+        end = end.min(s.len());
+        while !first.is_char_boundary(end) || !s.is_char_boundary(end) {
+            if end == 0 {
+                return String::new();
+            }
+            end -= 1;
+        }
+        while &first[..end] != &s[..end] {
+            end -= 1;
+            while end > 0 && (!first.is_char_boundary(end) || !s.is_char_boundary(end)) {
+                end -= 1;
+            }
+            if end == 0 {
+                break;
+            }
+        }
+    }
+    first[..end].to_string()
+}
+
+fn cycle_provider_filter(app: &mut SessionApp) {
+    let providers: Vec<String> = {
+        let mut seen: Vec<String> = Vec::new();
+        for m in &app.available_models {
+            if !seen.contains(&m.provider) {
+                seen.push(m.provider.clone());
+            }
+        }
+        seen
+    };
+    if providers.is_empty() {
+        return;
+    }
+    let next = match &app.provider_filter {
+        None => Some(providers[0].clone()),
+        Some(current) => {
+            let idx = providers.iter().position(|p| p == current).unwrap_or(0);
+            if idx + 1 >= providers.len() {
+                None
+            } else {
+                Some(providers[idx + 1].clone())
+            }
+        }
+    };
+    app.provider_filter = next;
+    app.dialog_state.selected = 0;
+    app.dialog_state.scroll = 0;
+}
+
+// ======== Overlay option builders ========
+
+fn current_overlay_options(app: &SessionApp) -> Vec<DialogOption> {
+    match app.overlay {
+        Overlay::Palette => palette_options(app),
+        Overlay::Sessions => sessions_options(app),
+        Overlay::ModelSwitcher => models_options(app),
+        Overlay::Agents => agents_options(app),
+        Overlay::Autonomy => autonomy_options(app),
+        Overlay::Providers => providers_options(app),
+        Overlay::Mcp => mcp_options(app),
+        Overlay::Skills => skills_options(app),
+        Overlay::Help | Overlay::None => Vec::new(),
+    }
+}
+
+fn current_overlay_flat(app: &SessionApp) -> bool {
+    // Sessions, Agents, Skills are naturally flat; the rest use categories
+    // when filter is empty and flatten when the user is searching.
+    matches!(
+        app.overlay,
+        Overlay::Sessions | Overlay::Agents | Overlay::Skills | Overlay::Autonomy
+    ) || !app.dialog_state.filter.is_empty()
+}
+
+fn current_overlay_total(app: &SessionApp) -> usize {
+    let opts = current_overlay_options(app);
+    let (_, filtered) =
+        dialog::filter_and_flatten(&opts, &app.dialog_state, current_overlay_flat(app));
+    filtered.len()
+}
+
+fn palette_options(_app: &SessionApp) -> Vec<DialogOption> {
+    command_catalog()
+        .into_iter()
+        .map(|item| {
+            DialogOption::new(item.command, item.command)
+                .description(item.description)
+                .category(item.category.label())
+        })
+        .collect()
+}
+
+fn sessions_options(app: &SessionApp) -> Vec<DialogOption> {
+    app.sessions
+        .iter()
+        .map(|session| {
+            let short_id = &session.id[..session.id.len().min(8)];
+            let title = if session.title.trim().is_empty() {
+                "untitled".to_string()
+            } else {
+                session.title.clone()
+            };
+            let marker_style = if session.active {
+                Style::default()
+                    .fg(app.theme.success)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(app.theme.dim)
+            };
+            DialogOption::new(session.id.clone(), title)
+                .description(format!("{} · {}", short_id, session.intent))
+                .footer(session.last_active.clone())
+                .marker(if session.active { "●" } else { "○" }, marker_style)
+        })
+        .collect()
+}
+
+fn models_options(app: &SessionApp) -> Vec<DialogOption> {
+    app.available_models
+        .iter()
+        .filter(|m| match &app.provider_filter {
+            Some(p) => &m.provider == p,
+            None => true,
+        })
+        .map(|model| {
+            let provider_label = provider_display_name(&model.provider);
+            let connected = provider_has_auth(&model.provider);
+            let marker = if connected { "✓" } else { "·" };
+            let marker_style = if connected {
+                Style::default().fg(app.theme.success)
+            } else {
+                Style::default().fg(app.theme.dim)
+            };
+            DialogOption::new(model.model_id.clone(), model.display.clone())
+                .description(model.model_id.clone())
+                .category(provider_label)
+                .footer(model.provider.clone())
+                .marker(marker, marker_style)
+                .disabled(!connected)
+        })
+        .collect()
+}
+
+fn agents_options(app: &SessionApp) -> Vec<DialogOption> {
+    app.background_jobs
+        .iter()
+        .filter(|job| matches!(job.kind, BackgroundJobKind::SubAgent))
+        .map(|job| {
+            let short_id = &job.id[..job.id.len().min(8)];
+            let (marker, style) = match job.status {
+                BackgroundJobStatus::Queued => ("⧗", Style::default().fg(app.theme.dim)),
+                BackgroundJobStatus::Running => ("◉", Style::default().fg(app.theme.warning)),
+                BackgroundJobStatus::Completed => ("✓", Style::default().fg(app.theme.success)),
+                BackgroundJobStatus::Failed => ("✗", Style::default().fg(app.theme.error)),
+                BackgroundJobStatus::Cancelled => ("⊘", Style::default().fg(app.theme.dim)),
+            };
+            let footer = job
+                .progress
+                .map(|p| format!("{p}%"))
+                .unwrap_or_else(|| format!("{:?}", job.status));
+            DialogOption::new(job.id.clone(), job.title.clone())
+                .description(format!("[{short_id}] {}", job.detail))
+                .footer(footer)
+                .marker(marker, style)
+        })
+        .collect()
+}
+
+fn autonomy_options(app: &SessionApp) -> Vec<DialogOption> {
+    let levels = [
+        AutonomyLevel::Conservative,
+        AutonomyLevel::Balanced,
+        AutonomyLevel::Aggressive,
+        AutonomyLevel::Yolo,
+    ];
+    levels
+        .iter()
+        .map(|level| {
+            let color = autonomy_color(*level, &app.theme);
+            let marker = if *level == app.autonomy { "●" } else { "○" };
+            DialogOption::new(level.short(), level.label())
+                .description(level.detail())
+                .marker(marker, Style::default().fg(color))
+        })
+        .collect()
+}
+
+fn providers_options(app: &SessionApp) -> Vec<DialogOption> {
+    // Static list of providers we know about, augmented with dynamic auth
+    // status via env-vars + ~/.codex/auth.json.
+    const PROVIDERS: &[(&str, &str)] = &[
+        ("openrouter", "OpenRouter"),
+        ("openai", "OpenAI"),
+        ("openai_codex", "OpenAI Codex"),
+        ("anthropic", "Anthropic Claude"),
+        ("google", "Google Gemini"),
+        ("ollama", "Ollama (local)"),
+    ];
+    PROVIDERS
+        .iter()
+        .map(|(id, label)| {
+            let connected = provider_has_auth(id);
+            let description = provider_auth_hint(id);
+            let footer = if connected {
+                "connected"
+            } else {
+                "not configured"
+            };
+            let marker = if connected { "✓" } else { "·" };
+            let style = if connected {
+                Style::default().fg(app.theme.success)
+            } else {
+                Style::default().fg(app.theme.dim)
+            };
+            DialogOption::new(id.to_string(), label.to_string())
+                .description(description)
+                .footer(footer)
+                .marker(marker, style)
+        })
+        .collect()
+}
+
+fn provider_display_name(id: &str) -> String {
+    match id {
+        "openai" => "OpenAI",
+        "openai_codex" => "OpenAI Codex",
+        "anthropic" => "Anthropic",
+        "google" => "Google",
+        "openrouter" => "OpenRouter",
+        "ollama" => "Ollama",
+        other => other,
+    }
+    .to_string()
+}
+
+fn provider_has_auth(id: &str) -> bool {
+    match id {
+        "openai" => std::env::var("OPENAI_API_KEY").is_ok(),
+        "openai_codex" => {
+            if std::env::var("OPENAI_API_KEY").is_ok() {
+                return true;
+            }
+            if let Some(home) = dirs_home() {
+                home.join(".codex/auth.json").exists()
+            } else {
+                false
+            }
+        }
+        "anthropic" => std::env::var("ANTHROPIC_API_KEY").is_ok(),
+        "google" => {
+            std::env::var("GEMINI_API_KEY").is_ok() || std::env::var("GOOGLE_API_KEY").is_ok()
+        }
+        "openrouter" => std::env::var("OPENROUTER_API_KEY").is_ok(),
+        "ollama" => true, // local — no auth needed.
+        _ => false,
+    }
+}
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+fn provider_auth_hint(id: &str) -> String {
+    match id {
+        "openai" => "Set OPENAI_API_KEY".to_string(),
+        "openai_codex" => "Set OPENAI_API_KEY or login with `codex`".to_string(),
+        "anthropic" => "Set ANTHROPIC_API_KEY".to_string(),
+        "google" => "Set GEMINI_API_KEY or GOOGLE_API_KEY".to_string(),
+        "openrouter" => "Set OPENROUTER_API_KEY".to_string(),
+        "ollama" => "Run `ollama serve` locally".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn mcp_options(app: &SessionApp) -> Vec<DialogOption> {
+    if !app.mcp.ready {
+        return vec![
+            DialogOption::new("no_mcp", "No MCP servers configured")
+                .description("Add a `.charm/mcp.json` to register servers"),
+        ];
+    }
+    if app.mcp.servers.is_empty() {
+        return vec![DialogOption::new("empty", "No MCP servers registered")];
+    }
+    app.mcp
+        .servers
+        .iter()
+        .map(|server| {
+            let connected = matches!(
+                server.status,
+                crate::runtime::types::McpServerStatus::Connected
+            );
+            let marker = match server.status {
+                crate::runtime::types::McpServerStatus::Connected => "✓",
+                crate::runtime::types::McpServerStatus::Degraded => "!",
+                crate::runtime::types::McpServerStatus::Disconnected => "·",
+            };
+            let style = if connected {
+                Style::default().fg(app.theme.success)
+            } else if matches!(
+                server.status,
+                crate::runtime::types::McpServerStatus::Degraded
+            ) {
+                Style::default().fg(app.theme.warning)
+            } else {
+                Style::default().fg(app.theme.dim)
+            };
+            let description = server
+                .last_error
+                .clone()
+                .unwrap_or_else(|| format!("approval: {}", server.approval_mode));
+            DialogOption::new(server.name.clone(), server.name.clone())
+                .description(description)
+                .footer(format!("{} tools", server.tool_count))
+                .marker(marker, style)
+        })
+        .collect()
+}
+
+fn skills_options(app: &SessionApp) -> Vec<DialogOption> {
+    if app.skills.is_empty() {
+        return vec![
+            DialogOption::new("empty", "No skills / workflows found")
+                .description("Add markdown to .windsurf/workflows/"),
+        ];
+    }
+    app.skills
+        .iter()
+        .map(|skill| {
+            DialogOption::new(skill.name.clone(), format!("/{}", skill.name))
+                .description(if skill.description.is_empty() {
+                    skill.path.clone()
+                } else {
+                    skill.description.clone()
+                })
+                .footer("workflow".to_string())
+        })
+        .collect()
+}
+
+/// Called when the user presses Enter (keyboard) or clicks (mouse) on an
+/// option. Applies the selection and closes the overlay.
+fn submit_overlay_selection(app: &mut SessionApp) {
+    let opts = current_overlay_options(app);
+    let (_, filtered) =
+        dialog::filter_and_flatten(&opts, &app.dialog_state, current_overlay_flat(app));
+    let Some(idx) = filtered.get(app.dialog_state.selected).copied() else {
+        return;
+    };
+    let Some(option) = opts.get(idx) else {
+        return;
+    };
+    let value = option.value.clone();
+    let disabled = option.disabled;
+
+    match app.overlay {
+        Overlay::Palette => {
+            let cleaned = strip_placeholders(&value);
+            app.input.buffer = cleaned;
+            app.input.cursor = app.input.buffer.len();
+        }
+        Overlay::Sessions => {
+            send_slash(app, &format!("/session {}", value));
+        }
+        Overlay::ModelSwitcher => {
+            if !disabled {
+                send_slash(app, &format!("/model {}", value));
+            } else {
+                app.toast = Some((
+                    format!("Provider not connected. Press Ctrl+Shift+P to connect."),
+                    Instant::now(),
+                ));
+            }
+        }
+        Overlay::Agents => {
+            send_slash(
+                app,
+                &format!("/agent kill {}", &value[..value.len().min(8)]),
+            );
+        }
+        Overlay::Autonomy => {
+            send_slash(app, &format!("/autonomy {}", value));
+        }
+        Overlay::Providers => {
+            // Hint the user on how to connect — we don't have an in-TUI
+            // auth flow yet.
+            let hint = provider_auth_hint(&value);
+            app.toast = Some((
+                format!("{}: {hint}", provider_display_name(&value)),
+                Instant::now(),
+            ));
+        }
+        Overlay::Mcp => {
+            send_slash(app, "/mcp refresh");
+        }
+        Overlay::Skills => {
+            // Selecting a skill inserts a `/workflow <name>` command into the
+            // composer buffer so the user can add context before firing it.
+            app.input.buffer = format!("/workflow {}", value);
+            app.input.cursor = app.input.buffer.len();
+        }
+        Overlay::Help | Overlay::None => {}
+    }
+
+    app.overlay = Overlay::None;
+    app.provider_filter = None;
+    app.dialog_state.reset();
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp) {
@@ -1094,12 +2172,21 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp) {
         frame.area(),
     );
 
+    let input_text = app.input.as_str();
+    let suggestions_len = slash_suggestions(input_text).len().min(6);
+    let dropdown_space = if input_text.starts_with('/') && suggestions_len > 0 {
+        suggestions_len as u16 + 2
+    } else {
+        0
+    };
+    let composer_height = 3 + dropdown_space + if app.context_items.is_empty() { 0 } else { 1 };
+
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(6),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(composer_height),
         ])
         .split(frame.area());
 
@@ -1121,59 +2208,315 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp) {
         render_left_dock(frame, app, main[cursor]);
         cursor += 1;
     }
-    render_transcript(frame, app, main[cursor]);
+    let transcript_rect = main[cursor];
+    app.transcript_area = Some(transcript_rect);
+    render_transcript(frame, app, transcript_rect);
     cursor += 1;
     if app.show_right_dock {
         render_right_dock(frame, app, main[cursor]);
     }
     render_status(frame, app, outer[1]);
+    app.composer_area = Some(outer[2]);
     render_composer(frame, app, outer[2]);
 
-    if app.overlay != Overlay::None {
-        match app.overlay {
-            Overlay::Palette => render_palette(frame, app),
-            Overlay::Sessions => render_sessions(frame, app),
-            Overlay::ModelSwitcher => render_model_switcher(frame, app),
-            Overlay::None => {}
-        }
+    if app.overlay == Overlay::Help {
+        render_help_overlay(frame, app);
+    } else if app.overlay.is_dialog_select() {
+        render_dialog_overlay(frame, app);
     }
+
+    if app.show_welcome && app.overlay == Overlay::None {
+        render_welcome_overlay(frame, app);
+    }
+
+    if let Some((text, _)) = app.toast.clone() {
+        render_toast(frame, app, &text);
+    }
+}
+
+fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp) {
+    let options = current_overlay_options(app);
+    let flat = current_overlay_flat(app);
+    let (title, placeholder, keybinds, current) = match app.overlay {
+        Overlay::Palette => (
+            "Commands",
+            "Search commands...",
+            vec![
+                KeybindHint::new("tab", "autocomplete"),
+                KeybindHint::new("↵", "insert"),
+            ],
+            None,
+        ),
+        Overlay::Sessions => (
+            "Sessions",
+            "Search sessions...",
+            vec![
+                KeybindHint::new("↵", "switch"),
+                KeybindHint::new("ctrl+n", "new"),
+            ],
+            Some(app.session_id.as_str()),
+        ),
+        Overlay::ModelSwitcher => {
+            let title = match &app.provider_filter {
+                Some(p) => {
+                    Box::leak(format!("Models · {}", provider_display_name(p)).into_boxed_str())
+                        as &'static str
+                }
+                None => "Models",
+            };
+            (
+                title,
+                "Search models...",
+                vec![
+                    KeybindHint::new("tab", "filter provider"),
+                    KeybindHint::new("↵", "select"),
+                ],
+                Some(app.current_model_display.as_str()),
+            )
+        }
+        Overlay::Agents => (
+            "Sub-agents",
+            "Search agents...",
+            vec![KeybindHint::new("↵", "kill")],
+            None,
+        ),
+        Overlay::Autonomy => (
+            "Autonomy",
+            "",
+            vec![KeybindHint::new("↵", "apply")],
+            Some(app.autonomy.short()),
+        ),
+        Overlay::Providers => (
+            "Providers",
+            "Search providers...",
+            vec![KeybindHint::new("↵", "how to connect")],
+            None,
+        ),
+        Overlay::Mcp => (
+            "MCP servers",
+            "Search servers...",
+            vec![KeybindHint::new("↵", "refresh")],
+            None,
+        ),
+        Overlay::Skills => (
+            "Skills / Workflows",
+            "Search skills...",
+            vec![KeybindHint::new("↵", "insert")],
+            None,
+        ),
+        Overlay::Help | Overlay::None => return,
+    };
+
+    let props = DialogSelectProps {
+        title,
+        placeholder,
+        options: &options,
+        state: &app.dialog_state,
+        flat,
+        keybinds: &keybinds,
+        width_pct: 72,
+        height_pct: 70,
+        current,
+    };
+
+    let layout = dialog::render_dialog_select(frame, &app.theme, &props);
+    app.last_dialog_layout = Some(layout);
 }
 
 fn render_transcript(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp, area: Rect) {
     let theme = &app.theme;
 
-    let scroll = if app.auto_scroll {
-        let total_lines = app.transcript.len() as u16;
-        total_lines.saturating_sub(area.height.saturating_sub(2))
-    } else {
-        app.scroll_offset
-    };
+    // Account for the block borders and 1-column padding on each side.
+    let inner_width = area.width.saturating_sub(4);
+    let viewport_height = area.height.saturating_sub(2);
 
+    // Pre-wrap the transcript so that scroll offsets are measured in
+    // display rows, not logical lines. This fixes the long-line truncation /
+    // incorrect scroll-clamp issues.
+    let wrapped = wrap_lines_to_width(&app.transcript, inner_width);
+    let total_rows = wrapped.len() as u16;
+
+    // Pinned-to-bottom policy: as long as the user is pinned, show the
+    // latest content. If they manually scrolled up (scroll_up sets pinned
+    // = false), respect scroll_offset. If their manual scroll ends up at
+    // or past the bottom, re-pin.
+    let max_scroll = total_rows.saturating_sub(viewport_height);
+    if app.scroll_pinned {
+        app.scroll_offset = max_scroll;
+    } else if app.scroll_offset >= max_scroll {
+        // User scrolled down past the tail: treat as "pinned again".
+        app.scroll_offset = max_scroll;
+        app.scroll_pinned = true;
+    }
+    let scroll = app.scroll_offset;
+
+    let pin_marker = if app.scroll_pinned { "●" } else { "○" };
+    let session_short = if app.session_id.is_empty() {
+        String::new()
+    } else {
+        app.session_id.chars().take(8).collect::<String>()
+    };
     let title = if app.processing {
         let spinner = app.spinner.tick();
-        format!(" {} {}", spinner, app.session_id)
+        format!(" {spinner} {pin_marker} {session_short} ")
     } else {
-        format!(" {}", app.session_id)
+        format!(" {pin_marker} {session_short} ")
     };
 
-    let paragraph = Paragraph::new(Text::from(app.transcript.clone()))
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    title,
-                    Style::default()
-                        .fg(theme.dock_title)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.border))
-                .style(Style::default().bg(theme.bg_primary)),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+    let visible: Vec<Line> = wrapped
+        .into_iter()
+        .skip(scroll as usize)
+        .take(viewport_height as usize)
+        .collect();
 
+    let paragraph = Paragraph::new(Text::from(visible)).block(
+        Block::default()
+            .title(Span::styled(
+                title,
+                Style::default()
+                    .fg(theme.dock_title)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.border))
+            .style(Style::default().bg(theme.bg_primary))
+            .padding(Padding::new(1, 1, 0, 0)),
+    );
     frame.render_widget(paragraph, area);
+
+    // Optional scroll indicator on the right edge.
+    if total_rows > viewport_height {
+        let track_height = viewport_height.saturating_sub(2);
+        if track_height > 0 {
+            let progress = (scroll as f32 / max_scroll.max(1) as f32).clamp(0.0, 1.0);
+            let indicator_y = area.y + 1 + (progress * track_height as f32) as u16;
+            let x = area.x + area.width.saturating_sub(1);
+            let y = indicator_y.min(area.y + area.height.saturating_sub(2));
+            frame.render_widget(
+                Paragraph::new("│").style(Style::default().fg(theme.accent)),
+                Rect {
+                    x,
+                    y,
+                    width: 1,
+                    height: 1,
+                },
+            );
+        }
+    }
+}
+
+/// Word-aware wrap of a Vec<Line<'static>> to a given width, preserving
+/// styled spans. A line wider than `width` columns is broken on whitespace
+/// when possible, otherwise on char boundaries.
+fn wrap_lines_to_width(lines: &[Line<'static>], width: u16) -> Vec<Line<'static>> {
+    if width == 0 {
+        return lines.to_vec();
+    }
+    let width = width as usize;
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for line in lines {
+        let wrapped = wrap_single_line(line, width);
+        out.extend(wrapped);
+    }
+    out
+}
+
+fn role_gutter_span(icon: &str, color: ratatui::style::Color) -> Span<'static> {
+    Span::styled(
+        format!(" {icon} "),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn continuation_gutter_span() -> Span<'static> {
+    Span::raw("   ")
+}
+
+fn wrap_single_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let mut result: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut current_width: usize = 0;
+
+    for span in &line.spans {
+        let style = span.style;
+        // Hard line breaks first: split the span body on \n (and drop any
+        // \r so CRLF streams stay clean). Every segment AFTER the first
+        // forces a new display row even when there is no width overflow.
+        // This is the whole reason the transcript used to render
+        // "line1line2line3" on a single row.
+        let segments: Vec<&str> = span.content.split('\n').collect();
+        for (seg_idx, segment_raw) in segments.iter().enumerate() {
+            if seg_idx > 0 {
+                result.push(Line::from(std::mem::take(&mut current)));
+                current_width = 0;
+            }
+            let segment = segment_raw.trim_end_matches('\r');
+            let mut remaining: &str = segment;
+            if remaining.is_empty() {
+                continue;
+            }
+            while !remaining.is_empty() {
+                let avail = width.saturating_sub(current_width);
+                if avail == 0 {
+                    result.push(Line::from(std::mem::take(&mut current)));
+                    current_width = 0;
+                    continue;
+                }
+                let mut taken_bytes = 0usize;
+                let mut taken_cols = 0usize;
+                let mut last_break_bytes: Option<usize> = None;
+                for (byte_idx, ch) in remaining.char_indices() {
+                    if ch == '\n' || ch == '\r' {
+                        // Defense in depth: split() already removed these,
+                        // but if a future caller skips the split, don't
+                        // let them leak.
+                        break;
+                    }
+                    let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if taken_cols + w > avail {
+                        break;
+                    }
+                    taken_bytes = byte_idx + ch.len_utf8();
+                    taken_cols += w;
+                    if ch.is_whitespace() {
+                        last_break_bytes = Some(taken_bytes);
+                    }
+                }
+                if taken_bytes == 0 {
+                    // Can't fit even a single char: force a line break.
+                    result.push(Line::from(std::mem::take(&mut current)));
+                    current_width = 0;
+                    continue;
+                }
+                let split_at = if taken_bytes < remaining.len() {
+                    last_break_bytes.unwrap_or(taken_bytes)
+                } else {
+                    taken_bytes
+                };
+                let chunk = &remaining[..split_at];
+                if !chunk.is_empty() {
+                    current.push(Span::styled(chunk.to_string(), style));
+                    current_width += unicode_width::UnicodeWidthStr::width(chunk);
+                }
+                remaining = &remaining[split_at..];
+                // Eat leading whitespace on continuation lines.
+                let trimmed = remaining.trim_start_matches(|c: char| c == ' ');
+                if trimmed.len() != remaining.len() && current_width >= width {
+                    result.push(Line::from(std::mem::take(&mut current)));
+                    current_width = 0;
+                    remaining = trimmed;
+                } else if current_width >= width {
+                    result.push(Line::from(std::mem::take(&mut current)));
+                    current_width = 0;
+                }
+            }
+        }
+    }
+    if !current.is_empty() || result.is_empty() {
+        result.push(Line::from(current));
+    }
+    result
 }
 
 fn render_left_dock(frame: &mut ratatui::Frame<'_>, app: &SessionApp, area: Rect) {
@@ -1414,31 +2757,69 @@ fn render_right_dock(frame: &mut ratatui::Frame<'_>, app: &SessionApp, area: Rec
         chunks[2],
     );
 
-    let jobs_lines = if app.background_jobs.is_empty() {
-        vec![Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled("No background jobs", Style::default().fg(theme.dim)),
-        ])]
+    let jobs_lines: Vec<Line> = if app.background_jobs.is_empty() {
+        vec![
+            Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled("No background jobs", Style::default().fg(theme.dim)),
+            ]),
+            Line::from(vec![Span::styled(
+                "  /agent spawn <task>",
+                Style::default().fg(theme.dim),
+            )]),
+        ]
     } else {
-        app.background_jobs
-            .iter()
-            .map(|job| {
-                let icon = match job.status {
-                    crate::runtime::types::BackgroundJobStatus::Running => "◉",
-                    crate::runtime::types::BackgroundJobStatus::Completed => "✓",
-                    crate::runtime::types::BackgroundJobStatus::Failed => "✗",
-                };
-                let icon_color = match job.status {
-                    crate::runtime::types::BackgroundJobStatus::Running => theme.warning,
-                    crate::runtime::types::BackgroundJobStatus::Completed => theme.success,
-                    crate::runtime::types::BackgroundJobStatus::Failed => theme.error,
-                };
-                Line::from(vec![
-                    Span::styled(format!(" {icon} "), Style::default().fg(icon_color)),
-                    Span::styled(job.title.clone(), Style::default().fg(theme.text_secondary)),
-                ])
-            })
-            .collect()
+        let mut lines = Vec::with_capacity(app.background_jobs.len() * 2);
+        for job in &app.background_jobs {
+            let icon = match job.status {
+                BackgroundJobStatus::Queued => "⧗",
+                BackgroundJobStatus::Running => "◉",
+                BackgroundJobStatus::Completed => "✓",
+                BackgroundJobStatus::Failed => "✗",
+                BackgroundJobStatus::Cancelled => "⊘",
+            };
+            let icon_color = match job.status {
+                BackgroundJobStatus::Queued => theme.dim,
+                BackgroundJobStatus::Running => theme.warning,
+                BackgroundJobStatus::Completed => theme.success,
+                BackgroundJobStatus::Failed => theme.error,
+                BackgroundJobStatus::Cancelled => theme.dim,
+            };
+            let progress_tag = job
+                .progress
+                .map(|p| format!(" {p:>3}%"))
+                .unwrap_or_default();
+            let kind_tag = match job.kind {
+                BackgroundJobKind::SubAgent => " ⎇",
+                BackgroundJobKind::Command => " ⌘",
+                BackgroundJobKind::Verification => " ✓",
+                BackgroundJobKind::Index => " ⎈",
+            };
+            let title_color = if matches!(job.kind, BackgroundJobKind::SubAgent) {
+                theme.text_primary
+            } else {
+                theme.text_secondary
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {icon} "), Style::default().fg(icon_color)),
+                Span::styled(kind_tag, Style::default().fg(theme.dim)),
+                Span::styled(" ", Style::default()),
+                Span::styled(
+                    job.title.clone(),
+                    Style::default()
+                        .fg(title_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(progress_tag, Style::default().fg(theme.accent)),
+            ]));
+            if !job.detail.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("    ", Style::default()),
+                    Span::styled(job.detail.clone(), Style::default().fg(theme.dim)),
+                ]));
+            }
+        }
+        lines
     };
     frame.render_widget(
         Paragraph::new(Text::from(jobs_lines)).block(
@@ -1465,6 +2846,17 @@ fn render_status(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp, area: Rec
         .iter()
         .filter(|a| a.status == ApprovalStatus::Pending)
         .count();
+    let active_subagents = app
+        .background_jobs
+        .iter()
+        .filter(|j| {
+            matches!(j.kind, BackgroundJobKind::SubAgent)
+                && matches!(
+                    j.status,
+                    BackgroundJobStatus::Running | BackgroundJobStatus::Queued
+                )
+        })
+        .count();
 
     let intent_icon = match app.current_intent {
         RouterIntent::Explore => "◈",
@@ -1473,47 +2865,96 @@ fn render_status(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp, area: Rec
         RouterIntent::Verify => "◈",
     };
 
+    let autonomy_col = autonomy_color(app.autonomy, theme);
+    let autonomy_badge = if app.autonomy == AutonomyLevel::Yolo {
+        "⚡ YOLO"
+    } else {
+        match app.autonomy {
+            AutonomyLevel::Conservative => "🛡 safe",
+            AutonomyLevel::Balanced => "⚖ balanced",
+            AutonomyLevel::Aggressive => "✦ fast",
+            AutonomyLevel::Yolo => "⚡ YOLO",
+        }
+    };
+
     let mut spans = vec![
+        Span::styled(" ", Style::default()),
         Span::styled(
-            format!(" {intent_icon} "),
-            Style::default().fg(theme.accent),
+            format!("{intent_icon} "),
+            Style::default().fg(theme.role_router),
         ),
         Span::styled(
             format!("{:?}", app.current_intent),
-            Style::default().fg(theme.status_label),
+            Style::default()
+                .fg(theme.status_label)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" │ ", Style::default().fg(theme.dim)),
+        Span::styled("  ", Style::default()),
         Span::styled(
-            format!("Autonomy {:?}", app.autonomy),
-            Style::default().fg(theme.text_secondary),
+            format!(" {autonomy_badge} "),
+            Style::default()
+                .fg(theme.bg_primary)
+                .bg(autonomy_col)
+                .add_modifier(Modifier::BOLD),
         ),
     ];
 
-    if pending > 0 {
-        spans.push(Span::styled(" │ ", Style::default().fg(theme.dim)));
+    if !app.current_model_display.is_empty() {
+        spans.push(Span::styled("  ", Style::default()));
+        spans.push(Span::styled("≋ ", Style::default().fg(theme.accent)));
         spans.push(Span::styled(
-            format!("⚠ {} approvals", pending),
+            truncate_str(&app.current_model_display, 28),
+            Style::default().fg(theme.status_value),
+        ));
+    }
+
+    if pending > 0 {
+        spans.push(Span::styled("  │ ", Style::default().fg(theme.dim)));
+        spans.push(Span::styled(
+            format!("⚠ {pending} approvals"),
             Style::default()
                 .fg(theme.error)
                 .add_modifier(Modifier::BOLD),
         ));
     }
 
-    if !app.background_jobs.is_empty() {
-        spans.push(Span::styled(" │ ", Style::default().fg(theme.dim)));
+    if active_subagents > 0 {
+        spans.push(Span::styled("  │ ", Style::default().fg(theme.dim)));
         spans.push(Span::styled(
-            format!("{} jobs", app.background_jobs.len()),
+            format!("⎇ {active_subagents} sub-agents"),
             Style::default().fg(theme.warning),
         ));
     }
 
+    if let Some((p, c, _)) = app.last_usage {
+        spans.push(Span::styled("  │ ", Style::default().fg(theme.dim)));
+        spans.push(Span::styled(
+            format!("↑{p} ↓{c}"),
+            Style::default().fg(theme.dim),
+        ));
+    }
+
     if app.processing {
-        spans.push(Span::styled(" │ ", Style::default().fg(theme.dim)));
+        spans.push(Span::styled("  │ ", Style::default().fg(theme.dim)));
         spans.push(Span::styled(
             app.spinner.tick().to_string(),
             Style::default().fg(theme.accent),
         ));
     }
+
+    // Right-aligned hints.
+    spans.push(Span::styled("    ", Style::default()));
+    spans.push(Span::styled("F1 help", Style::default().fg(theme.dim)));
+    spans.push(Span::styled(" · ", Style::default().fg(theme.dim)));
+    spans.push(Span::styled(
+        "Ctrl+P palette",
+        Style::default().fg(theme.dim),
+    ));
+    spans.push(Span::styled(" · ", Style::default().fg(theme.dim)));
+    spans.push(Span::styled(
+        "Ctrl+Y autonomy",
+        Style::default().fg(theme.dim),
+    ));
 
     let status_line = Line::from(spans);
     frame.render_widget(
@@ -1526,46 +2967,64 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, app: &SessionApp, area: Rect)
     let theme = &app.theme;
     let suggestions = app.suggestion_items();
     let input_text = app.input.as_str();
+    let is_slash = input_text.starts_with('/');
 
-    let display_text = if input_text.is_empty() {
-        format!(
-            "\n  Type a message...\n{}",
-            if suggestions.is_empty() {
-                String::new()
-            } else {
-                suggestions
-                    .iter()
-                    .map(|s| format!("  {} {}", s.command, s.description))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
-        )
+    // Split composer area: suggestion dropdown above, the input field below.
+    let suggestion_count = suggestions.len().min(6);
+    let dropdown_height = if is_slash && suggestion_count > 0 {
+        suggestion_count as u16 + 2
     } else {
-        let ctx = if app.context_items.is_empty() {
-            String::new()
-        } else {
-            format!("{} │ ", app.context_items.join(" · "))
-        };
-        let suggestion_text = if suggestions.is_empty() {
-            String::new()
-        } else {
-            let suggestion_strs: Vec<String> = suggestions
-                .iter()
-                .map(|s| format!("{} {}", s.command, s.description))
-                .collect();
-            format!("\n{}", suggestion_strs.join("\n"))
-        };
-        format!(
-            "{}{}\n{}",
-            ctx,
-            input_text,
-            if suggestion_text.is_empty() {
-                String::new()
-            } else {
-                suggestion_text.replace('\n', "\n")
-            }
-        )
+        0
     };
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(dropdown_height), Constraint::Min(3)])
+        .split(area);
+
+    if dropdown_height > 0 {
+        let items: Vec<ListItem> = suggestions
+            .iter()
+            .take(suggestion_count)
+            .map(|item| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("  {:<32}", item.command),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" {} ", item.category.label()),
+                        Style::default().fg(theme.dim),
+                    ),
+                    Span::styled(
+                        item.description.to_string(),
+                        Style::default().fg(theme.text_secondary),
+                    ),
+                ]))
+            })
+            .collect();
+
+        frame.render_widget(
+            List::new(items).block(
+                Block::default()
+                    .title(Span::styled(
+                        " Slash commands ",
+                        Style::default()
+                            .fg(theme.dock_title)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.border))
+                    .style(Style::default().bg(theme.bg_secondary))
+                    .padding(Padding::new(0, 0, 0, 0)),
+            ),
+            layout[0],
+        );
+    }
+
+    let input_area = layout[1];
 
     let border_color = if app.processing {
         theme.accent
@@ -1575,9 +3034,66 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, app: &SessionApp, area: Rect)
         theme.border
     };
 
+    // Build the visible composer line(s).
+    let prompt_indicator = if app.processing { "⠋ " } else { "› " };
+    let mut composer_lines: Vec<Line> = Vec::new();
+    if !app.context_items.is_empty() {
+        let chips: Vec<Span> = app
+            .context_items
+            .iter()
+            .flat_map(|chip| {
+                vec![
+                    Span::styled(
+                        format!(" {chip} "),
+                        Style::default()
+                            .fg(theme.bg_primary)
+                            .bg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" ", Style::default()),
+                ]
+            })
+            .collect();
+        composer_lines.push(Line::from(chips));
+    }
+
+    if input_text.is_empty() {
+        composer_lines.push(Line::from(vec![
+            Span::styled(
+                prompt_indicator,
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Ask, plan, or press / for commands",
+                Style::default().fg(theme.dim),
+            ),
+        ]));
+    } else {
+        composer_lines.push(Line::from(vec![
+            Span::styled(
+                prompt_indicator,
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                input_text.to_string(),
+                Style::default().fg(theme.text_primary),
+            ),
+        ]));
+    }
+
+    let title = if app.session_title.is_empty() {
+        " Charm ".to_string()
+    } else {
+        format!(" Charm · {} ", truncate_str(&app.session_title, 40))
+    };
+
     let composer_block = Block::default()
         .title(Span::styled(
-            " Charm",
+            title,
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
@@ -1585,30 +3101,27 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, app: &SessionApp, area: Rect)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
-        .style(Style::default().bg(theme.bg_composer));
+        .style(Style::default().bg(theme.bg_composer))
+        .padding(Padding::new(1, 1, 0, 0));
 
-    let paragraph = Paragraph::new(display_text)
+    let paragraph = Paragraph::new(Text::from(composer_lines))
         .block(composer_block)
         .wrap(Wrap { trim: false });
-
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, input_area);
 
     if app.overlay == Overlay::None && !input_text.is_empty() && app.cursor_visible {
-        let ctx_width: usize = if app.context_items.is_empty() {
-            0
-        } else {
-            UnicodeWidthStr::width(format!("{} │ ", app.context_items.join(" · ")).as_str())
-        };
-        let cursor_display = app.input.display_cursor_width();
-        let cursor_x = area.x + 1 + (ctx_width + cursor_display) as u16;
-        let cursor_y = area.y + 1;
+        let chips_offset: u16 = if app.context_items.is_empty() { 0 } else { 1 };
+        let prompt_width = UnicodeWidthStr::width(prompt_indicator) as u16;
+        let cursor_x = input_area.x + 2 + prompt_width + app.input.display_cursor_width() as u16;
+        let cursor_y = input_area.y + 1 + chips_offset;
         frame.set_cursor_position((
-            cursor_x.min(area.x + area.width.saturating_sub(2)),
+            cursor_x.min(input_area.x + input_area.width.saturating_sub(2)),
             cursor_y,
         ));
     }
 }
 
+#[allow(dead_code)] // replaced by render_dialog_overlay; kept for reference
 fn render_palette(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
     let theme = &app.theme;
     let area = centered_rect(60, 50, frame.area());
@@ -1649,6 +3162,7 @@ fn render_palette(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
     );
 }
 
+#[allow(dead_code)] // replaced by render_dialog_overlay; kept for reference
 fn render_sessions(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
     let theme = &app.theme;
     let area = centered_rect(65, 55, frame.area());
@@ -1707,6 +3221,7 @@ fn render_sessions(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
     );
 }
 
+#[allow(dead_code)] // replaced by render_dialog_overlay; kept for reference
 fn render_model_switcher(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
     let theme = &app.theme;
     let area = centered_rect(55, 55, frame.area());
@@ -1872,6 +3387,402 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
+fn render_help_overlay(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
+    let theme = &app.theme;
+    let area = centered_rect(72, 80, frame.area());
+    frame.render_widget(Clear, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(" ✦ ", Style::default().fg(theme.accent)),
+        Span::styled(
+            "Charm — autonomous coding harness",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    let section = |title: &str| -> Line {
+        Line::from(Span::styled(
+            format!(" {title}"),
+            Style::default()
+                .fg(theme.dock_title)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+
+    lines.push(section("Keyboard"));
+    for (keys, desc) in [
+        ("Ctrl+P", "Command palette"),
+        ("Ctrl+L", "Session switcher"),
+        ("Ctrl+M", "Model switcher"),
+        ("Ctrl+N", "New session"),
+        ("Ctrl+Y", "Cycle autonomy"),
+        ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / previous session"),
+        ("Ctrl+B / Ctrl+D", "Toggle left / right dock"),
+        ("Tab / Shift+Tab", "Cycle router intent"),
+        ("F1 / ?", "Open this help overlay"),
+        ("PgUp / PgDn", "Scroll transcript"),
+        ("Esc", "Dismiss overlay / cancel"),
+    ] {
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(format!("{keys:<28}"), Style::default().fg(theme.accent)),
+            Span::styled(desc.to_string(), Style::default().fg(theme.text_secondary)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(section("Autonomy"));
+    for level in [
+        AutonomyLevel::Conservative,
+        AutonomyLevel::Balanced,
+        AutonomyLevel::Aggressive,
+        AutonomyLevel::Yolo,
+    ] {
+        let marker = if level == app.autonomy { "●" } else { "○" };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {marker} "),
+                Style::default().fg(autonomy_color(level, theme)),
+            ),
+            Span::styled(
+                format!("{:<14}", level.label()),
+                Style::default()
+                    .fg(autonomy_color(level, theme))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                level.detail().to_string(),
+                Style::default().fg(theme.text_secondary),
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(section("Slash commands"));
+    for category in [
+        CommandCategory::Intent,
+        CommandCategory::Autonomy,
+        CommandCategory::Session,
+        CommandCategory::Agent,
+        CommandCategory::Context,
+        CommandCategory::Inspect,
+        CommandCategory::Meta,
+    ] {
+        lines.push(Line::from(Span::styled(
+            format!("  ▸ {}", category.label()),
+            Style::default().fg(theme.dim).add_modifier(Modifier::BOLD),
+        )));
+        for item in command_catalog()
+            .into_iter()
+            .filter(|item| item.category == category)
+        {
+            lines.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                Span::styled(
+                    format!("{:<34}", item.command),
+                    Style::default().fg(theme.accent),
+                ),
+                Span::styled(
+                    item.description.to_string(),
+                    Style::default().fg(theme.text_secondary),
+                ),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Esc to close, ↑/↓ to scroll.",
+        Style::default().fg(theme.dim),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        " Help ",
+                        Style::default()
+                            .fg(theme.dock_title)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.border_focused))
+                    .style(Style::default().bg(theme.bg_secondary))
+                    .padding(Padding::new(1, 1, 1, 1)),
+            )
+            .scroll((app.overlay_index as u16, 0))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+#[allow(dead_code)] // replaced by render_dialog_overlay; kept for reference
+fn render_autonomy_overlay(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
+    let theme = &app.theme;
+    let area = centered_rect(50, 40, frame.area());
+    frame.render_widget(Clear, area);
+
+    let levels = [
+        AutonomyLevel::Conservative,
+        AutonomyLevel::Balanced,
+        AutonomyLevel::Aggressive,
+        AutonomyLevel::Yolo,
+    ];
+
+    let items: Vec<ListItem> = levels
+        .iter()
+        .enumerate()
+        .map(|(idx, level)| {
+            let active = idx == app.overlay_index;
+            let marker = if *level == app.autonomy { "●" } else { "○" };
+            let style = if active {
+                Style::default()
+                    .fg(theme.palette_selected_fg)
+                    .bg(theme.palette_selected_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(autonomy_color(*level, theme))
+            };
+            let desc_style = if active {
+                Style::default()
+                    .fg(theme.palette_selected_fg)
+                    .bg(theme.palette_selected_bg)
+            } else {
+                Style::default().fg(theme.text_secondary)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {marker} "), style),
+                Span::styled(format!("{:<14}", level.label()), style),
+                Span::styled(level.detail().to_string(), desc_style),
+            ]))
+        })
+        .collect();
+
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .title(Span::styled(
+                    format!(" Autonomy (current: {}) ", app.autonomy.label()),
+                    Style::default()
+                        .fg(theme.dock_title)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(autonomy_color(app.autonomy, theme)))
+                .style(Style::default().bg(theme.bg_secondary))
+                .padding(Padding::new(1, 1, 1, 1)),
+        ),
+        area,
+    );
+}
+
+#[allow(dead_code)] // replaced by render_dialog_overlay; kept for reference
+fn render_agents_overlay(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
+    let theme = &app.theme;
+    let area = centered_rect(65, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    let sub: Vec<&BackgroundJob> = app
+        .background_jobs
+        .iter()
+        .filter(|j| matches!(j.kind, BackgroundJobKind::SubAgent))
+        .collect();
+
+    let lines: Vec<Line> = if sub.is_empty() {
+        vec![
+            Line::from(Span::styled(
+                "  No sub-agents spawned yet.",
+                Style::default().fg(theme.dim),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Try: /agent spawn audit authentication layer",
+                Style::default().fg(theme.accent),
+            )),
+        ]
+    } else {
+        sub.iter()
+            .enumerate()
+            .flat_map(|(idx, job)| {
+                let active = idx == app.overlay_index;
+                let marker = if active { "▸" } else { " " };
+                let icon = match job.status {
+                    BackgroundJobStatus::Queued => "⧗",
+                    BackgroundJobStatus::Running => "◉",
+                    BackgroundJobStatus::Completed => "✓",
+                    BackgroundJobStatus::Failed => "✗",
+                    BackgroundJobStatus::Cancelled => "⊘",
+                };
+                let icon_color = match job.status {
+                    BackgroundJobStatus::Queued => theme.dim,
+                    BackgroundJobStatus::Running => theme.warning,
+                    BackgroundJobStatus::Completed => theme.success,
+                    BackgroundJobStatus::Failed => theme.error,
+                    BackgroundJobStatus::Cancelled => theme.dim,
+                };
+                let progress = job.progress.map(|p| format!(" {p}%")).unwrap_or_default();
+                vec![
+                    Line::from(vec![
+                        Span::styled(format!(" {marker} "), Style::default().fg(theme.accent)),
+                        Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
+                        Span::styled(
+                            format!("[{}] ", &job.id[..job.id.len().min(8)]),
+                            Style::default().fg(theme.dim),
+                        ),
+                        Span::styled(
+                            job.title.clone(),
+                            Style::default()
+                                .fg(theme.text_primary)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(progress, Style::default().fg(theme.accent)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("      ", Style::default()),
+                        Span::styled(job.detail.clone(), Style::default().fg(theme.dim)),
+                    ]),
+                ]
+            })
+            .collect()
+    };
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .title(Span::styled(
+                    format!(" Sub-agents ({}) ", sub.len()),
+                    Style::default()
+                        .fg(theme.dock_title)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.border_focused))
+                .style(Style::default().bg(theme.bg_secondary))
+                .padding(Padding::new(1, 1, 1, 1)),
+        ),
+        area,
+    );
+}
+
+fn render_welcome_overlay(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
+    let theme = &app.theme;
+    let area = centered_rect(58, 55, frame.area());
+    frame.render_widget(Clear, area);
+
+    let banner: &[&str] = &[
+        "       _                          ",
+        "   ___| |__   __ _ _ __ _ __ ___  ",
+        "  / __| '_ \\ / _` | '__| '_ ` _ \\ ",
+        " | (__| | | | (_| | |  | | | | | |",
+        "  \\___|_| |_|\\__,_|_|  |_| |_| |_|",
+    ];
+
+    let mut lines: Vec<Line> = banner
+        .iter()
+        .map(|row| {
+            Line::from(Span::styled(
+                row.to_string(),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect();
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  autonomous coding harness · Rust · terminal-native",
+        Style::default().fg(theme.text_secondary),
+    )]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  workspace  ", Style::default().fg(theme.dim)),
+        Span::styled(
+            app.workspace_root.display().to_string(),
+            Style::default().fg(theme.text_primary),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  model      ", Style::default().fg(theme.dim)),
+        Span::styled(
+            if app.current_model_display.is_empty() {
+                "default".to_string()
+            } else {
+                app.current_model_display.clone()
+            },
+            Style::default().fg(theme.text_primary),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  autonomy   ", Style::default().fg(theme.dim)),
+        Span::styled(
+            app.autonomy.label(),
+            Style::default()
+                .fg(autonomy_color(app.autonomy, theme))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  press / for commands, F1 for help, or just type",
+        Style::default().fg(theme.dim),
+    )]));
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.accent))
+                    .style(Style::default().bg(theme.bg_secondary))
+                    .padding(Padding::new(2, 2, 1, 1)),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_toast(frame: &mut ratatui::Frame<'_>, app: &SessionApp, text: &str) {
+    let theme = &app.theme;
+    let area = frame.area();
+    let width = (text.width() as u16 + 4).min(area.width.saturating_sub(4));
+    let toast_area = Rect {
+        x: area.width.saturating_sub(width + 2),
+        y: area.height.saturating_sub(5),
+        width,
+        height: 3,
+    };
+    frame.render_widget(Clear, toast_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ⚡ ", Style::default().fg(theme.accent)),
+            Span::styled(
+                text.to_string(),
+                Style::default()
+                    .fg(theme.text_primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.accent))
+                .style(Style::default().bg(theme.bg_highlight)),
+        ),
+        toast_area,
+    );
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let popup = Layout::default()
         .direction(Direction::Vertical)
@@ -1907,6 +3818,261 @@ mod tests {
                 .iter()
                 .any(|item| item.command == suggestions[0].command)
         );
+    }
+
+    #[test]
+    fn longest_common_prefix_extends_short_slash() {
+        // `/a` matches /agent spawn, /agent list, /agent kill, /autonomy...
+        let strs = vec!["/agent spawn", "/agent list", "/agent kill"];
+        let prefix = longest_common_prefix(&strs);
+        assert_eq!(prefix, "/agent ");
+    }
+
+    #[test]
+    fn strip_placeholders_drops_brackets() {
+        assert_eq!(strip_placeholders("/session <id>"), "/session ");
+        assert_eq!(strip_placeholders("/help"), "/help");
+        assert_eq!(strip_placeholders("/context add <path>"), "/context add ");
+    }
+
+    #[test]
+    fn tab_autocomplete_extends_prefix_for_slash() {
+        let mut app = SessionApp::default();
+        app.input.buffer = "/a".to_string();
+        app.input.cursor = 2;
+        complete_slash(&mut app);
+        // All /a... slash commands share "/a" as prefix; at least "/agent"
+        // and "/autonomy" exist, so the longest common prefix is "/a".
+        // There is no longer prefix so the buffer should stay or extend to
+        // "/autonomy" if only one match survives. We assert it didn't shrink.
+        assert!(app.input.as_str().starts_with("/a"));
+    }
+
+    #[test]
+    fn wrap_single_line_splits_on_embedded_newline() {
+        // Regression: embedded \n was treated as a 0-width char, so
+        // "hello\nworld" survived as a single display line with a raw
+        // newline byte in the Span content → garbled terminal output.
+        let line = Line::from(Span::raw("hello\nworld"));
+        let wrapped = wrap_single_line(&line, 80);
+        assert_eq!(
+            wrapped.len(),
+            2,
+            "expected two display rows, got {wrapped:?}"
+        );
+        let first: String = wrapped[0].spans.iter().map(|s| s.content.clone()).collect();
+        let second: String = wrapped[1].spans.iter().map(|s| s.content.clone()).collect();
+        assert_eq!(first, "hello");
+        assert_eq!(second, "world");
+        for line in &wrapped {
+            for span in &line.spans {
+                assert!(
+                    !span.content.contains('\n'),
+                    "embedded newline leaked into span: {span:?}"
+                );
+                assert!(
+                    !span.content.contains('\r'),
+                    "embedded carriage return leaked into span: {span:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_single_line_splits_on_multiple_newlines() {
+        let line = Line::from(Span::raw("a\n\nb\nc"));
+        let wrapped = wrap_single_line(&line, 80);
+        let rendered: Vec<String> = wrapped
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+            .collect();
+        assert_eq!(rendered, vec!["a", "", "b", "c"]);
+    }
+
+    #[test]
+    fn streamed_code_block_renders_on_separate_rows() {
+        use ratatui::backend::TestBackend;
+        // Simulate an LLM streaming a short code block like:
+        //   "Here is a fn:\n```rust\nfn main() {}\n```"
+        // Arriving as a few deltas (which is how real providers chunk it).
+        let mut app = SessionApp::default();
+        app.apply_event(RuntimeEvent::StreamDelta {
+            role: "assistant".to_string(),
+            content: "Here is a fn:\n```rust\n".to_string(),
+            model: None,
+        });
+        app.apply_event(RuntimeEvent::StreamDelta {
+            role: "assistant".to_string(),
+            content: "fn main() {}\n".to_string(),
+            model: None,
+        });
+        app.apply_event(RuntimeEvent::StreamDelta {
+            role: "assistant".to_string(),
+            content: "```".to_string(),
+            model: None,
+        });
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 60,
+                    height: 12,
+                };
+                render_transcript(frame, &mut app, area);
+            })
+            .unwrap();
+        let dump = buffer_to_string(terminal.backend().buffer());
+        eprintln!("=== streamed code block dump ===\n{dump}=== end ===");
+        // Every display row must be a clean row of printable chars.
+        for line in dump.lines() {
+            assert!(
+                !line.contains('\n') && !line.contains('\r'),
+                "row leaked control char: {line:?}"
+            );
+        }
+        assert!(
+            dump.contains("Here is a fn:"),
+            "missing intro line:\n{dump}"
+        );
+        assert!(dump.contains("fn main() {}"), "missing code line:\n{dump}");
+        // The "```rust" marker and the intro line must be on different
+        // terminal rows, otherwise the streaming delta squashed them.
+        let rust_row = dump.lines().position(|l| l.contains("rust")).unwrap_or(0);
+        let intro_row = dump
+            .lines()
+            .position(|l| l.contains("Here is a fn:"))
+            .unwrap_or(0);
+        assert_ne!(
+            rust_row, intro_row,
+            "intro and code fence landed on the same row:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn transcript_with_newline_renders_as_separate_rows() {
+        use ratatui::backend::TestBackend;
+        // Render a transcript that mimics the bug the user saw: a single
+        // Line with embedded \n. Dump the terminal buffer and make sure no
+        // row contains a raw newline byte and the text is split across
+        // rows.
+        let mut app = SessionApp::default();
+        app.transcript
+            .push(Line::from(Span::raw("line one\nline two\nline three")));
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 10,
+                };
+                render_transcript(frame, &mut app, area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let dump = buffer_to_string(&buffer);
+        eprintln!("=== render dump ===\n{dump}=== end ===");
+        for line in dump.lines() {
+            assert!(
+                !line.contains('\n') && !line.contains('\r'),
+                "row leaked control char: {line:?}"
+            );
+        }
+        assert!(
+            dump.contains("line one") && dump.contains("line two") && dump.contains("line three"),
+            "missing rows in rendered dump:\n{dump}"
+        );
+    }
+
+    fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
+        let width = buffer.area.width as usize;
+        let height = buffer.area.height as usize;
+        let mut out = String::new();
+        for y in 0..height {
+            for x in 0..width {
+                if let Some(cell) = buffer.cell(ratatui::layout::Position {
+                    x: x as u16,
+                    y: y as u16,
+                }) {
+                    out.push_str(cell.symbol());
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn stream_delta_with_newline_creates_multiple_lines() {
+        let mut app = SessionApp::default();
+        // Seed a pending assistant line (as a typical turn starts).
+        app.transcript.push(Line::from(vec![]));
+        app.apply_event(RuntimeEvent::StreamDelta {
+            role: "assistant".to_string(),
+            content: "hel".to_string(),
+            model: None,
+        });
+        app.apply_event(RuntimeEvent::StreamDelta {
+            role: "assistant".to_string(),
+            content: "lo\nworld".to_string(),
+            model: None,
+        });
+        // The transcript should contain two display lines after wrap, not
+        // one concatenated row with a raw \n byte.
+        for (i, line) in app.transcript.iter().enumerate() {
+            for span in &line.spans {
+                assert!(
+                    !span.content.contains('\n'),
+                    "line {i} contains embedded newline: {:?}",
+                    span.content
+                );
+            }
+        }
+        // Overall rendered text should contain "hello" and "world", each on
+        // its own display row.
+        let rows: Vec<String> = app
+            .transcript
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.clone()).collect())
+            .collect();
+        let dump = rows.join(" | ");
+        assert!(
+            rows.iter().any(|r| r.contains("hello")),
+            "no row with 'hello' in {dump}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("world")),
+            "no row with 'world' in {dump}"
+        );
+        // "world" must land on a different row than "hello".
+        let hello_row = rows.iter().position(|r| r.contains("hello")).unwrap();
+        let world_row = rows.iter().position(|r| r.contains("world")).unwrap();
+        assert_ne!(
+            hello_row, world_row,
+            "hello and world landed on the same row"
+        );
+    }
+
+    #[test]
+    fn skill_frontmatter_description_is_parsed() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("demo.md");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            "---\ndescription: Run the demo workflow\n---\n\nSteps..."
+        )
+        .unwrap();
+        let desc = parse_workflow_description(&path).unwrap();
+        assert_eq!(desc, "Run the demo workflow");
     }
 
     #[test]

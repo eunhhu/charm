@@ -9,6 +9,7 @@ use crate::providers::types::{
     ChatRequest, ChatResponse, Message, ModelInfo, ToolSchema, Usage, default_tool_schemas,
 };
 
+#[derive(Clone)]
 pub enum ProviderClient {
     OpenAi(OpenAiClient),
     OpenAiCodex(OpenAiCodexClient),

@@ -1,7 +1,5 @@
 use crate::agent::runner::AgentRunner;
-use crate::orchestrator::types::{
-    Subtask, SubtaskResult, TaskDecomposition,
-};
+use crate::orchestrator::types::{Subtask, SubtaskResult, TaskDecomposition};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub struct Broker {

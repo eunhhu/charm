@@ -18,6 +18,7 @@ mod semantic;
 mod test_runner;
 mod todo;
 mod trajectory;
+mod url_guard;
 mod web;
 mod web_search;
 
@@ -110,8 +111,8 @@ impl ToolRegistry {
             "write_file" => file::write_file(args, &self.cwd).await,
             "grep_search" => search::grep_search(args, &self.cwd).await,
             "glob_search" => search::glob_search(args, &self.cwd).await,
-            "list_dir" => search::list_dir(args).await,
-            "edit_patch" => patch::edit_patch(args).await,
+            "list_dir" => search::list_dir(args, &self.cwd).await,
+            "edit_patch" => patch::edit_patch(args, &self.cwd).await,
             "semantic_search" => semantic::semantic_search(args, &self.cwd).await,
             "parallel_search" => retrieval::parallel_search(args, &self.cwd).await,
             "run_command" => command::run_command(args, &self.cwd).await,
@@ -148,11 +149,11 @@ impl ToolRegistry {
             "run_tests" => test_runner::run_tests(args, &self.cwd).await,
             "analyze_test_results" => test_runner::analyze_test_results(args, &self.cwd).await,
             "checkpoint_create" => {
-                let cm = crate::harness::CheckpointManager::new(&self.cwd)?;
+                let mut cm = crate::harness::CheckpointManager::new(&self.cwd)?;
                 cm.create(args)
             }
             "checkpoint_restore" => {
-                let cm = crate::harness::CheckpointManager::new(&self.cwd)?;
+                let mut cm = crate::harness::CheckpointManager::new(&self.cwd)?;
                 cm.restore(args)
             }
             "plan_update" => {

@@ -292,7 +292,23 @@ fn mode_rules(mode: &AgentMode) -> String {
 }
 
 fn interactive_workflow_rules(intent: RouterIntent, autonomy: AutonomyLevel) -> String {
+    let autonomy_note = match autonomy {
+        AutonomyLevel::Conservative => {
+            "You must request approval for any write/exec/external tool. Prefer reads, searches, and summaries."
+        }
+        AutonomyLevel::Balanced => {
+            "Reads and safe execution are automatic. Stateful edits, destructive ops, and external side effects require approval."
+        }
+        AutonomyLevel::Aggressive => {
+            "Reads, searches, edits, and tests run automatically. Only destructive or external-side-effect work escalates for approval."
+        }
+        AutonomyLevel::Yolo => {
+            "YOLO MODE: every tool is auto-approved including destructive and external-side-effect operations. A loud ⚠ transcript entry is still emitted for destructive/external calls (trace requirement). Favor decisive action, but: (1) create a git stash or checkpoint before irreversible operations, (2) prefer tests before destructive runs, (3) treat external API calls as something the user will have to audit after the fact. The user chose YOLO to accept responsibility, not to skip evidence — keep trace-first discipline."
+        }
+    };
     format!(
-        "## Interactive Session\n- You are operating in a multi-turn coding session.\n- Current intent: {intent:?}.\n- Default workflow: understand -> plan -> execute -> verify -> summarize.\n- Slash commands may override intent for the current turn only.\n- Autonomy level: {autonomy:?}.\n- Under aggressive autonomy, reads/searches/edits/tests are automatic; destructive or external side effects require approval.\n- Use LSP and MCP context when relevant.\n- Keep the conversation grounded in the current workspace state."
+        "## Interactive Session\n- You are operating in a multi-turn coding session.\n- Current intent: {intent:?}. You may self-select the intent you need next turn; the router will keep up.\n- Default workflow: understand -> plan -> execute -> verify -> summarize.\n- Slash commands override intent for the current turn only (/explore /plan /build /verify).\n- Autonomy level: {label} ({short}). {autonomy_note}\n- Use LSP and MCP context when relevant. Never fabricate APIs; verify with read/search tools.\n- Keep the conversation grounded in the current workspace state.\n- You can request long-running work via background sub-agents when the user mentions \"background\" or \"in parallel\".",
+        label = autonomy.label(),
+        short = autonomy.short(),
     )
 }

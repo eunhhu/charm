@@ -237,12 +237,12 @@ impl LiveIndex {
                             name: full_name,
                             kind: if class_name.is_some() { "method".to_string() } else { "function".to_string() },
                             file_path: file_path.to_string(),
-                            line: node.start_position().row + 1,
-                            col: node.start_position().column,
+                            line: child.start_position().row + 1,
+                            col: child.start_position().column,
                             signature: format!("def {}(...)", func_name),
                             docstring: None,
-                            body_start: node.start_position().row + 1,
-                            body_end: node.end_position().row + 1,
+                            body_start: child.start_position().row + 1,
+                            body_end: child.end_position().row + 1,
                         });
                     }
                 }
@@ -253,12 +253,12 @@ impl LiveIndex {
                             name: cls_name.to_string(),
                             kind: "class".to_string(),
                             file_path: file_path.to_string(),
-                            line: node.start_position().row + 1,
-                            col: node.start_position().column,
+                            line: child.start_position().row + 1,
+                            col: child.start_position().column,
                             signature: format!("class {}:", cls_name),
                             docstring: None,
-                            body_start: node.start_position().row + 1,
-                            body_end: node.end_position().row + 1,
+                            body_start: child.start_position().row + 1,
+                            body_end: child.end_position().row + 1,
                         });
                         
                         Self::walk_python_tree(source, child, file_path, symbols, Some(cls_name));
@@ -305,63 +305,6 @@ impl LiveIndex {
                 "function_item" => {
                     if let Some(name) = child.child_by_field_name("name") {
                         let func_name = &source[name.byte_range()];
-                        let full_name = func_name.to_string();
-
-                        symbols.push(Symbol {
-                            name: full_name,
-                            kind: "function".to_string(),
-                            file_path: file_path.to_string(),
-                            line: node.start_position().row + 1,
-                            col: node.start_position().column,
-                            signature: format!("fn {}", func_name),
-                            docstring: None,
-                            body_start: node.start_position().row + 1,
-                            body_end: node.end_position().row + 1,
-                        });
-                    }
-                }
-                "struct_item" => {
-                    if let Some(name) = child.child_by_field_name("name") {
-                        let struct_name = &source[name.byte_range()];
-                        symbols.push(Symbol {
-                            name: struct_name.to_string(),
-                            kind: "struct".to_string(),
-                            file_path: file_path.to_string(),
-                            line: node.start_position().row + 1,
-                            col: node.start_position().column,
-                            signature: format!("struct {}", struct_name),
-                            docstring: None,
-                            body_start: node.start_position().row + 1,
-                            body_end: node.end_position().row + 1,
-                        });
-                    }
-                }
-                "enum_item" => {
-                    if let Some(name) = child.child_by_field_name("name") {
-                        let enum_name = &source[name.byte_range()];
-                        symbols.push(Symbol {
-                            name: enum_name.to_string(),
-                            kind: "enum".to_string(),
-                            file_path: file_path.to_string(),
-                            line: node.start_position().row + 1,
-                            col: node.start_position().column,
-                            signature: format!("enum {}", enum_name),
-                            docstring: None,
-                            body_start: node.start_position().row + 1,
-                            body_end: node.end_position().row + 1,
-                        });
-                    }
-                }
-                "impl_item" => {
-                    let impl_name = child
-                        .child_by_field_name("type")
-                        .map(|n| &source[n.byte_range()])
-                        .map(|s| s.to_string());
-                    Self::walk_rust_tree(source, child, file_path, symbols, impl_name.as_deref());
-                }
-                "function_item" => {
-                    if let Some(name) = child.child_by_field_name("name") {
-                        let func_name = &source[name.byte_range()];
                         let full_name = if impl_type.is_some() {
                             format!("{}::{}", impl_type.unwrap(), func_name)
                         } else {
@@ -372,14 +315,53 @@ impl LiveIndex {
                             name: full_name,
                             kind: if impl_type.is_some() { "method" } else { "function" }.to_string(),
                             file_path: file_path.to_string(),
-                            line: node.start_position().row + 1,
-                            col: node.start_position().column,
+                            line: child.start_position().row + 1,
+                            col: child.start_position().column,
                             signature: format!("fn {}", func_name),
                             docstring: None,
-                            body_start: node.start_position().row + 1,
-                            body_end: node.end_position().row + 1,
+                            body_start: child.start_position().row + 1,
+                            body_end: child.end_position().row + 1,
                         });
                     }
+                }
+                "struct_item" => {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        let struct_name = &source[name.byte_range()];
+                        symbols.push(Symbol {
+                            name: struct_name.to_string(),
+                            kind: "struct".to_string(),
+                            file_path: file_path.to_string(),
+                            line: child.start_position().row + 1,
+                            col: child.start_position().column,
+                            signature: format!("struct {}", struct_name),
+                            docstring: None,
+                            body_start: child.start_position().row + 1,
+                            body_end: child.end_position().row + 1,
+                        });
+                    }
+                }
+                "enum_item" => {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        let enum_name = &source[name.byte_range()];
+                        symbols.push(Symbol {
+                            name: enum_name.to_string(),
+                            kind: "enum".to_string(),
+                            file_path: file_path.to_string(),
+                            line: child.start_position().row + 1,
+                            col: child.start_position().column,
+                            signature: format!("enum {}", enum_name),
+                            docstring: None,
+                            body_start: child.start_position().row + 1,
+                            body_end: child.end_position().row + 1,
+                        });
+                    }
+                }
+                "impl_item" => {
+                    let impl_name = child
+                        .child_by_field_name("type")
+                        .map(|n| &source[n.byte_range()])
+                        .map(|s| s.to_string());
+                    Self::walk_rust_tree(source, child, file_path, symbols, impl_name.as_deref());
                 }
                 _ => {
                     Self::walk_rust_tree(source, child, file_path, symbols, impl_type);

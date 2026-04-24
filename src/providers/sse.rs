@@ -1,6 +1,4 @@
-use crate::providers::types::{
-    ChatResponse, Choice, Message, Usage,
-};
+use crate::providers::types::{ChatResponse, Choice, Message, Usage};
 use anyhow::Result;
 use serde::Deserialize;
 
@@ -46,6 +44,9 @@ pub struct StreamFunction {
 
 pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk>> {
     let trimmed = line.trim();
+    // strip \r for CRLF robustness (defense in depth — callers should already
+    // strip \r, but this ensures correctness regardless of invocation site)
+    let trimmed = trimmed.trim_end_matches('\r');
     if trimmed.is_empty() || trimmed.starts_with(':') {
         return None;
     }

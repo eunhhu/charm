@@ -50,16 +50,29 @@ src/
 제품 철학과 장기 설계 방향은 다음 문서를 기준으로 합니다.
 
 - `docs/charm-strategy.md`: Charm의 목표, 철학, 차별성, tool-first/reference-first/token-minified 전략
+- `docs/architecture.md`: 현재 실행 경로와 목표 하네스 경로의 경계
 - `docs/devin-windsurf-harness-research.md`: Devin/Windsurf 하네스 분석과 Charm 이식 방향
 - `OPTIMIZATION_ROADMAP.md`: 구현 우선순위와 성능 목표
 
 코드 변경이 다음 영역에 닿으면 관련 문서도 같이 업데이트하세요.
 
-- `PromptAssembler`, `SessionRuntime`, `ToolRegistry`: prompt/compiler/tool policy 문서 확인
+- `PromptAssembler`, `PromptCompiler`, `SessionRuntime`, `ToolRegistry`: prompt/compiler/tool policy 문서 확인
+- `TaskConcretizer`, `runtime/router`: task contract, abstraction score, autonomy/gate 정책 확인
 - `indexer`, `retrieval`: evidence/context 전략 확인
-- `providers`, `runtime/mcp`: reference-first와 MCP 전략 확인
-- `tools/command`, `tools/search`, `tools/test_runner`: TokenSaver/minification 전략 확인
+- `ReferenceBroker`, `providers`, `runtime/mcp`: reference-first와 MCP 전략 확인
+- `TokenSaver`, `tools/command`, `tools/search`, `tools/test_runner`: raw output 보존과 minified view 전략 확인
 - `orchestrator`: delegation 전략 확인
+
+## 하네스 개발 우선순위
+
+새 기능을 추가하기 전에 다음 질문을 먼저 확인하세요.
+
+1. 이 변경이 모델의 기억에 의존하는가, 아니면 evidence를 수집하는가?
+2. tool/reference/verification을 생략해도 안전한 조건이 코드로 표현되어 있는가?
+3. raw output과 model-facing summary가 분리되어 있는가?
+4. 완료 선언을 뒷받침할 검증 경로가 있는가?
+
+현재 가장 중요한 방향은 `TaskConcretizer`, `ReferenceBroker`, `TokenSaver`, `PromptCompiler`를 세션 런타임의 필수 경로에 연결하는 것입니다.
 
 ## 의존성
 

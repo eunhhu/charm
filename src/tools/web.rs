@@ -1,4 +1,5 @@
 use crate::core::ToolResult;
+use crate::tools::url_guard;
 use anyhow::Context;
 use regex::Regex;
 use reqwest;
@@ -10,6 +11,8 @@ pub async fn fetch_url(args: Value) -> anyhow::Result<ToolResult> {
         .get("url")
         .and_then(|v| v.as_str())
         .context("Missing 'url' parameter")?;
+
+    let validated_url = url_guard::validate_url(url)?;
 
     let max_length = args
         .get("max_length")
@@ -25,9 +28,13 @@ pub async fn fetch_url(args: Value) -> anyhow::Result<ToolResult> {
 
     let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
-        .user_agent("Charm-Agent/0.1.0")
+    let client = validated_url
+        .pin_dns(
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout_secs))
+                .user_agent("Charm-Agent/0.1.0")
+                .redirect(reqwest::redirect::Policy::none()),
+        )
         .build()
         .context("Failed to build HTTP client")?;
 
@@ -58,12 +65,11 @@ pub async fn fetch_url(args: Value) -> anyhow::Result<ToolResult> {
         html_to_markdown(&html)
     };
 
-    // Apply start_index and max_length
+    // Apply start_index and max_length (UTF-8-safe)
     let content = if start_index >= body.len() {
         String::new()
     } else {
-        let end = (start_index + max_length).min(body.len());
-        body[start_index..end].to_string()
+        url_guard::safe_slice(&body, start_index, start_index + max_length).to_string()
     };
 
     let truncated = body.len() > (start_index + max_length);
@@ -113,6 +119,8 @@ pub async fn http_request(args: Value) -> anyhow::Result<ToolResult> {
         .and_then(|v| v.as_str())
         .context("Missing 'url' parameter")?;
 
+    let validated_url = url_guard::validate_url(url)?;
+
     let method = args
         .get("method")
         .and_then(|v| v.as_str())
@@ -124,9 +132,13 @@ pub async fn http_request(args: Value) -> anyhow::Result<ToolResult> {
 
     let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
-        .user_agent("Charm-Agent/0.1.0")
+    let client = validated_url
+        .pin_dns(
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout_secs))
+                .user_agent("Charm-Agent/0.1.0")
+                .redirect(reqwest::redirect::Policy::none()),
+        )
         .build()
         .context("Failed to build HTTP client")?;
 
@@ -174,7 +186,7 @@ pub async fn http_request(args: Value) -> anyhow::Result<ToolResult> {
         "HTTP {}\n\nHeaders:\n{}\n\nBody:\n{}",
         status,
         response_headers.join("\n"),
-        &response_body[..response_body.len().min(10000)]
+        url_guard::truncate_str(&response_body, 10000)
     );
 
     Ok(ToolResult {

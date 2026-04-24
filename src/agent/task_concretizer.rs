@@ -1,16 +1,26 @@
 use serde::{Deserialize, Serialize};
 
 /// Task contract that concretizes a vague user request into actionable work
+/// Spec: docs/charm-strategy.md Task contract
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskContract {
+    /// What must be accomplished
     pub objective: String,
-    pub scope: String,
+    /// What can be touched (files, modules, areas)
+    pub scope: Vec<String>,
+    /// Relevant files, symbols, tests, commands
     pub repo_anchors: Vec<RepoAnchor>,
-    pub acceptance: String,
-    pub verification: String,
+    /// What success means
+    pub acceptance: Vec<String>,
+    /// How to prove success
+    pub verification: Vec<String>,
+    /// Impacted areas and risks
     pub side_effects: Vec<String>,
+    /// What Charm will assume automatically
     pub assumptions: Vec<String>,
+    /// What must be asked before proceeding
     pub open_questions: Vec<String>,
+    /// shallow / normal / deep / exhaustive
     pub depth: ExecutionDepth,
 }
 
@@ -70,7 +80,11 @@ impl TaskConcretizer {
         }
 
         // Specific file mentions reduce abstraction significantly
-        if lower.contains(".rs") || lower.contains(".py") || lower.contains(".js") || lower.contains(".md") {
+        if lower.contains(".rs")
+            || lower.contains(".py")
+            || lower.contains(".js")
+            || lower.contains(".md")
+        {
             score -= 0.3;
         }
 
@@ -116,10 +130,10 @@ impl TaskConcretizer {
     fn build_contract(&self, request: &str, _score: f64) -> TaskContract {
         TaskContract {
             objective: request.to_string(),
-            scope: "To be determined from repo inspection".to_string(),
+            scope: vec!["To be determined from repo inspection".to_string()],
             repo_anchors: Vec::new(),
-            acceptance: "To be defined".to_string(),
-            verification: "To be defined".to_string(),
+            acceptance: vec!["To be defined".to_string()],
+            verification: vec!["To be defined".to_string()],
             side_effects: Vec::new(),
             assumptions: vec!["Assuming standard project structure".to_string()],
             open_questions: Vec::new(),
@@ -130,10 +144,10 @@ impl TaskConcretizer {
     fn build_contract_with_assumptions(&self, request: &str, _score: f64) -> TaskContract {
         TaskContract {
             objective: request.to_string(),
-            scope: "Conservative scope - will expand after initial inspection".to_string(),
+            scope: vec!["Conservative scope - will expand after initial inspection".to_string()],
             repo_anchors: Vec::new(),
-            acceptance: "Minimal viable improvement".to_string(),
-            verification: "Build and basic smoke test".to_string(),
+            acceptance: vec!["Minimal viable improvement".to_string()],
+            verification: vec!["Build passes".to_string(), "Basic smoke test".to_string()],
             side_effects: vec!["May affect related code paths".to_string()],
             assumptions: vec![
                 "Assuming common patterns".to_string(),
@@ -146,8 +160,7 @@ impl TaskConcretizer {
 
     fn generate_high_leverage_question(&self, request: &str) -> String {
         // Generate a question that maximally reduces ambiguity
-        if request.to_lowercase().contains("refactor")
-            || request.to_lowercase().contains("improve")
+        if request.to_lowercase().contains("refactor") || request.to_lowercase().contains("improve")
         {
             "Which specific file or module should I focus on first?".to_string()
         } else if request.to_lowercase().contains("fix") {
@@ -183,21 +196,33 @@ mod tests {
     fn test_abstraction_score_concrete() {
         let request = "Fix the off-by-one error in src/parser.rs line 42";
         let score = TaskConcretizer::score_abstraction(request);
-        assert!(score < 0.35, "Expected low score for concrete request, got {}", score);
+        assert!(
+            score < 0.35,
+            "Expected low score for concrete request, got {}",
+            score
+        );
     }
 
     #[test]
     fn test_abstraction_score_vague() {
         let request = "Improve everything everywhere";
         let score = TaskConcretizer::score_abstraction(request);
-        assert!(score > 0.70, "Expected high score for vague request, got {}", score);
+        assert!(
+            score > 0.70,
+            "Expected high score for vague request, got {}",
+            score
+        );
     }
 
     #[test]
     fn test_abstraction_score_moderate() {
         let request = "Refactor error handling";
         let score = TaskConcretizer::score_abstraction(request);
-        assert!(score >= 0.35 && score < 0.70, "Expected moderate score, got {}", score);
+        assert!(
+            score >= 0.35 && score < 0.70,
+            "Expected moderate score, got {}",
+            score
+        );
     }
 
     #[test]

@@ -21,6 +21,29 @@ Charm: 10 수준의 절차를 기본 가정 -> 필요 없는 것을 안전하게
 
 상세 철학은 `docs/charm-strategy.md`를 기준 문서로 삼는다.
 
+## 현재 전략 판단
+
+Charm의 가장 큰 레버는 새 모델을 더 많이 붙이는 것이 아니라, 모델이 바뀌어도 유지되는 실행 spine을 세션 런타임에 강제하는 것입니다.
+
+```text
+TaskContract
+-> EvidencePack
+-> ReferencePack
+-> PromptSections
+-> Tool loop
+-> Verification
+-> Trace
+```
+
+강한 모델은 이 spine 위에서 더 빠르고 넓게 추론합니다. 약한 모델은 같은 spine 덕분에 파일 읽기, reference 확인, 테스트 실행, 완료 근거 제시 같은 기본 절차를 놓치기 어렵습니다.
+
+## 상태 표기
+
+- **Designed**: 문서/타입 설계가 있음.
+- **Scaffolded**: Rust 모듈 또는 구조체가 있으나 기본 세션 경로에 아직 강제되지 않음.
+- **Wired**: 일반 사용자 세션에서 자동 적용됨.
+- **Enforced**: 모델이 생략하려 해도 gate가 막음.
+
 ## 제품 레이어 로드맵
 
 ### Phase 0: 하네스 철학 정착
@@ -28,7 +51,9 @@ Charm: 10 수준의 절차를 기본 가정 -> 필요 없는 것을 안전하게
 - [x] Evidence-first / Reference-first / Tool-first 원칙 문서화
 - [x] Devin/Windsurf harness research 문서화
 - [ ] 현재 `PromptAssembler`와 runtime prompt에 철학 반영
+  - Status: Designed. 현재 프롬프트에는 아직 tool-first와 충돌할 수 있는 표현이 남아 있음.
 - [ ] tool skip 기준과 reference-required 기준을 정책으로 분리
+  - Status: Designed. `AutonomyLevel`은 승인 정책을 다루지만 evidence requirement gate와는 별도여야 함.
 
 ### Phase 1: Task Concretization Layer
 
@@ -49,8 +74,10 @@ pub struct TaskContract {
 ```
 
 - [ ] abstraction score 계산
+  - Status: Scaffolded. `TaskConcretizer`에 초기 score 함수가 있음.
 - [ ] missing contract fields 추출
 - [ ] ask / inspect / auto-assume / execute 결정
+  - Status: Scaffolded. 초기 action 분기는 있으나 repo evidence 기반 보강 전.
 - [ ] side-effect scan 추가
 
 ### Phase 2: Reference-First Layer
@@ -61,6 +88,7 @@ pub struct TaskContract {
 - [ ] local package source/type definitions 조회
 - [ ] GitHub issue/discussion/web search fallback 정책
 - [ ] `ReferencePack` 구조 도입
+  - Status: Scaffolded. 구조체와 compile 함수는 있으나 provider fetch는 아직 skeleton.
 - [ ] 두 번 이상 local debugging 실패 시 external precedent search 강제
 
 ```rust
@@ -84,10 +112,15 @@ pub struct ReferencePack {
 
 - [ ] raw output store와 minified prompt view 분리
 - [ ] command/test/rustc/cargo output minifier
+  - Status: Scaffolded. 초기 minifier는 있으나 tool runtime 전체에 아직 연결되지 않음.
 - [ ] grep/search result dedupe and ranking
+  - Status: Scaffolded. 파일 단위 dedupe 시작점 있음. relevance ranking 필요.
 - [ ] docs/reference snippet distiller
+  - Status: Scaffolded. code block 추출 중심. 공식 규칙/caveat 추출 강화 필요.
 - [ ] code span minifier with line number preservation
+  - Status: Scaffolded. line number 보존 시작점 있음. 실제 file span provenance 필요.
 - [ ] prompt section budget enforcement
+  - Status: Scaffolded in `PromptCompiler`, not wired into `PromptAssembler`.
 
 ```rust
 pub struct MinifyRequest {
@@ -112,8 +145,11 @@ pub struct MinifiedView {
 목표: prompt를 문자열 조립이 아니라 typed artifact로 만든다.
 
 - [ ] `PromptSection` 도입
+  - Status: Scaffolded. section type, activation, budget, provenance 모델 존재.
 - [ ] priority, activation, token budget, provenance 관리
+  - Status: Scaffolded. 실제 session prompt 생성 경로 연결 필요.
 - [ ] provider-specific rendering
+  - Status: Scaffolded. provider hint 기반 rendering 시작점 있음.
 - [ ] section snapshot tests
 
 ```rust
@@ -265,25 +301,25 @@ pub struct HierarchicalMemory {
 ## 구현 우선순위
 
 ### 즉시 구현 (High Impact, Low Effort)
-1. TaskContract schema와 abstraction score
-2. Context7/reference provider 연결 설계
-3. TokenSaver 인터페이스와 cargo/test output minifier
-4. PromptSection typed model
-5. tool skip/reference gate 정책
+1. `PromptAssembler`의 tool policy를 strategy와 맞춤
+2. `TaskConcretizer`를 세션 입력 경로에 연결
+3. `TokenSaver`를 command/search/test tool result 경로에 연결
+4. `PromptCompiler`를 session system prompt 생성 경로에 연결
+5. tool skip/reference/verification gate를 runtime policy로 분리
 
 ### 단기 구현 (1-2주)
-6. ReferencePack compilation
+6. ReferencePack provider fetch 구현(Context7/local package source 우선)
 7. FastContextWorker evidence format
 8. AgentTraceStore raw/minified 분리
-9. 도구 스키마 캐싱
-10. 컨텍스트 압축 개선
+9. VerificationGate와 완료 선언 정책
+10. 컨텍스트 압축 개선(TokenSaver-backed `/compact`)
 
 ### 중기 구현 (2-4주)
-11. 임베딩 기반 시맨틱 검색
-12. RTK 고도화
-13. 계층적 메모리 시스템
-14. 백그라운드 인덱싱
-15. child-agent delegation 강화
+11. 도구 스키마 캐싱과 병렬 tool execution 안정화
+12. 임베딩 기반 시맨틱 검색
+13. RTK 고도화
+14. 계층적 메모리 시스템
+15. worktree-isolated child-agent delegation 강화
 
 ## 성능 목표
 

@@ -1,4 +1,5 @@
 pub mod app;
+pub mod dialog;
 pub mod event;
 pub mod theme;
 

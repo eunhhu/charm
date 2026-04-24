@@ -16,6 +16,12 @@ Korean version:
 
 > Charm은 내부적으로 10만큼 사고하고, 모델에게는 진실을 잃지 않는 최소 컨텍스트만 전달한다.
 
+Practical version:
+
+> Charm raises the floor of coding agents by moving discipline from model habit into runtime policy.
+
+The model should not be the only thing deciding whether to inspect files, fetch references, run tests, or preserve evidence. Charm's harness decides the required diligence first, then gives the model a compact, grounded execution context.
+
 ## Core Differentiation
 
 Most coding agents start from a small context and expand only when the model decides it needs more.
@@ -46,6 +52,8 @@ The goal is not wasteful depth. The goal is complete internal diligence plus min
 8. Every edit should point to evidence and verification.
 9. Local-first execution is the default; remote/cloud delegation is optional.
 10. Weak models should become useful through harness discipline.
+11. Model routing improves performance; runtime gates preserve correctness.
+12. The prompt is a view of state, not the state itself.
 
 ## Competitive Positioning
 
@@ -59,6 +67,54 @@ The goal is not wasteful depth. The goal is complete internal diligence plus min
 | Codex | Cloud tasks and code review | Offer local control plus optional delegation rather than cloud-only flow |
 
 Charm should win when correctness, traceability, and codebase grounding matter more than chat convenience.
+
+## Model-Agnostic Floor Raising
+
+Charm should work well with strong models, but it should not depend on strong-model behavior for basic diligence. The product goal is to make weak and mid-tier models useful by surrounding them with enforceable workflow:
+
+```text
+ambiguous request
+-> task contract
+-> repo evidence
+-> reference pack when needed
+-> typed prompt sections
+-> tool execution
+-> verification
+-> trace
+```
+
+This makes model choice an optimization layer, not the safety layer.
+
+### What Belongs To The Harness
+
+The harness, not the model, should own these decisions:
+
+- Whether the task is concrete enough to execute.
+- Whether repository evidence is required before answering.
+- Whether external references are required before using an API.
+- Which raw tool outputs must be stored for audit.
+- Which minified evidence enters the prompt.
+- Whether a completion claim has enough verification.
+- Whether destructive or external-side-effect tools require approval.
+
+The model should own these decisions:
+
+- How to reason over the compiled evidence.
+- Which local implementation approach best fits the codebase.
+- Which tool call to make next within the allowed policy.
+- How to explain the final result to the user.
+
+### Floor-Raising Invariants
+
+These invariants should hold no matter which model is selected:
+
+1. No code edit before relevant file/context inspection.
+2. No current-state claim without fresh evidence or an explicit stale-evidence marker.
+3. No external API or dependency claim without source/docs/package evidence when the task depends on current behavior.
+4. No repeated debugging guesses after two failed local fix cycles.
+5. No completion claim without verification evidence when a verification path exists.
+6. No raw evidence loss: raw output stays in trace, prompt receives a compact view.
+7. No autonomy profile can disable traceability.
 
 ## The Execution Philosophy
 
@@ -269,6 +325,32 @@ Completion claims require verification evidence:
 - Lint/typecheck when available.
 - Manual reproduction notes when no automated test exists.
 
+## Autonomy Profiles
+
+The four gates above define **what** evidence is required. Autonomy profiles
+define **who pays the attention tax** when a gate fires. They are a surface
+layer, not a replacement for gates.
+
+| Profile | Skip-Tool Gate | Reference Gate | Concretization Gate | Verification Gate | Destructive / External |
+| --- | --- | --- | --- | --- | --- |
+| **Conservative** (`/safe`) | Gate asks for approval every time | Required, user must acknowledge | Required, ask one question | Required | Approval required |
+| **Balanced** | Gate asks for stateful / edit tools | Required for third-party APIs | Required when score > 0.35 | Required | Approval required |
+| **Aggressive** (default) | Gate bypassed for reads/searches/edits/tests | Required but auto-applied when high confidence | Auto-assume conservatively when score < 0.7 | Required | Approval required |
+| **YOLO** (`/yolo`) | Bypassed globally — user asserts responsibility | **Warned but not enforced**; log a trace entry | Auto-assume always | Still recommended; skipping leaves a trace warning | Auto-approved with loud `⚠` transcript marker + checkpoint reminder |
+
+Rules that hold across all profiles:
+
+1. Trace requirements never relax. Every bypassed gate must emit a
+   `gate_bypass` event into the trace store so the audit trail stays intact.
+2. YOLO is not "trust the model". It is "the user accepts responsibility for
+   irreversible operations". Charm should aggressively checkpoint state
+   (git stash, worktree snapshot) before destructive operations in YOLO.
+3. The agent chooses `RouterIntent` autonomously from the user message; the
+   user does not cycle modes. Profiles only adjust gate bypass policy, not
+   intent routing.
+4. Profiles can be pinned per session and survive restarts. Model selection
+   is pinned the same way.
+
 ## Target Architecture
 
 ```text
@@ -306,6 +388,7 @@ Key modules to grow:
 - Add typed prompt section design.
 - Add task contract schema.
 - Add token saver interfaces for command, grep, test, docs, and file reads.
+- Replace prompt-only guidance with runtime gates where failure would lower the model floor.
 
 ### Mid Term
 
@@ -314,6 +397,7 @@ Key modules to grow:
 - Implement abstraction scoring and task concretization.
 - Add side-effect scan before edits.
 - Store raw tool outputs and minified prompt views separately.
+- Wire TaskConcretizer, ReferenceBroker, TokenSaver, and PromptCompiler into the normal session path.
 
 ### Long Term
 
@@ -322,6 +406,7 @@ Key modules to grow:
 - Add repo wiki/codemap generation.
 - Add replayable agent traces.
 - Use session insights to propose new rules, workflows, and memories.
+- Add model routing only after the evidence and verification spine is stable.
 
 ## Success Metrics
 
@@ -341,4 +426,3 @@ Key modules to grow:
 - Context7 MCP listing: https://mcp.directory/servers/context7
 - Context7 platform docs: https://context7.com/upstash/context7
 - Devin/Windsurf harness research: `docs/devin-windsurf-harness-research.md`
-

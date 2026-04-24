@@ -1,23 +1,34 @@
-use crate::core::ToolResult;
+use crate::core::{ToolResult, resolve_workspace_path};
 use serde_json::Value;
 use std::path::Path;
 use tokio::process::Command;
 
 pub async fn grep_search(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> {
     let pattern = args["pattern"].as_str().unwrap_or("");
-    let path = args["path"]
-        .as_str()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| cwd.to_string_lossy().to_string());
+    let path_arg = args["path"].as_str().unwrap_or(".");
     let include = args["include"].as_str();
     let output_mode = args["output_mode"].as_str().unwrap_or("content");
+
+    let resolved = match resolve_workspace_path(path_arg, cwd) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e),
+                metadata: Some(serde_json::json!({
+                    "search_path": path_arg,
+                })),
+            });
+        }
+    };
 
     let mut cmd = Command::new("rg");
     cmd.arg("-n")
         .arg("--color=never")
         .arg("-F")
         .arg(pattern)
-        .arg(&path);
+        .arg(&resolved);
     if let Some(inc) = include {
         cmd.arg("-g").arg(inc);
     }
@@ -31,7 +42,8 @@ pub async fn grep_search(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> 
             output: "(no matches)".to_string(),
             error: None,
             metadata: Some(serde_json::json!({
-                "search_path": path,
+                "search_path": path_arg,
+                "resolved_path": resolved.display().to_string(),
                 "match_count": 0,
                 "matched_files": []
             })),
@@ -58,7 +70,8 @@ pub async fn grep_search(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> 
         output: result,
         error: None,
         metadata: Some(serde_json::json!({
-            "search_path": path,
+            "search_path": path_arg,
+            "resolved_path": resolved.display().to_string(),
             "match_count": lines.len(),
             "matched_files": matched_files
         })),
@@ -67,13 +80,24 @@ pub async fn grep_search(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> 
 
 pub async fn glob_search(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> {
     let pattern = args["pattern"].as_str().unwrap_or("*");
-    let path = args["path"]
-        .as_str()
-        .map(|s| std::path::Path::new(s).to_path_buf())
-        .unwrap_or_else(|| cwd.to_path_buf());
+    let path_arg = args["path"].as_str().unwrap_or(".");
+
+    let resolved = match resolve_workspace_path(path_arg, cwd) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e),
+                metadata: Some(serde_json::json!({
+                    "search_path": path_arg,
+                })),
+            });
+        }
+    };
 
     let mut results = Vec::new();
-    for entry in walkdir::WalkDir::new(&path)
+    for entry in walkdir::WalkDir::new(&resolved)
         .into_iter()
         .filter_map(|e| e.ok())
     {
@@ -90,18 +114,34 @@ pub async fn glob_search(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> 
         output: results.join("\n"),
         error: None,
         metadata: Some(serde_json::json!({
-            "search_path": path,
+            "search_path": path_arg,
+            "resolved_path": resolved.display().to_string(),
             "match_count": results.len(),
             "matched_files": results
         })),
     })
 }
 
-pub async fn list_dir(args: Value) -> anyhow::Result<ToolResult> {
+pub async fn list_dir(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> {
     let dir_path = args["dir_path"].as_str().unwrap_or(".");
+
+    let resolved = match resolve_workspace_path(dir_path, cwd) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e),
+                metadata: Some(serde_json::json!({
+                    "search_path": dir_path,
+                })),
+            });
+        }
+    };
+
     let mut entries = Vec::new();
 
-    let mut dir = tokio::fs::read_dir(dir_path).await?;
+    let mut dir = tokio::fs::read_dir(&resolved).await?;
     while let Some(entry) = dir.next_entry().await? {
         let meta = entry.metadata().await?;
         let name = entry.file_name().to_string_lossy().to_string();
@@ -115,6 +155,7 @@ pub async fn list_dir(args: Value) -> anyhow::Result<ToolResult> {
         error: None,
         metadata: Some(serde_json::json!({
             "search_path": dir_path,
+            "resolved_path": resolved.display().to_string(),
             "match_count": 0,
             "matched_files": []
         })),
