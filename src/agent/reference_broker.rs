@@ -117,7 +117,7 @@ pub struct IssueResult {
     pub relevance_score: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum IssueStatus {
     Open,
     Closed,
@@ -272,12 +272,17 @@ impl ReferenceBroker {
     /// Search official issues/changelogs before repeated debugging
     pub async fn search_issues(
         &self,
-        _package: &PackageId,
-        _error_message: &str,
+        package: &PackageId,
+        error_message: &str,
     ) -> anyhow::Result<Vec<IssueResult>> {
-        // This would search GitHub issues, Stack Overflow, etc.
-        // For now, return empty as a skeleton
-        Ok(Vec::new())
+        let signature = first_meaningful_line(error_message).unwrap_or(error_message);
+        let query = format!("{} {} in:title,body type:issue", package.name, signature);
+        let url = format!(
+            "https://api.github.com/search/issues?q={}&per_page=5",
+            urlencoding::encode(&query)
+        );
+        let body = (self.http_get)(url).await?;
+        parse_github_issue_search(&body)
     }
 
     /// Compile raw findings into a ReferencePack
@@ -867,6 +872,55 @@ fn validate_context7_endpoint(endpoint: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn parse_github_issue_search(body: &str) -> anyhow::Result<Vec<IssueResult>> {
+    #[derive(Deserialize)]
+    struct SearchResponse {
+        items: Vec<SearchItem>,
+    }
+
+    #[derive(Deserialize)]
+    struct SearchItem {
+        title: String,
+        html_url: String,
+        state: String,
+        #[serde(default)]
+        score: Option<f64>,
+        #[serde(default)]
+        pull_request: Option<serde_json::Value>,
+    }
+
+    let response: SearchResponse = serde_json::from_str(body)?;
+    Ok(response
+        .items
+        .into_iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let status = if item.pull_request.is_some() && item.state == "closed" {
+                IssueStatus::Merged
+            } else if item.state == "closed" {
+                IssueStatus::Closed
+            } else {
+                IssueStatus::Open
+            };
+            IssueResult {
+                title: item.title,
+                url: item.html_url,
+                status,
+                relevance_score: item.score.unwrap_or_else(|| 1.0 / (idx + 1) as f64),
+            }
+        })
+        .collect())
+}
+
+fn first_meaningful_line(message: &str) -> Option<&str> {
+    message.lines().map(str::trim).find(|line| {
+        !line.is_empty()
+            && *line != "---stderr---"
+            && !line.starts_with("Finished ")
+            && !line.starts_with("Compiling ")
+    })
+}
+
 fn extract_mcp_text(body: &str) -> anyhow::Result<String> {
     let json: serde_json::Value = serde_json::from_str(body)?;
     if let Some(error) = json.get("error") {
@@ -1289,6 +1343,51 @@ pandas
                 .iter()
                 .any(|example| example.code.contains("Serialize and Deserialize"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_search_issues_queries_github_and_parses_results() {
+        let broker = ReferenceBroker::new().with_http_get(|url| async move {
+            assert!(url.starts_with("https://api.github.com/search/issues?q="));
+            assert!(url.contains("tokio"));
+            assert!(url.contains("type%3Aissue"));
+            Ok(r#"{
+  "total_count": 2,
+  "items": [
+    {
+      "title": "unresolved import after feature change",
+      "html_url": "https://github.com/tokio-rs/tokio/issues/1",
+      "state": "open",
+      "score": 8.5
+    },
+    {
+      "title": "compile error migration note",
+      "html_url": "https://github.com/tokio-rs/tokio/issues/2",
+      "state": "closed",
+      "score": 4.0
+    }
+  ]
+}"#
+            .to_string())
+        });
+
+        let issues = broker
+            .search_issues(
+                &PackageId {
+                    name: "tokio".to_string(),
+                    version: Some("1.44".to_string()),
+                    registry: Some("crates.io".to_string()),
+                },
+                "error[E0432]: unresolved import",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].title, "unresolved import after feature change");
+        assert_eq!(issues[0].status, IssueStatus::Open);
+        assert_eq!(issues[1].status, IssueStatus::Closed);
+        assert!(issues[0].relevance_score > issues[1].relevance_score);
     }
 
     #[tokio::test]

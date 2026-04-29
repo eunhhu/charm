@@ -98,6 +98,7 @@ pub struct SessionRuntime {
     lsp: LspSnapshot,
     mcp: McpSnapshot,
     subagent_bus: SubAgentBus,
+    reference_broker: ReferenceBroker,
     trace_store: AgentTraceStore,
     token_saver: TokenSaver,
     current_turn_id: Option<String>,
@@ -179,6 +180,7 @@ impl SessionRuntime {
             lsp,
             mcp,
             subagent_bus: SubAgentBus::new(),
+            reference_broker: ReferenceBroker::new(),
             trace_store: AgentTraceStore::new(workspace_root, session_id),
             token_saver: TokenSaver::new(),
             current_turn_id: None,
@@ -399,7 +401,8 @@ impl SessionRuntime {
         let result = self
             .execute_tool_with_gates(&tool_call, &approval.tool_name)
             .await;
-        self.record_tool_result(&tool_call, &approval.tool_name, &result)?;
+        self.record_tool_result(&tool_call, &approval.tool_name, &result)
+            .await?;
         if let Some(tool_call_id) = approval.tool_call_id.clone() {
             self.snapshot.messages.push(Message {
                 role: "tool".to_string(),
@@ -526,22 +529,28 @@ impl SessionRuntime {
         Ok(evidence)
     }
 
-    async fn collect_reference_packs(&self, message: &str) -> Vec<ReferencePack> {
+    async fn collect_reference_packs(&mut self, message: &str) -> Vec<ReferencePack> {
         if !reference_gate_required(message) {
             return Vec::new();
         }
 
-        let mut broker = ReferenceBroker::new();
-        let packages = broker.resolve_packages(&self.workspace_root);
+        let packages = self.reference_broker.resolve_packages(&self.workspace_root);
         let mentioned = reference_packages_for_message(message, packages);
         let roots = local_reference_source_roots(&self.workspace_root);
         let mut packs = Vec::new();
         for package in mentioned {
-            match broker.fetch_from_local_source_roots(&package, &roots, message) {
+            match self
+                .reference_broker
+                .fetch_from_local_source_roots(&package, &roots, message)
+            {
                 Ok(pack) => packs.push(pack),
-                Err(_) => match broker.fetch_docs(&package).await {
+                Err(_) => match self.reference_broker.fetch_docs(&package).await {
                     Ok(pack) => packs.push(pack),
-                    Err(_) => packs.push(local_reference_gate_pack(&broker, message, package)),
+                    Err(_) => packs.push(local_reference_gate_pack(
+                        &self.reference_broker,
+                        message,
+                        package,
+                    )),
                 },
             }
         }
@@ -561,14 +570,14 @@ impl SessionRuntime {
         self.trace(self.current_turn_id.as_deref(), event, payload)
     }
 
-    fn record_tool_result(
+    async fn record_tool_result(
         &mut self,
         call: &ToolCall,
         tool_name: &str,
         result: &ToolResult,
     ) -> anyhow::Result<()> {
         self.observe_verification(call, result);
-        self.maybe_force_external_precedent(call, result);
+        self.maybe_force_external_precedent(call, result).await;
         let minified = self.token_saver.minify(MinifyRequest {
             source_kind: source_kind_for_tool(call),
             raw: result.output.clone(),
@@ -642,7 +651,7 @@ impl SessionRuntime {
         self.snapshot.verification.updated_at = Some(Utc::now());
     }
 
-    fn maybe_force_external_precedent(&mut self, call: &ToolCall, result: &ToolResult) {
+    async fn maybe_force_external_precedent(&mut self, call: &ToolCall, result: &ToolResult) {
         if result.success {
             return;
         }
@@ -671,8 +680,10 @@ impl SessionRuntime {
             return;
         }
 
-        let mut pack = ReferenceBroker::new().compile_reference_pack(
-            ReferenceSourceKind::GitHubIssues,
+        let issue_findings = self
+            .fetch_external_precedent_findings(&command, &signature)
+            .await;
+        let findings = if issue_findings.is_empty() {
             vec![RawFinding {
                 kind: FindingKind::Caveat,
                 title: Some("External precedent required".to_string()),
@@ -681,10 +692,20 @@ impl SessionRuntime {
                 ),
                 language: None,
                 source_url: None,
-            }],
+            }]
+        } else {
+            issue_findings
+        };
+        let mut pack = self.reference_broker.compile_reference_pack(
+            ReferenceSourceKind::GitHubIssues,
+            findings,
             &query,
         );
-        pack.confidence = ReferenceConfidence::Uncertain;
+        pack.confidence = if pack.source_refs.is_empty() {
+            ReferenceConfidence::Uncertain
+        } else {
+            ReferenceConfidence::Medium
+        };
         pack.relevant_rules.push(
             "After two failed local fix cycles, stop guessing and verify external precedent before the next implementation attempt."
                 .to_string(),
@@ -709,6 +730,47 @@ impl SessionRuntime {
                 "reference_pack": pack,
             }),
         );
+    }
+
+    async fn fetch_external_precedent_findings(
+        &self,
+        command: &str,
+        signature: &str,
+    ) -> Vec<RawFinding> {
+        let packages = self.reference_broker.resolve_packages(&self.workspace_root);
+        let package = packages
+            .into_iter()
+            .find(|package| {
+                let name = package.name.to_ascii_lowercase();
+                command.to_ascii_lowercase().contains(&name)
+                    || signature.to_ascii_lowercase().contains(&name)
+            })
+            .unwrap_or_else(|| PackageId {
+                name: workspace_package_name(&self.workspace_root),
+                version: None,
+                registry: None,
+            });
+
+        match self
+            .reference_broker
+            .search_issues(&package, signature)
+            .await
+        {
+            Ok(issues) => issues
+                .into_iter()
+                .map(|issue| RawFinding {
+                    kind: FindingKind::Caveat,
+                    title: Some(format!("GitHub precedent: {}", issue.title)),
+                    content: format!(
+                        "{:?} issue matched repeated local failure with relevance {:.2}: {}",
+                        issue.status, issue.relevance_score, issue.title
+                    ),
+                    language: None,
+                    source_url: Some(issue.url),
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     fn verification_gap_event(&mut self, content: &str) -> Option<RuntimeEvent> {
@@ -871,7 +933,7 @@ impl SessionRuntime {
                     execution: execution.clone(),
                 });
                 let result = self.execute_tool_with_gates(&call, &tool_name).await;
-                self.record_tool_result(&call, &tool_name, &result)?;
+                self.record_tool_result(&call, &tool_name, &result).await?;
 
                 if result
                     .metadata
@@ -1104,7 +1166,7 @@ impl SessionRuntime {
                     execution: execution.clone(),
                 });
                 let result = self.execute_tool_with_gates(&call, &tool_name).await;
-                self.record_tool_result(&call, &tool_name, &result)?;
+                self.record_tool_result(&call, &tool_name, &result).await?;
 
                 if result
                     .metadata
@@ -1271,7 +1333,7 @@ impl SessionRuntime {
                     execution: execution.clone(),
                 });
                 let result = self.execute_tool_with_gates(&call, &tool_name).await;
-                self.record_tool_result(&call, &tool_name, &result)?;
+                self.record_tool_result(&call, &tool_name, &result).await?;
 
                 self.snapshot.messages.push(Message {
                     role: "tool".to_string(),
@@ -2548,6 +2610,15 @@ fn reference_packages_for_message(message: &str, packages: Vec<PackageId>) -> Ve
     matched
 }
 
+fn workspace_package_name(workspace_root: &Path) -> String {
+    workspace_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("workspace")
+        .to_string()
+}
+
 fn local_reference_source_roots(workspace_root: &Path) -> Vec<PathBuf> {
     let mut roots = vec![
         workspace_root.join(".cargo").join("registry").join("src"),
@@ -3557,6 +3628,21 @@ mod tests {
         )
         .await
         .unwrap();
+        runtime.reference_broker = ReferenceBroker::new().with_http_get(|url| async move {
+            assert!(url.starts_with("https://api.github.com/search/issues?q="));
+            Ok(r#"{
+  "total_count": 1,
+  "items": [
+    {
+      "title": "Known unresolved import fix",
+      "html_url": "https://github.com/example/project/issues/42",
+      "state": "closed",
+      "score": 7.25
+    }
+  ]
+}"#
+            .to_string())
+        });
         let session_id = runtime.snapshot().metadata.session_id.clone();
         runtime.current_turn_id = Some("turn-precedent".to_string());
 
@@ -3576,11 +3662,13 @@ mod tests {
 
         runtime
             .record_tool_result(&call, "run_command", &failure)
+            .await
             .unwrap();
         assert!(runtime.snapshot().reference_packs.is_empty());
 
         runtime
             .record_tool_result(&call, "run_command", &failure)
+            .await
             .unwrap();
 
         assert!(runtime.snapshot().reference_packs.iter().any(|pack| {
@@ -3590,6 +3678,10 @@ mod tests {
                     .relevant_rules
                     .iter()
                     .any(|rule| rule.contains("stop guessing"))
+                && pack
+                    .source_refs
+                    .iter()
+                    .any(|source| source.url == "https://github.com/example/project/issues/42")
         }));
 
         let trace_path = dir
