@@ -636,56 +636,62 @@ impl SessionRuntime {
 
     fn scope_guard_result(&self, call: &ToolCall, tool_name: &str) -> Option<ToolResult> {
         let contract = self.snapshot.current_task_contract.as_ref()?;
-        let target = tool_scope_target(call)?;
+        let targets = tool_scope_targets(call);
+        if targets.is_empty() {
+            return None;
+        }
         let allowed_scope = concrete_scope_patterns(contract);
         if allowed_scope.is_empty() {
             return None;
         }
 
-        let normalized_target = match self.workspace_relative_target(target) {
-            Ok(target) => target,
-            Err(err) => {
-                return Some(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Tool policy gate: {err}")),
-                    metadata: Some(serde_json::json!({
-                        "blocked_by": "scope_guard",
-                        "tool_name": tool_name,
-                        "target": target,
-                        "allowed_scope": allowed_scope,
-                    })),
-                });
+        for target in targets {
+            let normalized_target = match self.workspace_relative_target(&target) {
+                Ok(target) => target,
+                Err(err) => {
+                    return Some(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Tool policy gate: {err}")),
+                        metadata: Some(serde_json::json!({
+                            "blocked_by": "scope_guard",
+                            "tool_name": tool_name,
+                            "target": target,
+                            "allowed_scope": allowed_scope,
+                        })),
+                    });
+                }
+            };
+            if scope_allows_target(&normalized_target, &allowed_scope) {
+                continue;
             }
-        };
-        if scope_allows_target(&normalized_target, &allowed_scope) {
-            return None;
-        }
 
-        let result = ToolResult {
-            success: false,
-            output: String::new(),
-            error: Some(format!(
-                "Tool policy gate: target '{normalized_target}' is outside current task scope ({})",
-                allowed_scope.join(", ")
-            )),
-            metadata: Some(serde_json::json!({
-                "blocked_by": "scope_guard",
-                "tool_name": tool_name,
-                "target": normalized_target,
-                "allowed_scope": allowed_scope,
-            })),
-        };
-        let _ = self.trace_current_turn(
-            "tool_policy_blocked",
-            serde_json::json!({
-                "tool_name": tool_name,
-                "call": call,
-                "reason": "tool target outside current task scope",
-                "result": result,
-            }),
-        );
-        Some(result)
+            let result = ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Tool policy gate: target '{normalized_target}' is outside current task scope ({})",
+                    allowed_scope.join(", ")
+                )),
+                metadata: Some(serde_json::json!({
+                    "blocked_by": "scope_guard",
+                    "tool_name": tool_name,
+                    "target": normalized_target,
+                    "allowed_scope": allowed_scope,
+                })),
+            };
+            let _ = self.trace_current_turn(
+                "tool_policy_blocked",
+                serde_json::json!({
+                    "tool_name": tool_name,
+                    "call": call,
+                    "reason": "tool target outside current task scope",
+                    "result": result,
+                }),
+            );
+            return Some(result);
+        }
+        None
     }
 
     fn workspace_relative_target(&self, target: &str) -> Result<String, String> {
@@ -2615,18 +2621,107 @@ fn requires_repo_evidence_before_execution(call: &ToolCall) -> bool {
     )
 }
 
-fn tool_scope_target(call: &ToolCall) -> Option<&str> {
+fn tool_scope_targets(call: &ToolCall) -> Vec<String> {
     match call {
         ToolCall::EditPatch { file_path, .. } | ToolCall::WriteFile { file_path, .. } => {
-            Some(file_path)
+            vec![file_path.clone()]
         }
         ToolCall::RunCommand {
+            command,
             cwd: Some(cwd),
             risk_class:
                 RiskClass::StatefulExec | RiskClass::Destructive | RiskClass::ExternalSideEffect,
             ..
-        } if cwd != "." => Some(cwd),
-        _ => None,
+        } if cwd != "." => {
+            let mut targets = vec![cwd.clone()];
+            for target in command_path_mentions(command) {
+                let target = if Path::new(&target).is_relative() {
+                    format!("{}/{}", cwd.trim_end_matches('/'), target)
+                } else {
+                    target
+                };
+                push_unique_string(&mut targets, target);
+            }
+            targets
+        }
+        ToolCall::RunCommand {
+            command,
+            risk_class:
+                RiskClass::StatefulExec | RiskClass::Destructive | RiskClass::ExternalSideEffect,
+            ..
+        } => command_path_mentions(command),
+        _ => Vec::new(),
+    }
+}
+
+fn command_path_mentions(command: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for raw in command.split_whitespace() {
+        let token = raw.trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '\''
+                    | '"'
+                    | ','
+                    | ';'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | '|'
+                    | '&'
+            )
+        });
+        if token.is_empty() || token.starts_with('-') {
+            continue;
+        }
+        if let Some((_, value)) = token.split_once('=') {
+            push_command_path_candidate(&mut paths, value);
+        } else {
+            push_command_path_candidate(&mut paths, token);
+        }
+    }
+    paths
+}
+
+fn push_command_path_candidate(paths: &mut Vec<String>, candidate: &str) {
+    let path = candidate
+        .trim()
+        .trim_start_matches("./")
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_end_matches(',')
+        .trim_end_matches(';');
+    if looks_like_command_path(path) {
+        push_unique_string(paths, path.to_string());
+    }
+}
+
+fn looks_like_command_path(path: &str) -> bool {
+    if path.is_empty() || path.starts_with("http://") || path.starts_with("https://") {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    path.starts_with('/')
+        || lower.starts_with("src/")
+        || lower.starts_with("docs/")
+        || lower.starts_with("tests/")
+        || lower.starts_with(".charm/")
+        || [
+            ".rs", ".md", ".toml", ".json", ".yaml", ".yml", ".py", ".js", ".ts", ".tsx", ".jsx",
+            ".css", ".html", ".lock",
+        ]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
+fn push_unique_string(items: &mut Vec<String>, value: String) {
+    if !items.iter().any(|item| item == &value) {
+        items.push(value);
     }
 }
 
@@ -4070,6 +4165,110 @@ tokio = "1.44"
 
         assert!(result.success, "{result:?}");
         assert!(dir.path().join("src/tui/app.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn scope_guard_blocks_stateful_command_target_outside_current_task_contract() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/tui")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/core")).unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+        runtime.snapshot.current_task_contract = Some(TaskContract {
+            abstraction_score: 0.4,
+            objective: "Fix TUI shortcuts".to_string(),
+            scope: vec!["src/tui/**".to_string()],
+            repo_anchors: Vec::new(),
+            acceptance: Vec::new(),
+            verification: Vec::new(),
+            side_effects: vec!["May affect TUI input/keybinding compatibility".to_string()],
+            assumptions: Vec::new(),
+            open_questions: Vec::new(),
+            depth: crate::agent::task_concretizer::ExecutionDepth::Normal,
+        });
+
+        let result = runtime
+            .execute_tool_with_gates(
+                &ToolCall::RunCommand {
+                    command: "touch src/core/outside.rs".to_string(),
+                    cwd: None,
+                    blocking: true,
+                    timeout_ms: None,
+                    risk_class: RiskClass::StatefulExec,
+                },
+                "run_command",
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outside current task scope")
+        );
+        assert!(!dir.path().join("src/core/outside.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn scope_guard_allows_stateful_command_target_inside_current_task_contract() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/tui")).unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+        runtime.snapshot.current_task_contract = Some(TaskContract {
+            abstraction_score: 0.4,
+            objective: "Fix TUI shortcuts".to_string(),
+            scope: vec!["src/tui/**".to_string()],
+            repo_anchors: Vec::new(),
+            acceptance: Vec::new(),
+            verification: Vec::new(),
+            side_effects: vec!["May affect TUI input/keybinding compatibility".to_string()],
+            assumptions: Vec::new(),
+            open_questions: Vec::new(),
+            depth: crate::agent::task_concretizer::ExecutionDepth::Normal,
+        });
+
+        let result = runtime
+            .execute_tool_with_gates(
+                &ToolCall::RunCommand {
+                    command: "touch src/tui/inside.rs".to_string(),
+                    cwd: None,
+                    blocking: true,
+                    timeout_ms: None,
+                    risk_class: RiskClass::StatefulExec,
+                },
+                "run_command",
+            )
+            .await;
+
+        assert!(result.success, "{result:?}");
+        assert!(dir.path().join("src/tui/inside.rs").exists());
     }
 
     #[tokio::test]
