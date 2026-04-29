@@ -74,7 +74,6 @@ src/
 
 현재 가장 중요한 방향은 이미 세션 런타임에 연결된 `TaskConcretizer`, `ReferenceBroker`, `TokenSaver`, `PromptCompiler`를 더 엄격한 gate와 더 좋은 UX로 다듬는 것입니다. 새 추상화를 늘리기보다 다음을 우선합니다.
 
-- scope guard 확장: source-aware pattern
 - TokenSaver-backed `/compact`의 replay/audit UI 연결
 - trace replay/audit UI
 - TUI 세션의 병렬 도구 실행 안전 연결

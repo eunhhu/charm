@@ -640,7 +640,7 @@ impl SessionRuntime {
         if targets.is_empty() {
             return None;
         }
-        let allowed_scope = concrete_scope_patterns(contract);
+        let allowed_scope = self.scope_guard_allowed_patterns(contract);
         if allowed_scope.is_empty() {
             return None;
         }
@@ -710,6 +710,25 @@ impl SessionRuntime {
             )
         })?;
         Ok(path_to_slash(relative))
+    }
+
+    fn scope_guard_allowed_patterns(&self, contract: &TaskContract) -> Vec<String> {
+        let mut patterns = concrete_scope_patterns(contract);
+        for anchor in &contract.repo_anchors {
+            if let Some(path) = anchor
+                .file_path
+                .as_deref()
+                .and_then(normalize_scope_pattern)
+            {
+                push_unique_string(&mut patterns, path);
+            }
+        }
+        for evidence in &self.snapshot.repo_evidence {
+            if let Some(path) = normalize_scope_pattern(&evidence.file_path) {
+                push_unique_string(&mut patterns, path);
+            }
+        }
+        patterns
     }
 
     async fn store_tool_result_message(
@@ -4215,6 +4234,127 @@ tokio = "1.44"
 
         assert!(result.success, "{result:?}");
         assert!(dir.path().join("src/tui/app.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn scope_guard_uses_repo_evidence_when_contract_scope_is_abstract() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/tui")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/core")).unwrap();
+        std::fs::write(dir.path().join("src/tui/app.rs"), "pub fn tui() {}\n").unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+        runtime.snapshot.current_task_contract = Some(TaskContract {
+            abstraction_score: 0.5,
+            objective: "Fix relevant code".to_string(),
+            scope: vec!["Conservative scope - will expand after initial inspection".to_string()],
+            repo_anchors: Vec::new(),
+            acceptance: Vec::new(),
+            verification: Vec::new(),
+            side_effects: Vec::new(),
+            assumptions: Vec::new(),
+            open_questions: Vec::new(),
+            depth: crate::agent::task_concretizer::ExecutionDepth::Normal,
+        });
+        runtime.snapshot.repo_evidence = vec![crate::retrieval::types::Evidence {
+            source: "grep".to_string(),
+            rank: 1.0,
+            file_path: "src/tui/app.rs".to_string(),
+            line: 1,
+            snippet: "pub fn tui() {}".to_string(),
+            context: None,
+        }];
+        runtime.turn_repo_evidence_seen = true;
+
+        let result = runtime
+            .execute_tool_with_gates(
+                &ToolCall::WriteFile {
+                    file_path: "src/core/mod.rs".to_string(),
+                    content: "pub fn outside() {}\n".to_string(),
+                },
+                "write_file",
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("allowed_scope"))
+                .and_then(Value::as_array)
+                .is_some_and(|scope| scope.iter().any(|item| item == "src/tui/app.rs"))
+        );
+        assert!(!dir.path().join("src/core/mod.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn scope_guard_allows_repo_evidence_target_when_contract_scope_is_abstract() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/tui")).unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+        runtime.snapshot.current_task_contract = Some(TaskContract {
+            abstraction_score: 0.5,
+            objective: "Fix relevant code".to_string(),
+            scope: vec!["Conservative scope - will expand after initial inspection".to_string()],
+            repo_anchors: Vec::new(),
+            acceptance: Vec::new(),
+            verification: Vec::new(),
+            side_effects: Vec::new(),
+            assumptions: Vec::new(),
+            open_questions: Vec::new(),
+            depth: crate::agent::task_concretizer::ExecutionDepth::Normal,
+        });
+        runtime.snapshot.repo_evidence = vec![crate::retrieval::types::Evidence {
+            source: "grep".to_string(),
+            rank: 1.0,
+            file_path: "src/tui/app.rs".to_string(),
+            line: 1,
+            snippet: "pub fn tui() {}".to_string(),
+            context: None,
+        }];
+        runtime.turn_repo_evidence_seen = true;
+
+        let result = runtime
+            .execute_tool_with_gates(
+                &ToolCall::WriteFile {
+                    file_path: "src/tui/app.rs".to_string(),
+                    content: "pub fn tui() { println!(\"ok\"); }\n".to_string(),
+                },
+                "write_file",
+            )
+            .await;
+
+        assert!(result.success, "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/tui/app.rs")).unwrap(),
+            "pub fn tui() { println!(\"ok\"); }\n"
+        );
     }
 
     #[tokio::test]

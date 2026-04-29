@@ -312,7 +312,6 @@ rtk cargo test
 - **Delegate 모드**: 실험적 기능
 
 ### 개발 중인 기능
-- Scope guard 확장: source-aware pattern
 - TokenSaver-backed `/compact`의 replay/audit UI 연결
 - AgentTraceStore 기반 audit/replay UI
 - 컨텍스트 압축 최적화
