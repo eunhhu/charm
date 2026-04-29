@@ -4369,6 +4369,114 @@ tokio = "1.44"
     }
 
     #[tokio::test]
+    async fn mixed_tool_calls_parallelize_read_prefix_before_ordered_write() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src").join("a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("src").join("b.rs"), "pub fn b() {}\n").unwrap();
+        let model = fake_model(vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some("Inspecting then writing".to_string()),
+                tool_calls: Some(vec![
+                    ToolCallBlock {
+                        id: "call-a".to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "read_range".to_string(),
+                            arguments: serde_json::json!({
+                                "file_path": "src/a.rs",
+                                "offset": 0,
+                                "limit": 10
+                            })
+                            .to_string(),
+                        },
+                    },
+                    ToolCallBlock {
+                        id: "call-b".to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "read_range".to_string(),
+                            arguments: serde_json::json!({
+                                "file_path": "src/b.rs",
+                                "offset": 0,
+                                "limit": 10
+                            })
+                            .to_string(),
+                        },
+                    },
+                    ToolCallBlock {
+                        id: "call-write".to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "write_file".to_string(),
+                            arguments: serde_json::json!({
+                                "file_path": "src/output.rs",
+                                "content": "pub fn output() {}\n"
+                            })
+                            .to_string(),
+                        },
+                    },
+                ]),
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Some("Done".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+            },
+        ]);
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+
+        let events = runtime.submit_input("Read then write src files").await.unwrap();
+
+        let tool_event_order = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::ToolCallStarted { .. } => Some("started"),
+                RuntimeEvent::ToolCallFinished { .. } => Some("finished"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_event_order,
+            vec![
+                "started", "started", "finished", "finished", "started", "finished"
+            ]
+        );
+        let tool_call_ids = runtime
+            .snapshot()
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(tool_call_ids, vec!["call-a", "call-b", "call-write"]);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src").join("output.rs")).unwrap(),
+            "pub fn output() {}\n"
+        );
+    }
+
+    #[tokio::test]
     async fn scope_guard_blocks_write_outside_current_task_contract() {
         let dir = tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/tui")).unwrap();
