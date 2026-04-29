@@ -600,6 +600,9 @@ impl SessionRuntime {
     }
 
     async fn execute_tool_with_gates(&mut self, call: &ToolCall, tool_name: &str) -> ToolResult {
+        if let Some(result) = self.scope_guard_result(call, tool_name) {
+            return result;
+        }
         if requires_repo_evidence_before_execution(call) && !self.turn_repo_evidence_seen {
             let result = ToolResult {
                 success: false,
@@ -629,6 +632,78 @@ impl SessionRuntime {
             self.turn_repo_evidence_seen = true;
         }
         result
+    }
+
+    fn scope_guard_result(&self, call: &ToolCall, tool_name: &str) -> Option<ToolResult> {
+        let contract = self.snapshot.current_task_contract.as_ref()?;
+        let target = tool_scope_target(call)?;
+        let allowed_scope = concrete_scope_patterns(contract);
+        if allowed_scope.is_empty() {
+            return None;
+        }
+
+        let normalized_target = match self.workspace_relative_target(target) {
+            Ok(target) => target,
+            Err(err) => {
+                return Some(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Tool policy gate: {err}")),
+                    metadata: Some(serde_json::json!({
+                        "blocked_by": "scope_guard",
+                        "tool_name": tool_name,
+                        "target": target,
+                        "allowed_scope": allowed_scope,
+                    })),
+                });
+            }
+        };
+        if scope_allows_target(&normalized_target, &allowed_scope) {
+            return None;
+        }
+
+        let result = ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!(
+                "Tool policy gate: target '{normalized_target}' is outside current task scope ({})",
+                allowed_scope.join(", ")
+            )),
+            metadata: Some(serde_json::json!({
+                "blocked_by": "scope_guard",
+                "tool_name": tool_name,
+                "target": normalized_target,
+                "allowed_scope": allowed_scope,
+            })),
+        };
+        let _ = self.trace_current_turn(
+            "tool_policy_blocked",
+            serde_json::json!({
+                "tool_name": tool_name,
+                "call": call,
+                "reason": "tool target outside current task scope",
+                "result": result,
+            }),
+        );
+        Some(result)
+    }
+
+    fn workspace_relative_target(&self, target: &str) -> Result<String, String> {
+        let resolved = resolve_workspace_path(target, &self.workspace_root)?;
+        let root = self.workspace_root.canonicalize().map_err(|err| {
+            format!(
+                "cannot canonicalize workspace root '{}': {err}",
+                self.workspace_root.display()
+            )
+        })?;
+        let relative = resolved.strip_prefix(&root).map_err(|_| {
+            format!(
+                "target '{}' resolves outside workspace root '{}'",
+                target,
+                root.display()
+            )
+        })?;
+        Ok(path_to_slash(relative))
     }
 
     fn observe_verification(&mut self, call: &ToolCall, result: &ToolResult) {
@@ -2540,6 +2615,77 @@ fn requires_repo_evidence_before_execution(call: &ToolCall) -> bool {
     )
 }
 
+fn tool_scope_target(call: &ToolCall) -> Option<&str> {
+    match call {
+        ToolCall::EditPatch { file_path, .. } | ToolCall::WriteFile { file_path, .. } => {
+            Some(file_path)
+        }
+        ToolCall::RunCommand {
+            cwd: Some(cwd),
+            risk_class:
+                RiskClass::StatefulExec | RiskClass::Destructive | RiskClass::ExternalSideEffect,
+            ..
+        } if cwd != "." => Some(cwd),
+        _ => None,
+    }
+}
+
+fn concrete_scope_patterns(contract: &TaskContract) -> Vec<String> {
+    contract
+        .scope
+        .iter()
+        .filter_map(|scope| normalize_scope_pattern(scope))
+        .collect()
+}
+
+fn normalize_scope_pattern(scope: &str) -> Option<String> {
+    let trimmed = scope
+        .trim()
+        .trim_matches('`')
+        .trim_start_matches("./")
+        .trim_end_matches('/');
+    if trimmed.is_empty()
+        || trimmed.contains(' ')
+        || trimmed.contains("determined")
+        || trimmed.contains("Conservative")
+    {
+        return None;
+    }
+    if !(trimmed.contains('/') || trimmed.contains('.') || trimmed.ends_with("**")) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn scope_allows_target(target: &str, allowed_scope: &[String]) -> bool {
+    allowed_scope
+        .iter()
+        .any(|scope| scope_pattern_allows_target(scope, target))
+}
+
+fn scope_pattern_allows_target(scope: &str, target: &str) -> bool {
+    if let Some(base) = scope.strip_suffix("/**") {
+        return target == base || target.starts_with(&format!("{base}/"));
+    }
+    if scope.ends_with('/') {
+        return target.starts_with(scope);
+    }
+    if Path::new(scope).extension().is_some() {
+        return target == scope;
+    }
+    target == scope || target.starts_with(&format!("{scope}/"))
+}
+
+fn path_to_slash(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn tool_provides_repo_evidence(call: &ToolCall) -> bool {
     matches!(
         call,
@@ -3816,6 +3962,114 @@ tokio = "1.44"
                     .iter()
                     .any(|caveat| caveat.contains("Answered discussion matched"))
         }));
+    }
+
+    #[tokio::test]
+    async fn scope_guard_blocks_write_outside_current_task_contract() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/tui")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/core")).unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+        runtime.snapshot.current_task_contract = Some(TaskContract {
+            abstraction_score: 0.4,
+            objective: "Fix TUI shortcuts".to_string(),
+            scope: vec!["src/tui/**".to_string()],
+            repo_anchors: Vec::new(),
+            acceptance: Vec::new(),
+            verification: Vec::new(),
+            side_effects: vec!["May affect TUI input/keybinding compatibility".to_string()],
+            assumptions: Vec::new(),
+            open_questions: Vec::new(),
+            depth: crate::agent::task_concretizer::ExecutionDepth::Normal,
+        });
+        runtime.turn_repo_evidence_seen = true;
+
+        let result = runtime
+            .execute_tool_with_gates(
+                &ToolCall::WriteFile {
+                    file_path: "src/core/mod.rs".to_string(),
+                    content: "pub fn outside() {}\n".to_string(),
+                },
+                "write_file",
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outside current task scope")
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("blocked_by"))
+                .and_then(Value::as_str),
+            Some("scope_guard")
+        );
+        assert!(!dir.path().join("src/core/mod.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn scope_guard_allows_write_inside_current_task_contract() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/tui")).unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+        runtime.snapshot.current_task_contract = Some(TaskContract {
+            abstraction_score: 0.4,
+            objective: "Fix TUI shortcuts".to_string(),
+            scope: vec!["src/tui/**".to_string()],
+            repo_anchors: Vec::new(),
+            acceptance: Vec::new(),
+            verification: Vec::new(),
+            side_effects: vec!["May affect TUI input/keybinding compatibility".to_string()],
+            assumptions: Vec::new(),
+            open_questions: Vec::new(),
+            depth: crate::agent::task_concretizer::ExecutionDepth::Normal,
+        });
+        runtime.turn_repo_evidence_seen = true;
+
+        let result = runtime
+            .execute_tool_with_gates(
+                &ToolCall::WriteFile {
+                    file_path: "src/tui/app.rs".to_string(),
+                    content: "pub fn inside() {}\n".to_string(),
+                },
+                "write_file",
+            )
+            .await;
+
+        assert!(result.success, "{result:?}");
+        assert!(dir.path().join("src/tui/app.rs").exists());
     }
 
     #[tokio::test]

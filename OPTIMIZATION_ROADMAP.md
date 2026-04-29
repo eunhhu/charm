@@ -46,9 +46,9 @@ TaskContract
 
 ## 현재 진행 요약
 
-- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, repeated-failure precedent gate, GitHub issue/discussion precedent provider, command cancel, read-range FileCache, TokenSaver-backed `/compact`.
-- **부분/Wired**: Context7/local package/registry/web reference provider, FastExecutor read-only batch path, trace linkage.
-- **남음**: side-effect scope guard 정밀화, replay/audit UI, persistent cache, full TUI parallel tool execution.
+- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, repeated-failure precedent gate, GitHub issue/discussion precedent provider, write-target scope guard, command cancel, read-range FileCache, TokenSaver-backed `/compact`.
+- **부분/Wired**: Context7/local package/registry/web reference provider, FastExecutor read-only batch path, trace linkage, side-effect scope inference.
+- **남음**: command/source-aware scope guard 확장, replay/audit UI, persistent cache, full TUI parallel tool execution.
 
 ## 제품 레이어 로드맵
 
@@ -86,7 +86,9 @@ pub struct TaskContract {
 - [x] ask / inspect / auto-assume / execute 결정
   - Status: Partially Wired. 현재 자동 세션은 conservative assumption + evidence collection 중심. 사용자 질의 interrupt 정책은 추가 필요.
 - [x] side-effect scan 추가
-  - Status: Wired. 요청 surface에서 TUI/keybinding, session/runtime, auth/provider, schema, CLI, cache/index, dependency/API, destructive risk를 contract에 기록.
+  - Status: Wired. 요청 surface에서 TUI/keybinding, session/runtime, auth/provider, schema, CLI, cache/index, dependency/API, destructive risk를 contract에 기록하고, concrete scope(`src/tui/**`, `src/runtime/**` 등)를 추론.
+- [x] side-effect 기반 scope guard 1차
+  - Status: Wired for writes. `EditPatch`/`WriteFile` target이 current `TaskContract.scope` 밖이면 registry 실행 전 `scope_guard`로 차단하고 trace에 남김. Command mutation parsing과 approval 전 queue 차단은 후속 확장.
 
 ### Phase 2: Reference-First Layer
 

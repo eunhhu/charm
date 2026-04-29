@@ -157,7 +157,10 @@ impl TaskConcretizer {
         TaskContract {
             abstraction_score: score,
             objective: request.to_string(),
-            scope: vec!["To be determined from repo inspection".to_string()],
+            scope: infer_scope_or_default(
+                request,
+                "To be determined from repo inspection".to_string(),
+            ),
             repo_anchors: Vec::new(),
             acceptance: vec!["User request is addressed with grounded evidence".to_string()],
             verification,
@@ -177,7 +180,10 @@ impl TaskConcretizer {
         TaskContract {
             abstraction_score: score,
             objective: request.to_string(),
-            scope: vec!["Conservative scope - will expand after initial inspection".to_string()],
+            scope: infer_scope_or_default(
+                request,
+                "Conservative scope - will expand after initial inspection".to_string(),
+            ),
             repo_anchors: Vec::new(),
             acceptance: vec!["Minimal viable improvement".to_string()],
             verification: vec!["Build passes".to_string(), "Basic smoke test".to_string()],
@@ -206,6 +212,151 @@ impl TaskConcretizer {
             "Could you specify which files or components are involved?".to_string()
         }
     }
+}
+
+fn infer_scope_or_default(request: &str, fallback: String) -> Vec<String> {
+    let mut scope = infer_scope(request);
+    if scope.is_empty() {
+        scope.push(fallback);
+    }
+    scope
+}
+
+fn infer_scope(request: &str) -> Vec<String> {
+    let lower = request.to_ascii_lowercase();
+    let mut scope = Vec::new();
+
+    for path in extract_path_mentions(request) {
+        push_unique(&mut scope, path);
+    }
+    if contains_any(
+        &lower,
+        &[
+            "tui",
+            "terminal",
+            "shortcut",
+            "keybinding",
+            "mac",
+            "단축키",
+            "터미널",
+        ],
+    ) {
+        push_unique(&mut scope, "src/tui/**".to_string());
+    }
+    if contains_any(
+        &lower,
+        &[
+            "repl",
+            "session",
+            "runtime",
+            "background",
+            "sub-agent",
+            "세션",
+            "런타임",
+        ],
+    ) {
+        push_unique(&mut scope, "src/runtime/**".to_string());
+    }
+    if contains_any(&lower, &["auth", "token", "api key", "provider", "model"]) {
+        push_unique(&mut scope, "src/providers/**".to_string());
+        push_unique(&mut scope, "src/runtime/**".to_string());
+    }
+    if contains_any(&lower, &["cli", "flag", "argument", "command"]) {
+        push_unique(&mut scope, "src/cli/**".to_string());
+        push_unique(&mut scope, "src/main.rs".to_string());
+    }
+    if contains_any(&lower, &["cache", "index", "search", "retrieval"]) {
+        push_unique(&mut scope, "src/indexer/**".to_string());
+        push_unique(&mut scope, "src/retrieval/**".to_string());
+        push_unique(&mut scope, "src/tools/**".to_string());
+    }
+    if contains_any(
+        &lower,
+        &[
+            "reference",
+            "context7",
+            "precedent",
+            "registry",
+            "github discussion",
+        ],
+    ) {
+        push_unique(&mut scope, "src/agent/reference_broker.rs".to_string());
+        push_unique(&mut scope, "src/runtime/**".to_string());
+    }
+    if contains_any(
+        &lower,
+        &[
+            "taskconcretizer",
+            "side-effect",
+            "side effect",
+            "scope guard",
+            "스코프",
+        ],
+    ) {
+        push_unique(&mut scope, "src/agent/task_concretizer.rs".to_string());
+        push_unique(&mut scope, "src/runtime/**".to_string());
+    }
+    if contains_any(
+        &lower,
+        &[
+            "dependency",
+            "upgrade",
+            "migrate",
+            "crate",
+            "package",
+            "sdk",
+        ],
+    ) {
+        push_unique(&mut scope, "Cargo.toml".to_string());
+        push_unique(&mut scope, "Cargo.lock".to_string());
+        push_unique(&mut scope, "package.json".to_string());
+        push_unique(&mut scope, "pyproject.toml".to_string());
+    }
+    if contains_any(&lower, &["readme", "docs", "documentation", "문서"]) {
+        push_unique(&mut scope, "README.md".to_string());
+        push_unique(&mut scope, "docs/**".to_string());
+    }
+
+    scope
+}
+
+fn extract_path_mentions(request: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for raw in request.split_whitespace() {
+        let token = raw.trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '\'' | '"' | ',' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+        });
+        if !looks_like_workspace_path(token) {
+            continue;
+        }
+        let path = token
+            .trim_start_matches("./")
+            .trim_end_matches('.')
+            .trim_end_matches(',')
+            .to_string();
+        if !path.is_empty() {
+            push_unique(&mut paths, path);
+        }
+    }
+    paths
+}
+
+fn looks_like_workspace_path(token: &str) -> bool {
+    if token.starts_with("http://") || token.starts_with("https://") {
+        return false;
+    }
+    let lower = token.to_ascii_lowercase();
+    [
+        ".rs", ".md", ".toml", ".json", ".yaml", ".yml", ".py", ".js", ".ts", ".tsx", ".jsx",
+        ".css", ".html",
+    ]
+    .iter()
+    .any(|suffix| lower.ends_with(suffix))
+        || lower.starts_with("src/")
+        || lower.starts_with("docs/")
 }
 
 fn infer_side_effects(request: &str) -> Vec<String> {
@@ -403,5 +554,15 @@ mod tests {
                 .iter()
                 .any(|effect| effect.contains("session/runtime state"))
         );
+    }
+
+    #[test]
+    fn concretize_for_auto_infers_concrete_scope_from_side_effect_surface() {
+        let concretizer = TaskConcretizer::new();
+        let contract = concretizer
+            .concretize_for_auto("Fix Mac shortcuts in the TUI REPL and session runtime");
+
+        assert!(contract.scope.iter().any(|scope| scope == "src/tui/**"));
+        assert!(contract.scope.iter().any(|scope| scope == "src/runtime/**"));
     }
 }
