@@ -1,7 +1,10 @@
+use crate::agent::reference_broker::ReferencePack;
+use crate::agent::task_concretizer::TaskContract;
 use crate::providers::types::Message;
+use crate::retrieval::types::Evidence;
 use crate::runtime::types::{
     ApprovalRequest, ApprovalStatus, AutonomyLevel, BackgroundJob, BackgroundJobStatus,
-    ComposerState, RouterIntent, WorkspacePreflight,
+    ComposerState, RouterIntent, VerificationState, WorkspacePreflight,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -79,6 +82,14 @@ pub struct SessionSnapshot {
     pub background_jobs: Vec<BackgroundJob>,
     pub preflight: WorkspacePreflight,
     pub composer: ComposerState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_task_contract: Option<TaskContract>,
+    #[serde(default)]
+    pub verification: VerificationState,
+    #[serde(default)]
+    pub repo_evidence: Vec<Evidence>,
+    #[serde(default)]
+    pub reference_packs: Vec<ReferencePack>,
 }
 
 impl SessionSnapshot {
@@ -287,6 +298,22 @@ impl SessionStore {
             &session_dir.join("composer.json"),
             &serde_json::to_string_pretty(&snapshot.composer)?,
         )?;
+        atomic_write(
+            &session_dir.join("task-contract.json"),
+            &serde_json::to_string_pretty(&snapshot.current_task_contract)?,
+        )?;
+        atomic_write(
+            &session_dir.join("verification.json"),
+            &serde_json::to_string_pretty(&snapshot.verification)?,
+        )?;
+        atomic_write(
+            &session_dir.join("repo-evidence.json"),
+            &serde_json::to_string_pretty(&snapshot.repo_evidence)?,
+        )?;
+        atomic_write(
+            &session_dir.join("reference-packs.json"),
+            &serde_json::to_string_pretty(&snapshot.reference_packs)?,
+        )?;
         Ok(())
     }
 
@@ -310,6 +337,14 @@ impl SessionStore {
             .unwrap_or(WorkspacePreflight::default());
         let composer =
             Self::load_optional(&session_dir, "composer.json").unwrap_or(ComposerState::default());
+        let current_task_contract =
+            Self::load_optional(&session_dir, "task-contract.json").unwrap_or_default();
+        let verification =
+            Self::load_optional(&session_dir, "verification.json").unwrap_or_default();
+        let repo_evidence =
+            Self::load_optional(&session_dir, "repo-evidence.json").unwrap_or_default();
+        let reference_packs =
+            Self::load_optional(&session_dir, "reference-packs.json").unwrap_or_default();
 
         Ok(Some(SessionSnapshot {
             metadata,
@@ -319,6 +354,10 @@ impl SessionStore {
             background_jobs,
             preflight,
             composer,
+            current_task_contract,
+            verification,
+            repo_evidence,
+            reference_packs,
         }))
     }
 
@@ -439,6 +478,10 @@ impl SessionStore {
             background_jobs: Vec::new(),
             preflight: WorkspacePreflight::default(),
             composer: ComposerState::default(),
+            current_task_contract: None,
+            verification: VerificationState::default(),
+            repo_evidence: Vec::new(),
+            reference_packs: Vec::new(),
         };
         self.save_snapshot(&snapshot)?;
         std::fs::remove_file(legacy_path)?;
@@ -486,6 +529,10 @@ mod tests {
             background_jobs: Vec::new(),
             preflight: WorkspacePreflight::default(),
             composer: ComposerState::default(),
+            current_task_contract: None,
+            verification: VerificationState::default(),
+            repo_evidence: Vec::new(),
+            reference_packs: Vec::new(),
         }
     }
 

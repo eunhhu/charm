@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 /// Spec: docs/charm-strategy.md Task contract
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskContract {
+    /// Abstraction score used to choose grounding depth.
+    #[serde(default)]
+    pub abstraction_score: f64,
     /// What must be accomplished
     pub objective: String,
     /// What can be touched (files, modules, areas)
@@ -127,13 +130,37 @@ impl TaskConcretizer {
         }
     }
 
-    fn build_contract(&self, request: &str, _score: f64) -> TaskContract {
+    pub fn concretize_for_auto(&self, request: &str) -> TaskContract {
+        match self.concretize(request) {
+            ConcretizationResult::Ready(contract) => contract,
+            ConcretizationResult::NeedsClarification(question) => {
+                let score = Self::score_abstraction(request);
+                let mut contract = self.build_contract_with_assumptions(request, score);
+                contract.open_questions.push(question);
+                contract.depth = ExecutionDepth::Deep;
+                contract
+            }
+        }
+    }
+
+    fn build_contract(&self, request: &str, score: f64) -> TaskContract {
+        let lower = request.to_lowercase();
+        let verification = if lower.contains("test") || lower.contains("verify") {
+            vec!["Run relevant tests".to_string(), "Build passes".to_string()]
+        } else {
+            vec![
+                "Inspect relevant workspace context".to_string(),
+                "Verify with the narrowest available check".to_string(),
+            ]
+        };
+
         TaskContract {
+            abstraction_score: score,
             objective: request.to_string(),
             scope: vec!["To be determined from repo inspection".to_string()],
             repo_anchors: Vec::new(),
-            acceptance: vec!["To be defined".to_string()],
-            verification: vec!["To be defined".to_string()],
+            acceptance: vec!["User request is addressed with grounded evidence".to_string()],
+            verification,
             side_effects: Vec::new(),
             assumptions: vec!["Assuming standard project structure".to_string()],
             open_questions: Vec::new(),
@@ -141,8 +168,9 @@ impl TaskConcretizer {
         }
     }
 
-    fn build_contract_with_assumptions(&self, request: &str, _score: f64) -> TaskContract {
+    fn build_contract_with_assumptions(&self, request: &str, score: f64) -> TaskContract {
         TaskContract {
+            abstraction_score: score,
             objective: request.to_string(),
             scope: vec!["Conservative scope - will expand after initial inspection".to_string()],
             repo_anchors: Vec::new(),

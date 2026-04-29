@@ -1,9 +1,15 @@
+use crate::agent::prompt_compiler::{
+    Activation, PromptCompiler, PromptContext, PromptSection, ProviderHint, SectionType,
+};
 use crate::agent::provider_prompts::ProviderPrompts;
+use crate::agent::reference_broker::ReferencePack;
 use crate::agent::rules::RulesLoader;
+use crate::agent::task_concretizer::TaskContract;
 use crate::core::WorkspaceState;
 use crate::harness::{MemoryManager, PlanManager};
+use crate::retrieval::types::Evidence;
 use crate::runtime::types::{
-    AutonomyLevel, LspSnapshot, McpSnapshot, RouterIntent, WorkspacePreflight,
+    AutonomyLevel, LspSnapshot, McpSnapshot, RouterIntent, VerificationState, WorkspacePreflight,
 };
 use std::path::Path;
 
@@ -111,6 +117,10 @@ impl PromptAssembler {
         preflight: &WorkspacePreflight,
         lsp: &LspSnapshot,
         mcp: &McpSnapshot,
+        task_contract: Option<&TaskContract>,
+        verification: &VerificationState,
+        repo_evidence: &[Evidence],
+        reference_packs: &[ReferencePack],
     ) -> String {
         let mut parts = Vec::new();
 
@@ -205,6 +215,13 @@ impl PromptAssembler {
             } else {
                 mcp.tools.join(", ")
             }
+        ));
+
+        parts.push(compiled_harness_rules(
+            task_contract,
+            verification,
+            repo_evidence,
+            reference_packs,
         ));
 
         parts.join("\n\n")
@@ -311,4 +328,219 @@ fn interactive_workflow_rules(intent: RouterIntent, autonomy: AutonomyLevel) -> 
         label = autonomy.label(),
         short = autonomy.short(),
     )
+}
+
+fn task_contract_rules(contract: &TaskContract) -> String {
+    format!(
+        "## Current Task Contract\n- Objective: {}\n- Abstraction score: {:.2}\n- Depth: {:?}\n- Scope: {}\n- Acceptance: {}\n- Verification: {}\n- Assumptions: {}\n- Open questions: {}\n",
+        contract.objective,
+        contract.abstraction_score,
+        contract.depth,
+        join_or_none(&contract.scope),
+        join_or_none(&contract.acceptance),
+        join_or_none(&contract.verification),
+        join_or_none(&contract.assumptions),
+        join_or_none(&contract.open_questions),
+    )
+}
+
+fn verification_gate_rules(verification: &VerificationState) -> String {
+    format!(
+        "## Verification Gate\n- Required evidence: {}\n- Observed evidence: {}\n- Satisfied: {}\n- Last status: {}\n- Do not claim completion unless this gate is satisfied or you explicitly state the verification gap.\n",
+        join_or_none(&verification.required),
+        join_or_none(&verification.observed),
+        verification.satisfied,
+        verification
+            .last_status
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
+    )
+}
+
+fn compiled_harness_rules(
+    task_contract: Option<&TaskContract>,
+    verification: &VerificationState,
+    repo_evidence: &[Evidence],
+    reference_packs: &[ReferencePack],
+) -> String {
+    let mut compiler = PromptCompiler::new().with_budget(2600);
+    if let Some(contract) = task_contract {
+        compiler.add_section(PromptSection {
+            id: "current_task_contract".to_string(),
+            priority: 10,
+            activation: Activation::Always,
+            token_budget: 900,
+            content: task_contract_rules(contract),
+            provenance: Vec::new(),
+            section_type: SectionType::Plan,
+        });
+    }
+    compiler.add_section(PromptSection {
+        id: "verification_gate".to_string(),
+        priority: 20,
+        activation: Activation::Always,
+        token_budget: 500,
+        content: verification_gate_rules(verification),
+        provenance: Vec::new(),
+        section_type: SectionType::Evidence,
+    });
+    if !repo_evidence.is_empty() {
+        compiler.add_section(PromptSection {
+            id: "repo_evidence".to_string(),
+            priority: 30,
+            activation: Activation::Always,
+            token_budget: 800,
+            content: repo_evidence_rules(repo_evidence),
+            provenance: Vec::new(),
+            section_type: SectionType::Evidence,
+        });
+    }
+    if !reference_packs.is_empty() {
+        compiler.add_section(PromptSection {
+            id: "reference_gate".to_string(),
+            priority: 40,
+            activation: Activation::Always,
+            token_budget: 800,
+            content: reference_gate_rules(reference_packs),
+            provenance: Vec::new(),
+            section_type: SectionType::Reference,
+        });
+    }
+
+    let context = PromptContext {
+        token_budget_remaining: 2600,
+        ..Default::default()
+    };
+    let compiled = compiler.compile(&context);
+    compiler.render_for_provider(&compiled, ProviderHint::Generic)
+}
+
+fn repo_evidence_rules(evidence: &[Evidence]) -> String {
+    let rows = evidence
+        .iter()
+        .take(8)
+        .map(|item| {
+            format!(
+                "- [{} {:.1}] {}:{} {}",
+                item.source,
+                item.rank,
+                item.file_path,
+                item.line,
+                item.snippet.lines().next().unwrap_or("").trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "## Repo Evidence\n{}\nUse these file/line anchors before making or judging code changes.",
+        rows
+    )
+}
+
+fn reference_gate_rules(reference_packs: &[ReferencePack]) -> String {
+    let rows = reference_packs
+        .iter()
+        .take(5)
+        .map(|pack| {
+            let examples = pack
+                .minimal_examples
+                .iter()
+                .take(2)
+                .map(|example| compact_reference_example(&example.code))
+                .collect::<Vec<_>>();
+            format!(
+                "- {} confidence={:?} source={:?} examples={} caveats={}",
+                pack.library.clone().unwrap_or_else(|| pack.query.clone()),
+                pack.confidence,
+                pack.source_kind,
+                if examples.is_empty() {
+                    "none".to_string()
+                } else {
+                    examples.join(" | ")
+                },
+                if pack.caveats.is_empty() {
+                    "none".to_string()
+                } else {
+                    pack.caveats.join(" | ")
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "## Reference Gate\n{}\nDo not rely on model memory alone for external APIs. Use package/source/docs evidence before implementation claims.",
+        rows
+    )
+}
+
+fn compact_reference_example(raw: &str) -> String {
+    let text = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.chars().count() <= 180 {
+        return text;
+    }
+    let mut out = text.chars().take(180).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn join_or_none(items: &[String]) -> String {
+    if items.is_empty() {
+        "none".to_string()
+    } else {
+        items.join(" | ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::task_concretizer::{ExecutionDepth, RepoAnchor, TaskContract};
+    use crate::core::WorkspaceState;
+    use crate::runtime::types::{AutonomyLevel, RouterIntent};
+
+    #[test]
+    fn session_system_prompt_budgets_harness_contract_sections() {
+        let assembler = PromptAssembler::new(std::path::Path::new("."));
+        let workspace = WorkspaceState {
+            root_path: ".".to_string(),
+            branch: "main".to_string(),
+            dirty_files: Vec::new(),
+            open_files: Vec::new(),
+        };
+        let contract = TaskContract {
+            abstraction_score: 0.8,
+            objective: "x".repeat(12_000),
+            scope: vec!["all".to_string()],
+            repo_anchors: Vec::<RepoAnchor>::new(),
+            acceptance: vec!["done".to_string()],
+            verification: vec!["check".to_string()],
+            side_effects: Vec::new(),
+            assumptions: Vec::new(),
+            open_questions: Vec::new(),
+            depth: ExecutionDepth::Deep,
+        };
+
+        let prompt = assembler.assemble_session_system(
+            &workspace,
+            RouterIntent::Implement,
+            AutonomyLevel::Aggressive,
+            &WorkspacePreflight::default(),
+            &LspSnapshot::default(),
+            &McpSnapshot::default(),
+            Some(&contract),
+            &VerificationState::default(),
+            &[],
+            &[],
+        );
+
+        assert!(prompt.contains("## Current Task Contract"));
+        assert!(prompt.contains("characters omitted"));
+        assert!(prompt.len() < 9_000);
+    }
 }

@@ -30,35 +30,43 @@ impl ContextCompressor {
             }
         }
 
-        let to_compress = messages.len().saturating_sub(preserve_count.max(2));
-        if to_compress == 0 {
-            if let Some(sys) = system {
-                messages.insert(0, sys);
-            }
-            return;
+        Self::compress_with_recent_count(messages, preserve_count.max(2));
+
+        if let Some(sys) = system {
+            messages.insert(0, sys);
+        }
+    }
+
+    pub fn compact_now(messages: &mut Vec<Message>, preserve_recent: usize) -> usize {
+        if messages.len() <= 4 {
+            return 0;
         }
 
-        let ids_to_remove: HashSet<String> = messages[..to_compress]
-            .iter()
-            .filter(|m| m.role == "assistant")
-            .filter_map(|m| m.tool_calls.as_ref())
-            .flatten()
-            .map(|tc| tc.id.clone())
-            .collect();
+        let system = if messages[0].role == "system" {
+            Some(messages.remove(0))
+        } else {
+            None
+        };
 
-        let compressed: Vec<Message> = messages
-            .drain(0..to_compress)
-            .filter(|msg| {
-                if msg.role == "tool" {
-                    if let Some(ref id) = msg.tool_call_id {
-                        return !ids_to_remove.contains(id);
-                    }
-                    return false;
-                }
-                true
-            })
-            .collect();
+        let removed = Self::compress_with_recent_count(messages, preserve_recent.max(2));
 
+        if let Some(sys) = system {
+            messages.insert(0, sys);
+        }
+
+        removed
+    }
+
+    fn compress_with_recent_count(messages: &mut Vec<Message>, preserve_recent: usize) -> usize {
+        let mut to_compress = messages.len().saturating_sub(preserve_recent);
+        while to_compress < messages.len() && messages[to_compress].role == "tool" {
+            to_compress += 1;
+        }
+        if to_compress == 0 {
+            return 0;
+        }
+
+        let compressed: Vec<Message> = messages.drain(0..to_compress).collect();
         let summary = Self::summarize(&compressed);
 
         messages.insert(
@@ -73,59 +81,168 @@ impl ContextCompressor {
             },
         );
 
-        if let Some(sys) = system {
-            messages.insert(0, sys);
-        }
+        compressed.len()
     }
 
     fn summarize(msgs: &[Message]) -> String {
         let mut tool_calls = 0usize;
         let mut tool_successes = 0usize;
-        let _files_read: HashSet<String> = HashSet::new();
+        let mut requests = Vec::new();
+        let mut decisions = Vec::new();
+        let mut files_read: HashSet<String> = HashSet::new();
         let mut files_edited: HashSet<String> = HashSet::new();
+        let mut commands = Vec::new();
 
         for msg in msgs {
             match msg.role.as_str() {
+                "user" => {
+                    if let Some(content) = msg.content.as_deref() {
+                        push_excerpt(&mut requests, content, 4);
+                    }
+                }
                 "assistant" => {
+                    if let Some(content) = msg.content.as_deref() {
+                        push_excerpt(&mut decisions, content, 4);
+                    }
                     if let Some(ref tc) = msg.tool_calls {
                         for call in tc {
+                            tool_calls += 1;
+                            let args =
+                                serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                                    .ok();
                             match call.function.name.as_str() {
                                 "read_range" | "grep_search" | "semantic_search" => {
-                                    tool_calls += 1;
+                                    if let Some(args) = args.as_ref() {
+                                        collect_tool_arg(args, "path", &mut files_read);
+                                        collect_tool_arg(args, "file_path", &mut files_read);
+                                        collect_tool_arg(args, "query", &mut files_read);
+                                    }
                                 }
                                 "edit_patch" | "write_file" => {
-                                    tool_calls += 1;
-                                    files_edited.insert(call.function.name.clone());
+                                    if let Some(args) = args.as_ref() {
+                                        collect_tool_arg(args, "path", &mut files_edited);
+                                        collect_tool_arg(args, "file_path", &mut files_edited);
+                                        collect_tool_arg(args, "target_file", &mut files_edited);
+                                    }
+                                    if files_edited.is_empty() {
+                                        files_edited.insert(call.function.name.clone());
+                                    }
                                 }
-                                _ => {
-                                    tool_calls += 1;
+                                "run_command" => {
+                                    if let Some(args) = args.as_ref() {
+                                        collect_tool_arg(args, "command", &mut commands);
+                                    }
                                 }
+                                _ => {}
                             }
                         }
                     }
                 }
                 "tool" => {
-                    if let Some(ref content) = msg.content {
-                        if content.contains("\"success\": true")
-                            || content.contains("success: true")
-                        {
-                            tool_successes += 1;
-                        }
+                    if msg.content.as_ref().is_some_and(|content| {
+                        content.contains("\"success\": true") || content.contains("success: true")
+                    }) {
+                        tool_successes += 1;
                     }
                 }
                 _ => {}
             }
         }
 
-        if files_edited.is_empty() {
-            format!("{} calls, {} ok", tool_calls, tool_successes)
-        } else {
-            format!(
-                "{} calls, {} ok, edited: {}",
-                tool_calls,
-                tool_successes,
-                files_edited.len()
-            )
+        let mut parts = Vec::new();
+        if !requests.is_empty() {
+            parts.push(format!("requests: {}", requests.join(" | ")));
         }
+        if !decisions.is_empty() {
+            parts.push(format!("assistant notes: {}", decisions.join(" | ")));
+        }
+        parts.push(format!("{tool_calls} tool calls, {tool_successes} ok"));
+        if !files_read.is_empty() {
+            parts.push(format!("refs: {}", sorted_join(files_read)));
+        }
+        if !files_edited.is_empty() {
+            parts.push(format!("edited: {}", sorted_join(files_edited)));
+        }
+        if !commands.is_empty() {
+            parts.push(format!("commands: {}", commands.join(" | ")));
+        }
+
+        parts.join("; ")
+    }
+}
+
+fn push_excerpt(target: &mut Vec<String>, content: &str, max_items: usize) {
+    if target.len() >= max_items {
+        return;
+    }
+    let excerpt = content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(content)
+        .trim();
+    if excerpt.is_empty() {
+        return;
+    }
+    target.push(truncate_chars(excerpt, 140));
+}
+
+fn collect_tool_arg(args: &serde_json::Value, key: &str, target: &mut impl Extend<String>) {
+    if let Some(value) = args.get(key).and_then(serde_json::Value::as_str) {
+        target.extend([truncate_chars(value, 120)]);
+    }
+}
+
+fn truncate_chars(raw: &str, max_chars: usize) -> String {
+    if raw.chars().count() <= max_chars {
+        return raw.to_string();
+    }
+    let mut truncated = raw.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn sorted_join(values: HashSet<String>) -> String {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort();
+    values.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_message(role: &str, content: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_details: None,
+        }
+    }
+
+    #[test]
+    fn compact_now_rolls_old_messages_into_summary_and_preserves_recent() {
+        let mut messages = vec![text_message("system", "system prompt")];
+        for idx in 0..10 {
+            messages.push(text_message("user", &format!("request {idx}")));
+            messages.push(text_message("assistant", &format!("decision {idx}")));
+        }
+
+        let removed = ContextCompressor::compact_now(&mut messages, 6);
+
+        assert_eq!(removed, 14);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "assistant");
+        let summary = messages[1].content.as_deref().unwrap_or_default();
+        assert!(summary.contains("[Earlier:"));
+        assert!(summary.contains("request 0"));
+        assert!(summary.contains("decision 0"));
+        assert_eq!(messages.len(), 8);
+        assert_eq!(
+            messages.last().unwrap().content.as_deref(),
+            Some("decision 9")
+        );
     }
 }

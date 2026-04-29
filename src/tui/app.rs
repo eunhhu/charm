@@ -11,8 +11,9 @@ use crate::tui::dialog::{
 use crate::tui::event::{AppEvent, EventBridge};
 use crate::tui::theme::Theme;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -55,6 +56,22 @@ impl InputState {
     pub fn insert(&mut self, ch: char) {
         self.buffer.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
+    }
+
+    pub fn insert_str(&mut self, text: &str) {
+        self.buffer.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+
+    pub fn insert_newline(&mut self) {
+        self.insert('\n');
+    }
+
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+        self.cursor = 0;
+        self.history_index = self.history.len();
+        self.saved_buffer.clear();
     }
 
     pub fn backspace(&mut self) {
@@ -108,15 +125,87 @@ impl InputState {
         self.cursor = self.buffer.len();
     }
 
-    pub fn delete_word(&mut self) {
-        let start = self.buffer[..self.cursor]
-            .char_indices()
-            .rev()
-            .skip_while(|(_, ch)| ch.is_whitespace())
-            .find(|(_, ch)| ch.is_whitespace())
-            .map(|(i, _)| i + 1)
+    pub fn move_line_start(&mut self) {
+        self.cursor = self.buffer[..self.cursor]
+            .rfind('\n')
+            .map(|idx| idx + 1)
             .unwrap_or(0);
+    }
+
+    pub fn move_line_end(&mut self) {
+        self.cursor = self.buffer[self.cursor..]
+            .find('\n')
+            .map(|idx| self.cursor + idx)
+            .unwrap_or(self.buffer.len());
+    }
+
+    pub fn move_word_left(&mut self) {
+        let mut cursor = self.cursor;
+        while let Some((prev, ch)) = prev_char(&self.buffer, cursor) {
+            if !ch.is_whitespace() {
+                break;
+            }
+            cursor = prev;
+        }
+        while let Some((prev, ch)) = prev_char(&self.buffer, cursor) {
+            if ch.is_whitespace() {
+                break;
+            }
+            cursor = prev;
+        }
+        self.cursor = cursor;
+    }
+
+    pub fn move_word_right(&mut self) {
+        let mut cursor = self.cursor;
+        while let Some((next, ch)) = next_char(&self.buffer, cursor) {
+            if !ch.is_whitespace() {
+                break;
+            }
+            cursor = next;
+        }
+        while let Some((next, ch)) = next_char(&self.buffer, cursor) {
+            if ch.is_whitespace() {
+                break;
+            }
+            cursor = next;
+        }
+        self.cursor = cursor;
+    }
+
+    pub fn delete_word(&mut self) {
+        let original = self.cursor;
+        self.move_word_left();
+        let start = self.cursor;
+        self.cursor = original;
         self.buffer.drain(start..self.cursor);
+        self.cursor = start;
+    }
+
+    pub fn delete_word_forward(&mut self) {
+        if self.cursor >= self.buffer.len() {
+            return;
+        }
+        let start = self.cursor;
+        self.move_word_right();
+        let end = self.cursor;
+        self.buffer.drain(start..end);
+        self.cursor = start;
+    }
+
+    pub fn delete_to_line_start(&mut self) {
+        let end = self.cursor;
+        self.move_line_start();
+        let start = self.cursor;
+        self.buffer.drain(start..end);
+        self.cursor = start;
+    }
+
+    pub fn delete_to_line_end(&mut self) {
+        let start = self.cursor;
+        self.move_line_end();
+        let end = self.cursor;
+        self.buffer.drain(start..end);
         self.cursor = start;
     }
 
@@ -126,7 +215,9 @@ impl InputState {
         }
         let input = std::mem::take(&mut self.buffer);
         self.cursor = 0;
-        self.history.push(input.clone());
+        if self.history.last() != Some(&input) {
+            self.history.push(input.clone());
+        }
         self.history_index = self.history.len();
         self.saved_buffer.clear();
         Some(input)
@@ -164,8 +255,33 @@ impl InputState {
     }
 
     pub fn display_cursor_width(&self) -> usize {
-        UnicodeWidthStr::width(&self.buffer[..self.cursor])
+        let current_line_start = self.buffer[..self.cursor]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        UnicodeWidthStr::width(&self.buffer[current_line_start..self.cursor])
     }
+
+    pub fn explicit_line_count(&self) -> usize {
+        self.buffer.matches('\n').count() + 1
+    }
+}
+
+fn prev_char(text: &str, cursor: usize) -> Option<(usize, char)> {
+    if cursor == 0 {
+        return None;
+    }
+    text[..cursor].char_indices().next_back()
+}
+
+fn next_char(text: &str, cursor: usize) -> Option<(usize, char)> {
+    if cursor >= text.len() {
+        return None;
+    }
+    text[cursor..]
+        .char_indices()
+        .next()
+        .map(|(_, ch)| (cursor + ch.len_utf8(), ch))
 }
 
 pub struct Spinner {
@@ -354,6 +470,21 @@ pub fn command_catalog() -> Vec<CommandItem> {
             category: CommandCategory::Agent,
         },
         CommandItem {
+            command: "/agent diff <id>",
+            description: "Review sub-agent worktree diff",
+            category: CommandCategory::Agent,
+        },
+        CommandItem {
+            command: "/agent merge <id>",
+            description: "Copy reviewed sub-agent files into workspace",
+            category: CommandCategory::Agent,
+        },
+        CommandItem {
+            command: "/agent cleanup <id>",
+            description: "Remove reviewed sub-agent worktree",
+            category: CommandCategory::Agent,
+        },
+        CommandItem {
             command: "/agent kill <id>",
             description: "Cancel a background sub-agent",
             category: CommandCategory::Agent,
@@ -361,6 +492,16 @@ pub fn command_catalog() -> Vec<CommandItem> {
         CommandItem {
             command: "/approvals",
             description: "Show pending approvals",
+            category: CommandCategory::Inspect,
+        },
+        CommandItem {
+            command: "/approvals approve <id>",
+            description: "Approve pending tool request",
+            category: CommandCategory::Inspect,
+        },
+        CommandItem {
+            command: "/approvals deny <id>",
+            description: "Deny pending tool request",
             category: CommandCategory::Inspect,
         },
         CommandItem {
@@ -432,6 +573,7 @@ pub enum Overlay {
     ModelSwitcher,
     Help,
     Agents,
+    Approvals,
     Autonomy,
     Providers,
     Mcp,
@@ -448,6 +590,7 @@ impl Overlay {
                 | Overlay::Sessions
                 | Overlay::ModelSwitcher
                 | Overlay::Agents
+                | Overlay::Approvals
                 | Overlay::Autonomy
                 | Overlay::Providers
                 | Overlay::Mcp
@@ -1154,7 +1297,26 @@ pub fn run_session_tui(
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let keyboard_enhancement = matches!(
+        crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
+    );
+    if keyboard_enhancement {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
+        )?;
+    }
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut app = SessionApp::default();
@@ -1170,10 +1332,14 @@ pub fn run_session_tui(
     let result = run_loop(&mut terminal, &mut app, bridge);
 
     disable_raw_mode()?;
+    if keyboard_enhancement {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
     result
@@ -1228,6 +1394,9 @@ fn run_loop(
             }
             Event::Mouse(mouse) => {
                 handle_mouse_event(mouse, app);
+            }
+            Event::Paste(text) => {
+                app.input.insert_str(&text);
             }
             Event::Resize(_, _) => {
                 // Re-pin to bottom on resize so wrapping stays coherent.
@@ -1392,6 +1561,10 @@ fn parse_workflow_description(path: &std::path::Path) -> Option<String> {
 }
 
 fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool> {
+    if matches!(key.kind, KeyEventKind::Release) {
+        return Ok(false);
+    }
+
     // ===== Overlay key handling =====
     if app.overlay != Overlay::None {
         return handle_overlay_key(key, app);
@@ -1400,6 +1573,54 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
     // ===== Global ctrl+shift combinations =====
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let option_like = key
+        .modifiers
+        .intersects(KeyModifiers::ALT | KeyModifiers::META);
+    let command_like = key.modifiers.contains(KeyModifiers::SUPER);
+
+    if command_like {
+        match key.code {
+            KeyCode::Left | KeyCode::Home => {
+                app.input.move_home();
+                return Ok(false);
+            }
+            KeyCode::Right | KeyCode::End => {
+                app.input.move_end();
+                return Ok(false);
+            }
+            KeyCode::Backspace => {
+                app.input.clear();
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+
+    if option_like {
+        match key.code {
+            KeyCode::Left | KeyCode::Char('b') | KeyCode::Char('B') => {
+                app.input.move_word_left();
+                return Ok(false);
+            }
+            KeyCode::Right | KeyCode::Char('f') | KeyCode::Char('F') => {
+                app.input.move_word_right();
+                return Ok(false);
+            }
+            KeyCode::Backspace => {
+                app.input.delete_word();
+                return Ok(false);
+            }
+            KeyCode::Delete | KeyCode::Char('d') | KeyCode::Char('D') => {
+                app.input.delete_word_forward();
+                return Ok(false);
+            }
+            KeyCode::Enter => {
+                app.input.insert_newline();
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
 
     if ctrl && shift {
         match key.code {
@@ -1409,6 +1630,10 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
             }
             KeyCode::Char('M') | KeyCode::Char('m') => {
                 open_overlay(app, Overlay::Mcp);
+                return Ok(false);
+            }
+            KeyCode::Char('A') | KeyCode::Char('a') => {
+                open_overlay(app, Overlay::Approvals);
                 return Ok(false);
             }
             KeyCode::BackTab => {
@@ -1478,6 +1703,14 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
                 app.input.delete_word();
                 return Ok(false);
             }
+            KeyCode::Char('u') => {
+                app.input.delete_to_line_start();
+                return Ok(false);
+            }
+            KeyCode::Char('e') => {
+                app.input.move_line_end();
+                return Ok(false);
+            }
             _ => {}
         }
     }
@@ -1506,7 +1739,17 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
 
     // ===== Base keys =====
     match key.code {
-        KeyCode::Esc => Ok(true),
+        KeyCode::Esc => {
+            if !app.input.is_empty() {
+                app.input.clear();
+                app.toast = Some((
+                    "Draft cleared. Press Esc again to quit.".to_string(),
+                    Instant::now(),
+                ));
+                return Ok(false);
+            }
+            Ok(true)
+        }
         KeyCode::Tab => {
             // Autocomplete slash commands. No more user-driven intent cycling —
             // the router picks intent autonomously from the message.
@@ -1557,6 +1800,17 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
             Ok(false)
         }
         KeyCode::Enter => {
+            if shift {
+                app.input.insert_newline();
+                return Ok(false);
+            }
+            if app.processing {
+                app.toast = Some((
+                    "A turn is still running. Wait for it to finish before sending.".to_string(),
+                    Instant::now(),
+                ));
+                return Ok(false);
+            }
             if let Some(input) = app.input.submit() {
                 app.processing = true;
                 app.scroll_pinned = true;
@@ -1638,6 +1892,36 @@ fn handle_overlay_key(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<boo
         KeyCode::Enter => {
             submit_overlay_selection(app);
         }
+        KeyCode::Char('d') | KeyCode::Char('D')
+            if app.overlay == Overlay::Agents && app.dialog_state.filter.is_empty() =>
+        {
+            submit_selected_agent_action(app, "diff");
+        }
+        KeyCode::Char('m') | KeyCode::Char('M')
+            if app.overlay == Overlay::Agents && app.dialog_state.filter.is_empty() =>
+        {
+            submit_selected_agent_action(app, "merge");
+        }
+        KeyCode::Char('c') | KeyCode::Char('C')
+            if app.overlay == Overlay::Agents && app.dialog_state.filter.is_empty() =>
+        {
+            submit_selected_agent_action(app, "cleanup");
+        }
+        KeyCode::Char('k') | KeyCode::Char('K')
+            if app.overlay == Overlay::Agents && app.dialog_state.filter.is_empty() =>
+        {
+            submit_selected_agent_action(app, "kill");
+        }
+        KeyCode::Char('a') | KeyCode::Char('A')
+            if app.overlay == Overlay::Approvals && app.dialog_state.filter.is_empty() =>
+        {
+            submit_selected_approval_action(app, true);
+        }
+        KeyCode::Char('d') | KeyCode::Char('D')
+            if app.overlay == Overlay::Approvals && app.dialog_state.filter.is_empty() =>
+        {
+            submit_selected_approval_action(app, false);
+        }
         KeyCode::Tab => {
             // Inside the model switcher, Tab cycles the provider filter.
             if app.overlay == Overlay::ModelSwitcher {
@@ -1674,6 +1958,13 @@ fn open_overlay(app: &mut SessionApp, next: Overlay) {
 }
 
 fn send_slash(app: &mut SessionApp, command: &str) {
+    if app.processing {
+        app.toast = Some((
+            "A turn is still running. Wait for it to finish before sending.".to_string(),
+            Instant::now(),
+        ));
+        return;
+    }
     app.input.buffer = command.to_string();
     app.input.cursor = app.input.buffer.len();
     if let Some(input) = app.input.submit() {
@@ -1811,6 +2102,7 @@ fn current_overlay_options(app: &SessionApp) -> Vec<DialogOption> {
         Overlay::Sessions => sessions_options(app),
         Overlay::ModelSwitcher => models_options(app),
         Overlay::Agents => agents_options(app),
+        Overlay::Approvals => approvals_options(app),
         Overlay::Autonomy => autonomy_options(app),
         Overlay::Providers => providers_options(app),
         Overlay::Mcp => mcp_options(app),
@@ -1824,7 +2116,11 @@ fn current_overlay_flat(app: &SessionApp) -> bool {
     // when filter is empty and flatten when the user is searching.
     matches!(
         app.overlay,
-        Overlay::Sessions | Overlay::Agents | Overlay::Skills | Overlay::Autonomy
+        Overlay::Sessions
+            | Overlay::Agents
+            | Overlay::Approvals
+            | Overlay::Skills
+            | Overlay::Autonomy
     ) || !app.dialog_state.filter.is_empty()
 }
 
@@ -1918,6 +2214,29 @@ fn agents_options(app: &SessionApp) -> Vec<DialogOption> {
                 .description(format!("[{short_id}] {}", job.detail))
                 .footer(footer)
                 .marker(marker, style)
+        })
+        .collect()
+}
+
+fn approvals_options(app: &SessionApp) -> Vec<DialogOption> {
+    let pending: Vec<&ApprovalRequest> = app
+        .pending_approvals
+        .iter()
+        .filter(|approval| approval.status == ApprovalStatus::Pending)
+        .collect();
+    if pending.is_empty() {
+        return vec![
+            DialogOption::new("empty", "No pending approvals").description("Tool gates are clear"),
+        ];
+    }
+    pending
+        .into_iter()
+        .map(|approval| {
+            let short_id = &approval.id[..approval.id.len().min(8)];
+            DialogOption::new(approval.id.clone(), approval.tool_name.clone())
+                .description(approval.summary.clone())
+                .footer(format!("[{short_id}] {:?}", approval.risk))
+                .marker("!", Style::default().fg(app.theme.warning))
         })
         .collect()
 }
@@ -2129,10 +2448,22 @@ fn submit_overlay_selection(app: &mut SessionApp) {
             }
         }
         Overlay::Agents => {
-            send_slash(
-                app,
-                &format!("/agent kill {}", &value[..value.len().min(8)]),
-            );
+            let action = app
+                .background_jobs
+                .iter()
+                .find(|job| job.id == value)
+                .map(|job| match job.status {
+                    BackgroundJobStatus::Completed | BackgroundJobStatus::Failed => "diff",
+                    BackgroundJobStatus::Queued | BackgroundJobStatus::Running => "kill",
+                    BackgroundJobStatus::Cancelled => "cleanup",
+                })
+                .unwrap_or("diff");
+            submit_agent_action(app, &value, action);
+        }
+        Overlay::Approvals => {
+            if value != "empty" {
+                submit_approval_action(app, &value, true);
+            }
         }
         Overlay::Autonomy => {
             send_slash(app, &format!("/autonomy {}", value));
@@ -2163,6 +2494,45 @@ fn submit_overlay_selection(app: &mut SessionApp) {
     app.dialog_state.reset();
 }
 
+fn submit_selected_agent_action(app: &mut SessionApp, action: &str) {
+    if let Some(value) = selected_overlay_value(app) {
+        submit_agent_action(app, &value, action);
+        app.overlay = Overlay::None;
+        app.provider_filter = None;
+        app.dialog_state.reset();
+    }
+}
+
+fn selected_overlay_value(app: &SessionApp) -> Option<String> {
+    let opts = current_overlay_options(app);
+    let (_, filtered) =
+        dialog::filter_and_flatten(&opts, &app.dialog_state, current_overlay_flat(app));
+    let idx = filtered.get(app.dialog_state.selected).copied()?;
+    opts.get(idx).map(|option| option.value.clone())
+}
+
+fn submit_agent_action(app: &mut SessionApp, id: &str, action: &str) {
+    let short = &id[..id.len().min(8)];
+    send_slash(app, &format!("/agent {action} {short}"));
+}
+
+fn submit_selected_approval_action(app: &mut SessionApp, approved: bool) {
+    if let Some(value) = selected_overlay_value(app) {
+        if value != "empty" {
+            submit_approval_action(app, &value, approved);
+        }
+        app.overlay = Overlay::None;
+        app.provider_filter = None;
+        app.dialog_state.reset();
+    }
+}
+
+fn submit_approval_action(app: &mut SessionApp, id: &str, approved: bool) {
+    let short = &id[..id.len().min(8)];
+    let action = if approved { "approve" } else { "deny" };
+    send_slash(app, &format!("/approvals {action} {short}"));
+}
+
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp) {
     let theme = &app.theme;
     let bg = theme.bg_secondary;
@@ -2179,7 +2549,9 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp) {
     } else {
         0
     };
-    let composer_height = 3 + dropdown_space + if app.context_items.is_empty() { 0 } else { 1 };
+    let input_rows = composer_input_rows(input_text).min(6) as u16;
+    let composer_height =
+        2 + input_rows + dropdown_space + if app.context_items.is_empty() { 0 } else { 1 };
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -2277,7 +2649,21 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp) {
         Overlay::Agents => (
             "Sub-agents",
             "Search agents...",
-            vec![KeybindHint::new("↵", "kill")],
+            vec![
+                KeybindHint::new("↵/d", "diff"),
+                KeybindHint::new("m", "merge"),
+                KeybindHint::new("c", "cleanup"),
+                KeybindHint::new("k", "kill"),
+            ],
+            None,
+        ),
+        Overlay::Approvals => (
+            "Approvals",
+            "Search approvals...",
+            vec![
+                KeybindHint::new("↵/a", "approve"),
+                KeybindHint::new("d", "deny"),
+            ],
             None,
         ),
         Overlay::Autonomy => (
@@ -3071,18 +3457,18 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, app: &SessionApp, area: Rect)
             ),
         ]));
     } else {
-        composer_lines.push(Line::from(vec![
-            Span::styled(
-                prompt_indicator,
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                input_text.to_string(),
-                Style::default().fg(theme.text_primary),
-            ),
-        ]));
+        for (idx, line) in input_text.split('\n').enumerate() {
+            let gutter = if idx == 0 { prompt_indicator } else { "  " };
+            composer_lines.push(Line::from(vec![
+                Span::styled(
+                    gutter,
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(line.to_string(), Style::default().fg(theme.text_primary)),
+            ]));
+        }
     }
 
     let title = if app.session_title.is_empty() {
@@ -3111,14 +3497,35 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, app: &SessionApp, area: Rect)
 
     if app.overlay == Overlay::None && !input_text.is_empty() && app.cursor_visible {
         let chips_offset: u16 = if app.context_items.is_empty() { 0 } else { 1 };
-        let prompt_width = UnicodeWidthStr::width(prompt_indicator) as u16;
-        let cursor_x = input_area.x + 2 + prompt_width + app.input.display_cursor_width() as u16;
-        let cursor_y = input_area.y + 1 + chips_offset;
+        let (cursor_col, cursor_row) = composer_cursor_position(input_text, app.input.cursor);
+        let line_prefix = if cursor_row == 0 {
+            UnicodeWidthStr::width(prompt_indicator) as u16
+        } else {
+            2
+        };
+        let cursor_x = input_area.x + 2 + line_prefix + cursor_col as u16;
+        let cursor_y = input_area.y + 1 + chips_offset + cursor_row as u16;
         frame.set_cursor_position((
             cursor_x.min(input_area.x + input_area.width.saturating_sub(2)),
-            cursor_y,
+            cursor_y.min(input_area.y + input_area.height.saturating_sub(2)),
         ));
     }
+}
+
+fn composer_input_rows(input: &str) -> usize {
+    if input.is_empty() {
+        1
+    } else {
+        input.matches('\n').count() + 1
+    }
+}
+
+fn composer_cursor_position(input: &str, cursor: usize) -> (usize, usize) {
+    let before_cursor = &input[..cursor.min(input.len())];
+    let row = before_cursor.matches('\n').count();
+    let line_start = before_cursor.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let col = UnicodeWidthStr::width(&before_cursor[line_start..]);
+    (col, row)
 }
 
 #[allow(dead_code)] // replaced by render_dialog_overlay; kept for reference
@@ -3420,12 +3827,17 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
         ("Ctrl+M", "Model switcher"),
         ("Ctrl+N", "New session"),
         ("Ctrl+Y", "Cycle autonomy"),
+        ("Ctrl+A", "Sub-agent queue"),
+        ("Ctrl+Shift+P / M / A", "Providers / MCP / approvals"),
         ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / previous session"),
         ("Ctrl+B / Ctrl+D", "Toggle left / right dock"),
-        ("Tab / Shift+Tab", "Cycle router intent"),
+        ("Tab", "Autocomplete slash command"),
+        ("Shift+Enter / Option+Enter", "Insert newline"),
+        ("Option+←/→", "Move by word"),
+        ("Option+Backspace/Delete", "Delete word"),
         ("F1 / ?", "Open this help overlay"),
         ("PgUp / PgDn", "Scroll transcript"),
-        ("Esc", "Dismiss overlay / cancel"),
+        ("Esc", "Clear draft, then quit"),
     ] {
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default()),
@@ -4154,6 +4566,44 @@ mod tests {
     }
 
     #[test]
+    fn input_state_word_navigation_and_forward_delete() {
+        let mut input = InputState::default();
+        input.insert_str("alpha beta gamma");
+        input.move_word_left();
+        assert_eq!(input.as_str(), "alpha beta gamma");
+        assert_eq!(input.cursor, "alpha beta ".len());
+
+        input.move_word_left();
+        assert_eq!(input.cursor, "alpha ".len());
+
+        input.delete_word_forward();
+        assert_eq!(input.as_str(), "alpha  gamma");
+
+        input.move_word_right();
+        assert_eq!(input.cursor, "alpha  gamma".len());
+    }
+
+    #[test]
+    fn input_state_multiline_cursor_width_uses_current_line() {
+        let mut input = InputState::default();
+        input.insert_str("first line\nsecond");
+        assert_eq!(input.display_cursor_width(), "second".len());
+
+        input.move_word_left();
+        assert_eq!(input.display_cursor_width(), 0);
+    }
+
+    #[test]
+    fn input_state_submit_deduplicates_consecutive_history() {
+        let mut input = InputState::default();
+        input.insert_str("repeat");
+        assert_eq!(input.submit(), Some("repeat".to_string()));
+        input.insert_str("repeat");
+        assert_eq!(input.submit(), Some("repeat".to_string()));
+        assert_eq!(input.history, vec!["repeat".to_string()]);
+    }
+
+    #[test]
     fn input_state_history_navigation() {
         let mut input = InputState::default();
         input.insert('f');
@@ -4179,6 +4629,161 @@ mod tests {
         assert_eq!(input.as_str(), "first");
         input.history_down();
         assert_eq!(input.as_str(), "second");
+    }
+
+    #[test]
+    fn esc_clears_composer_before_quitting() {
+        let mut app = SessionApp::default();
+        app.input.insert_str("draft");
+
+        let should_quit =
+            handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut app).unwrap();
+
+        assert!(!should_quit);
+        assert!(app.input.is_empty());
+
+        let should_quit =
+            handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut app).unwrap();
+
+        assert!(should_quit);
+    }
+
+    #[test]
+    fn option_arrow_moves_by_word_on_mac_terminals() {
+        let mut app = SessionApp::default();
+        app.input.insert_str("alpha beta gamma");
+
+        handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &mut app).unwrap();
+        assert_eq!(app.input.cursor, "alpha beta ".len());
+
+        handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &mut app).unwrap();
+        assert_eq!(app.input.cursor, "alpha beta gamma".len());
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_instead_of_submitting() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = SessionApp::default();
+        app.input_sender = Some(tx);
+        app.input.insert_str("line one");
+
+        handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), &mut app).unwrap();
+
+        assert_eq!(app.input.as_str(), "line one\n");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn enter_while_processing_keeps_draft_and_does_not_queue_hidden_turn() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = SessionApp::default();
+        app.input_sender = Some(tx);
+        app.processing = true;
+        app.input.insert_str("next task");
+
+        handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app).unwrap();
+
+        assert_eq!(app.input.as_str(), "next task");
+        assert!(rx.try_recv().is_err());
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("still running"))
+        );
+    }
+
+    #[test]
+    fn completed_agent_overlay_enter_opens_diff_instead_of_killing() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = SessionApp::default();
+        app.input_sender = Some(tx);
+        app.overlay = Overlay::Agents;
+        app.background_jobs.push(BackgroundJob {
+            id: "abcdef123456".to_string(),
+            title: "review me".to_string(),
+            status: BackgroundJobStatus::Completed,
+            detail: "done".to_string(),
+            kind: BackgroundJobKind::SubAgent,
+            progress: Some(100),
+            metadata: None,
+        });
+
+        submit_overlay_selection(&mut app);
+
+        assert_eq!(rx.try_recv().unwrap(), "/agent diff abcdef12");
+    }
+
+    #[test]
+    fn agent_overlay_keyboard_shortcuts_apply_review_actions() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = SessionApp::default();
+        app.input_sender = Some(tx);
+        app.overlay = Overlay::Agents;
+        app.background_jobs.push(BackgroundJob {
+            id: "fedcba987654".to_string(),
+            title: "merge me".to_string(),
+            status: BackgroundJobStatus::Completed,
+            detail: "done".to_string(),
+            kind: BackgroundJobKind::SubAgent,
+            progress: Some(100),
+            metadata: None,
+        });
+
+        handle_overlay_key(
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .unwrap();
+
+        assert_eq!(rx.try_recv().unwrap(), "/agent merge fedcba98");
+    }
+
+    #[test]
+    fn approval_overlay_enter_approves_selected_request() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = SessionApp::default();
+        app.input_sender = Some(tx);
+        app.overlay = Overlay::Approvals;
+        app.pending_approvals.push(ApprovalRequest {
+            id: "approve123456".to_string(),
+            tool_name: "run_command".to_string(),
+            summary: "cargo test".to_string(),
+            risk: crate::core::RiskClass::ExternalSideEffect,
+            status: ApprovalStatus::Pending,
+            created_at: Utc::now(),
+            tool_arguments: None,
+            tool_call_id: None,
+        });
+
+        submit_overlay_selection(&mut app);
+
+        assert_eq!(rx.try_recv().unwrap(), "/approvals approve approve1");
+    }
+
+    #[test]
+    fn approval_overlay_d_shortcut_denies_selected_request() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = SessionApp::default();
+        app.input_sender = Some(tx);
+        app.overlay = Overlay::Approvals;
+        app.pending_approvals.push(ApprovalRequest {
+            id: "deny123456".to_string(),
+            tool_name: "write_file".to_string(),
+            summary: "write config".to_string(),
+            risk: crate::core::RiskClass::Destructive,
+            status: ApprovalStatus::Pending,
+            created_at: Utc::now(),
+            tool_arguments: None,
+            tool_call_id: None,
+        });
+
+        handle_overlay_key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .unwrap();
+
+        assert_eq!(rx.try_recv().unwrap(), "/approvals deny deny1234");
     }
 
     #[test]

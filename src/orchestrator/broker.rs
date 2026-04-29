@@ -6,6 +6,12 @@ pub struct Broker {
     max_retries: usize,
 }
 
+impl Default for Broker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Broker {
     pub fn new() -> Self {
         Self { max_retries: 2 }
@@ -30,33 +36,42 @@ impl Broker {
                 subtask.id, subtask.description
             );
 
-            let _retries = 0;
-            loop {
+            for attempt in 0..=self.max_retries {
                 let task_text = format!("[Subtask {}] {}", subtask.id, subtask.description);
-                let subtask_results = runner.run_task(&task_text).await?;
+                match runner.run_task(&task_text).await {
+                    Ok(subtask_results) => {
+                        let result = Self::build_subtask_result(subtask, subtask_results);
+                        let success = result.success;
+                        results.insert(subtask.id.clone(), result);
 
-                let files_changed = Self::extract_files_changed(&subtask_results);
-                let output = subtask_results
-                    .iter()
-                    .map(|r| {
-                        if r.success {
-                            r.output.clone()
-                        } else {
-                            r.error.clone().unwrap_or_default()
+                        if success || attempt == self.max_retries {
+                            break;
                         }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
 
-                let result = SubtaskResult {
-                    subtask_id: subtask.id.clone(),
-                    success: subtask_results.iter().all(|r| r.success),
-                    output,
-                    files_changed,
-                };
-
-                results.insert(subtask.id.clone(), result);
-                break;
+                        println!(
+                            "[Broker] Subtask {} failed; retrying ({}/{})",
+                            subtask.id,
+                            attempt + 2,
+                            self.max_retries + 1
+                        );
+                    }
+                    Err(err) if attempt < self.max_retries => {
+                        println!(
+                            "[Broker] Subtask {} errored: {}. Retrying ({}/{})",
+                            subtask.id,
+                            err,
+                            attempt + 2,
+                            self.max_retries + 1
+                        );
+                    }
+                    Err(err) => {
+                        return Err(err.context(format!(
+                            "subtask {} failed after {} attempt(s)",
+                            subtask.id,
+                            self.max_retries + 1
+                        )));
+                    }
+                }
             }
         }
 
@@ -117,5 +132,30 @@ impl Broker {
             }
         }
         files.into_iter().collect()
+    }
+
+    fn build_subtask_result(
+        subtask: &Subtask,
+        tool_results: Vec<crate::core::ToolResult>,
+    ) -> SubtaskResult {
+        let files_changed = Self::extract_files_changed(&tool_results);
+        let output = tool_results
+            .iter()
+            .map(|r| {
+                if r.success {
+                    r.output.clone()
+                } else {
+                    r.error.clone().unwrap_or_default()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        SubtaskResult {
+            subtask_id: subtask.id.clone(),
+            success: tool_results.iter().all(|r| r.success),
+            output,
+            files_changed,
+        }
     }
 }

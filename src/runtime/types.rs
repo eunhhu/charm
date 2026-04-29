@@ -192,6 +192,15 @@ pub struct ComposerState {
     pub active_target: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct VerificationState {
+    pub required: Vec<String>,
+    pub observed: Vec<String>,
+    pub satisfied: bool,
+    pub last_status: Option<String>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionLifecycle {

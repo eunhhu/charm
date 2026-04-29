@@ -4,29 +4,39 @@ use super::subagent::{SubAgentBus, SubAgentReport, spawn_executor_subagent};
 use super::types::{
     ApprovalRequest, ApprovalStatus, AutonomyLevel, BackgroundJob, BackgroundJobKind,
     BackgroundJobStatus, LspSnapshot, McpSnapshot, RouterIntent, RuntimeEvent, SessionLifecycle,
-    ToolExecution, WorkspacePreflight,
+    ToolExecution, VerificationState, WorkspacePreflight,
 };
 use super::workspace::{build_preflight, collect_lsp_snapshot, refresh_lsp_snapshot};
 use crate::agent::context_compressor::ContextCompressor;
 use crate::agent::parser::ToolParser;
 use crate::agent::prompt::PromptAssembler;
+use crate::agent::reference_broker::{
+    FindingKind, PackageId, RawFinding, ReferenceBroker, ReferenceConfidence, ReferencePack,
+    ReferenceSourceKind,
+};
+use crate::agent::task_concretizer::{TaskConcretizer, TaskContract};
+use crate::agent::token_saver::{
+    MinifyRequest, PreservePolicy, SourceKind, TokenBudget, TokenSaver,
+};
 use crate::cli::InteractiveRequest;
-use crate::core::{RiskClass, ToolCall, ToolResult, WorkspaceState};
+use crate::core::{RiskClass, ToolCall, ToolResult, WorkspaceState, resolve_workspace_path};
 use crate::harness::PlanManager;
 use crate::harness::session::{
     SessionMetadata, SessionSelection, SessionSnapshot, SessionStatus, SessionStore,
     TranscriptEntry,
 };
+use crate::harness::trace::AgentTraceStore;
 use crate::providers::client::ProviderClient;
 use crate::providers::sse::{StreamChunk, accumulate_stream_to_response};
 use crate::providers::types::{ChatRequest, Message, ToolSchema, Usage};
+use crate::retrieval::worker::RetrievalWorker;
 use crate::tools::ToolRegistry;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use uuid::Uuid;
@@ -88,6 +98,10 @@ pub struct SessionRuntime {
     lsp: LspSnapshot,
     mcp: McpSnapshot,
     subagent_bus: SubAgentBus,
+    trace_store: AgentTraceStore,
+    token_saver: TokenSaver,
+    current_turn_id: Option<String>,
+    turn_repo_evidence_seen: bool,
 }
 
 impl SessionRuntime {
@@ -146,6 +160,7 @@ impl SessionRuntime {
         let restored_autonomy = snapshot.metadata.autonomy_level;
         let pinned_model = snapshot.metadata.pinned_model.clone();
         let effective_model = pinned_model.clone().unwrap_or_else(|| model_name.clone());
+        let session_id = snapshot.metadata.session_id.clone();
 
         let mut runtime = Self {
             workspace_root: workspace_root.to_path_buf(),
@@ -164,6 +179,10 @@ impl SessionRuntime {
             lsp,
             mcp,
             subagent_bus: SubAgentBus::new(),
+            trace_store: AgentTraceStore::new(workspace_root, session_id),
+            token_saver: TokenSaver::new(),
+            current_turn_id: None,
+            turn_repo_evidence_seen: false,
         };
         runtime.refresh_system_prompt();
         runtime.save()?;
@@ -235,6 +254,7 @@ impl SessionRuntime {
             return Ok(events);
         }
 
+        self.prepare_turn_harness(message).await?;
         self.append_transcript("user", message.to_string());
         self.snapshot.messages.push(Message {
             role: "user".to_string(),
@@ -263,6 +283,7 @@ impl SessionRuntime {
             for event in events {
                 let _ = event_tx.send(event);
             }
+            let _ = event_tx.send(RuntimeEvent::StreamDone { model: None });
             self.save()?;
             return Ok(());
         }
@@ -293,10 +314,12 @@ impl SessionRuntime {
                     decision.intent
                 ),
             });
+            let _ = event_tx.send(RuntimeEvent::StreamDone { model: None });
             self.save()?;
             return Ok(());
         }
 
+        self.prepare_turn_harness(message).await?;
         self.append_transcript("user", message.to_string());
         self.snapshot.messages.push(Message {
             role: "user".to_string(),
@@ -307,7 +330,15 @@ impl SessionRuntime {
             reasoning_details: None,
         });
 
-        self.run_model_loop_streaming(&event_tx).await?;
+        if let Err(err) = self.run_model_loop_streaming(&event_tx).await {
+            let _ = event_tx.send(RuntimeEvent::MessageDelta {
+                role: "system".to_string(),
+                content: format!("Turn failed: {err}"),
+            });
+            let _ = event_tx.send(RuntimeEvent::StreamDone { model: None });
+            self.save()?;
+            return Ok(());
+        }
         self.save()?;
         Ok(())
     }
@@ -365,7 +396,10 @@ impl SessionRuntime {
             execution: execution.clone(),
         });
 
-        let result = execute_tool_graceful(&mut self.registry, &tool_call).await;
+        let result = self
+            .execute_tool_with_gates(&tool_call, &approval.tool_name)
+            .await;
+        self.record_tool_result(&tool_call, &approval.tool_name, &result)?;
         if let Some(tool_call_id) = approval.tool_call_id.clone() {
             self.snapshot.messages.push(Message {
                 role: "tool".to_string(),
@@ -412,6 +446,10 @@ impl SessionRuntime {
             &self.preflight,
             &self.lsp,
             &self.mcp,
+            self.snapshot.current_task_contract.as_ref(),
+            &self.snapshot.verification,
+            &self.snapshot.repo_evidence,
+            &self.snapshot.reference_packs,
         );
         self.snapshot.messages[0] = Message {
             role: "system".to_string(),
@@ -421,6 +459,212 @@ impl SessionRuntime {
             reasoning: None,
             reasoning_details: None,
         };
+    }
+
+    async fn prepare_turn_harness(&mut self, message: &str) -> anyhow::Result<()> {
+        let turn_id = Uuid::new_v4().to_string();
+        self.current_turn_id = Some(turn_id.clone());
+        self.turn_repo_evidence_seen = false;
+        let contract = TaskConcretizer::new().concretize_for_auto(message);
+        self.snapshot.verification = verification_from_contract(&contract);
+        self.snapshot.current_task_contract = Some(contract.clone());
+        self.snapshot.repo_evidence = self.collect_repo_evidence(message).await?;
+        self.snapshot.reference_packs = self.collect_reference_packs(message).await;
+        if !self.snapshot.repo_evidence.is_empty() {
+            self.turn_repo_evidence_seen = true;
+            self.trace(
+                Some(&turn_id),
+                "repo_evidence",
+                serde_json::json!({
+                    "query": message,
+                    "evidence": self.snapshot.repo_evidence,
+                }),
+            )?;
+        }
+        if !self.snapshot.reference_packs.is_empty() {
+            self.trace(
+                Some(&turn_id),
+                "reference_gate",
+                serde_json::json!({
+                    "query": message,
+                    "reference_packs": self.snapshot.reference_packs,
+                }),
+            )?;
+        }
+        self.trace(
+            Some(&turn_id),
+            "task_contract",
+            serde_json::json!({
+                "contract": contract,
+                "verification": self.snapshot.verification,
+            }),
+        )?;
+        self.refresh_system_prompt();
+        Ok(())
+    }
+
+    async fn collect_repo_evidence(
+        &self,
+        message: &str,
+    ) -> anyhow::Result<Vec<crate::retrieval::types::Evidence>> {
+        let worker = RetrievalWorker::new(&self.workspace_root);
+        let mut evidence = Vec::new();
+        for query in evidence_queries_for_message(message) {
+            let result = worker.retrieve(&query, 8).await?;
+            evidence.extend(result.evidence);
+            if evidence.len() >= 8 {
+                break;
+            }
+        }
+        evidence.sort_by(|a, b| {
+            b.rank
+                .partial_cmp(&a.rank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        evidence.dedup_by(|a, b| a.file_path == b.file_path && a.line == b.line);
+        evidence.truncate(8);
+        Ok(evidence)
+    }
+
+    async fn collect_reference_packs(&self, message: &str) -> Vec<ReferencePack> {
+        if !reference_gate_required(message) {
+            return Vec::new();
+        }
+
+        let mut broker = ReferenceBroker::new();
+        let packages = broker.resolve_packages(&self.workspace_root);
+        let mentioned = reference_packages_for_message(message, packages);
+        let roots = local_reference_source_roots(&self.workspace_root);
+        let mut packs = Vec::new();
+        for package in mentioned {
+            match broker.fetch_from_local_source_roots(&package, &roots, message) {
+                Ok(pack) => packs.push(pack),
+                Err(_) => match broker.fetch_docs(&package).await {
+                    Ok(pack) => packs.push(pack),
+                    Err(_) => packs.push(local_reference_gate_pack(&broker, message, package)),
+                },
+            }
+        }
+        packs
+    }
+
+    fn trace(
+        &self,
+        turn_id: Option<&str>,
+        event: &str,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.trace_store.append(turn_id, event, payload)
+    }
+
+    fn trace_current_turn(&self, event: &str, payload: serde_json::Value) -> anyhow::Result<()> {
+        self.trace(self.current_turn_id.as_deref(), event, payload)
+    }
+
+    fn record_tool_result(
+        &mut self,
+        call: &ToolCall,
+        tool_name: &str,
+        result: &ToolResult,
+    ) -> anyhow::Result<()> {
+        self.observe_verification(call, result);
+        let minified = self.token_saver.minify(MinifyRequest {
+            source_kind: source_kind_for_tool(call),
+            raw: result.output.clone(),
+            budget: TokenBudget::new(1000),
+            preserve: PreservePolicy::default(),
+        });
+        self.trace_current_turn(
+            "tool_result",
+            serde_json::json!({
+                "tool_name": tool_name,
+                "call": call,
+                "success": result.success,
+                "output": result.output,
+                "minified_output": minified,
+                "error": result.error,
+                "metadata": result.metadata,
+                "verification": self.snapshot.verification,
+            }),
+        )
+    }
+
+    async fn execute_tool_with_gates(&mut self, call: &ToolCall, tool_name: &str) -> ToolResult {
+        if requires_repo_evidence_before_execution(call) && !self.turn_repo_evidence_seen {
+            let result = ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "Tool policy gate: inspect relevant repository context before editing files."
+                        .to_string(),
+                ),
+                metadata: Some(serde_json::json!({
+                    "blocked_by": "repo_evidence_gate",
+                    "tool_name": tool_name,
+                })),
+            };
+            let _ = self.trace_current_turn(
+                "tool_policy_blocked",
+                serde_json::json!({
+                    "tool_name": tool_name,
+                    "call": call,
+                    "reason": "repo evidence required before file edits",
+                }),
+            );
+            return result;
+        }
+
+        let result = execute_tool_graceful(&mut self.registry, call).await;
+        if tool_provides_repo_evidence(call) && result.success {
+            self.turn_repo_evidence_seen = true;
+        }
+        result
+    }
+
+    fn observe_verification(&mut self, call: &ToolCall, result: &ToolResult) {
+        let Some(command) = verification_command(call, result) else {
+            return;
+        };
+        let status = if result.success { "passed" } else { "failed" };
+        self.snapshot
+            .verification
+            .observed
+            .push(format!("command {status}: {command}"));
+        self.snapshot.verification.satisfied = result.success
+            && !result
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("running"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        self.snapshot.verification.last_status = Some(format!("command {status}: {command}"));
+        self.snapshot.verification.updated_at = Some(Utc::now());
+    }
+
+    fn verification_gap_event(&mut self, content: &str) -> Option<RuntimeEvent> {
+        if self.snapshot.verification.satisfied
+            || !parsed_completion_claim_without_verification(content)
+        {
+            return None;
+        }
+
+        let message = "Verification gate not satisfied: assistant made a completion claim before observed verification evidence. Run or report verification before treating this as complete.".to_string();
+        self.snapshot.verification.last_status =
+            Some("completion claim blocked: verification evidence missing".to_string());
+        self.snapshot.verification.updated_at = Some(Utc::now());
+        self.append_transcript("system", message.clone());
+        let _ = self.trace_current_turn(
+            "verification_gap",
+            serde_json::json!({
+                "content": content,
+                "verification": self.snapshot.verification,
+            }),
+        );
+
+        Some(RuntimeEvent::MessageDelta {
+            role: "system".to_string(),
+            content: message,
+        })
     }
 
     async fn run_model_loop(&mut self) -> anyhow::Result<Vec<RuntimeEvent>> {
@@ -455,13 +699,29 @@ impl SessionRuntime {
                 }
             };
 
+            self.trace_current_turn(
+                "model_response",
+                serde_json::json!({
+                    "role": response.role.clone(),
+                    "content": response.content.clone(),
+                    "tool_call_count": response.tool_calls.as_ref().map(Vec::len).unwrap_or(0),
+                }),
+            )?;
+
             if let Some(content) = response.content.clone() {
                 if !content.trim().is_empty() {
                     self.append_transcript("assistant", content.clone());
                     events.push(RuntimeEvent::MessageDelta {
                         role: "assistant".to_string(),
-                        content,
+                        content: content.clone(),
                     });
+                    let has_tool_calls = response
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| !calls.is_empty());
+                    if !has_tool_calls {
+                        events.extend(self.verification_gap_event(&content));
+                    }
                 }
             }
 
@@ -540,7 +800,8 @@ impl SessionRuntime {
                 events.push(RuntimeEvent::ToolCallStarted {
                     execution: execution.clone(),
                 });
-                let result = execute_tool_graceful(&mut self.registry, &call).await;
+                let result = self.execute_tool_with_gates(&call, &tool_name).await;
+                self.record_tool_result(&call, &tool_name, &result)?;
 
                 if result
                     .metadata
@@ -674,7 +935,18 @@ impl SessionRuntime {
                 }
             };
 
-            if let Some(ref content) = choice.message.content {
+            self.trace_current_turn(
+                "model_response",
+                serde_json::json!({
+                    "role": choice.message.role.clone(),
+                    "content": choice.message.content.clone(),
+                    "tool_call_count": choice.message.tool_calls.as_ref().map(Vec::len).unwrap_or(0),
+                    "streamed": true,
+                }),
+            )?;
+
+            let assistant_content_for_gap = choice.message.content.clone();
+            if let Some(ref content) = assistant_content_for_gap {
                 if !content.trim().is_empty() {
                     self.append_transcript("assistant", content.clone());
                 }
@@ -717,6 +989,12 @@ impl SessionRuntime {
             }
 
             if parsed_calls.is_empty() {
+                let gap_event = assistant_content_for_gap
+                    .as_deref()
+                    .and_then(|content| self.verification_gap_event(content));
+                if let Some(event) = gap_event {
+                    let _ = event_tx.send(event);
+                }
                 break;
             }
 
@@ -755,7 +1033,8 @@ impl SessionRuntime {
                 let _ = event_tx.send(RuntimeEvent::ToolCallStarted {
                     execution: execution.clone(),
                 });
-                let result = execute_tool_graceful(&mut self.registry, &call).await;
+                let result = self.execute_tool_with_gates(&call, &tool_name).await;
+                self.record_tool_result(&call, &tool_name, &result)?;
 
                 if result
                     .metadata
@@ -813,9 +1092,21 @@ impl SessionRuntime {
                     role: "system".to_string(),
                     content: format!("Model error: {e}"),
                 });
+                let _ = event_tx.send(RuntimeEvent::StreamDone { model: None });
                 return Ok(());
             }
         };
+
+        self.trace_current_turn(
+            "model_response",
+            serde_json::json!({
+                "role": response.role.clone(),
+                "content": response.content.clone(),
+                "tool_call_count": response.tool_calls.as_ref().map(Vec::len).unwrap_or(0),
+                "streamed": false,
+                "fallback": true,
+            }),
+        )?;
 
         if let Some(content) = response.content.clone() {
             if !content.trim().is_empty() {
@@ -823,7 +1114,17 @@ impl SessionRuntime {
                     role: "assistant".to_string(),
                     content: content.clone(),
                 });
-                self.append_transcript("assistant", content);
+                self.append_transcript("assistant", content.clone());
+                let has_tool_calls = response
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty());
+                let gap_event = (!has_tool_calls)
+                    .then(|| self.verification_gap_event(&content))
+                    .flatten();
+                if let Some(event) = gap_event {
+                    let _ = event_tx.send(event);
+                }
             }
         }
 
@@ -888,6 +1189,7 @@ impl SessionRuntime {
                     self.snapshot.approvals.push(approval.clone());
                     self.refresh_counts();
                     let _ = event_tx.send(RuntimeEvent::ApprovalRequested { approval });
+                    let _ = event_tx.send(RuntimeEvent::StreamDone { model: None });
                     return Ok(());
                 }
 
@@ -898,7 +1200,8 @@ impl SessionRuntime {
                 let _ = event_tx.send(RuntimeEvent::ToolCallStarted {
                     execution: execution.clone(),
                 });
-                let result = execute_tool_graceful(&mut self.registry, &call).await;
+                let result = self.execute_tool_with_gates(&call, &tool_name).await;
+                self.record_tool_result(&call, &tool_name, &result)?;
 
                 self.snapshot.messages.push(Message {
                     role: "tool".to_string(),
@@ -913,6 +1216,7 @@ impl SessionRuntime {
             }
         }
 
+        let _ = event_tx.send(RuntimeEvent::StreamDone { model: None });
         Ok(())
     }
 
@@ -1062,6 +1366,15 @@ impl SessionRuntime {
                 role: "assistant".to_string(),
                 content: self.render_agent_summary(),
             }])),
+            ["/agent", "diff", id] | ["/agents", "diff", id] => {
+                Ok(Some(self.diff_subagent_result(id)))
+            }
+            ["/agent", "merge", id] | ["/agents", "merge", id] => {
+                Ok(Some(self.merge_subagent_result(id)?))
+            }
+            ["/agent", "cleanup", id] | ["/agents", "cleanup", id] => {
+                Ok(Some(self.cleanup_subagent_worktree(id)?))
+            }
             ["/agent", "kill", id] | ["/agents", "kill", id] => {
                 Ok(Some(self.cancel_subagent(id)))
             }
@@ -1409,23 +1722,25 @@ impl SessionRuntime {
 
     pub fn compact_context(&mut self) -> Vec<RuntimeEvent> {
         let before = self.snapshot.messages.len();
-        // TODO(phase-3): replace this naive pass-through with a TokenSaver-backed
-        // compactor. Right now we tell the ContextCompressor we are at 0/128K so
-        // it only trims when the transcript is already huge. Per
-        // `OPTIMIZATION_ROADMAP.md` Phase A 1.2 the real contract is:
-        //   - preserve code spans verbatim (line numbers intact)
-        //   - roll intermediate tool output + chat into a key-point summary
-        //   - keep open questions, decisions, assumptions
-        //   - drop duplicate tool calls
-        // The TUI UX (/compact slash + Ctrl+K) already matches the final surface.
-        ContextCompressor::compress(&mut self.snapshot.messages, 0, 128_000);
+        let removed = ContextCompressor::compact_now(&mut self.snapshot.messages, 12);
+        self.refresh_system_prompt();
         let after = self.snapshot.messages.len();
-        let removed = before.saturating_sub(after);
+        let net_removed = before.saturating_sub(after);
         let summary = if removed == 0 {
             "Context already compact.".to_string()
         } else {
-            format!("Compacted context: {removed} messages rolled into summary.")
+            format!(
+                "Compacted context: {removed} messages rolled into summary ({net_removed} net removed)."
+            )
         };
+        let _ = self.trace_current_turn(
+            "context_compacted",
+            serde_json::json!({
+                "removed_messages": removed,
+                "net_removed_messages": net_removed,
+                "remaining_messages": after,
+            }),
+        );
         self.append_transcript("system", summary.clone());
         vec![
             RuntimeEvent::ContextCompacted {
@@ -1512,7 +1827,10 @@ impl SessionRuntime {
                 detail = job.detail
             ));
         }
-        lines.push("Use /agent kill <id-prefix> to cancel a sub-agent.".to_string());
+        lines.push(
+            "Use /agent diff <id>, /agent merge <id>, /agent cleanup <id>, or /agent kill <id>."
+                .to_string(),
+        );
         lines.join("\n")
     }
 
@@ -1572,6 +1890,224 @@ impl SessionRuntime {
                 content: format!("No background job matches '{id_prefix}'."),
             }],
         }
+    }
+
+    pub fn diff_subagent_result(&self, id_prefix: &str) -> Vec<RuntimeEvent> {
+        let Some(index) = self.find_subagent_job(id_prefix) else {
+            return vec![RuntimeEvent::MessageDelta {
+                role: "system".to_string(),
+                content: format!("No sub-agent matches '{id_prefix}'."),
+            }];
+        };
+        let job = &self.snapshot.background_jobs[index];
+        let Ok((worktree_path, changed_files)) = self.subagent_worktree_details(job) else {
+            return vec![RuntimeEvent::MessageDelta {
+                role: "system".to_string(),
+                content: format!(
+                    "Sub-agent {} has no reviewable worktree metadata.",
+                    short_id(job)
+                ),
+            }];
+        };
+
+        let status = std::process::Command::new("git")
+            .args(["status", "--short"])
+            .current_dir(&worktree_path)
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "(no git status output)".to_string());
+        let diff = std::process::Command::new("git")
+            .arg("diff")
+            .arg("--")
+            .args(&changed_files)
+            .current_dir(&worktree_path)
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "(no tracked diff; files may be new/untracked)".to_string());
+
+        vec![RuntimeEvent::MessageDelta {
+            role: "system".to_string(),
+            content: format!(
+                "Sub-agent {}\nWorktree: {}\nChanged files: {}\n\nStatus:\n{}\n\nDiff:\n{}",
+                short_id(job),
+                worktree_path.display(),
+                if changed_files.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    changed_files.join(", ")
+                },
+                status,
+                diff
+            ),
+        }]
+    }
+
+    pub fn merge_subagent_result(&mut self, id_prefix: &str) -> anyhow::Result<Vec<RuntimeEvent>> {
+        let Some(index) = self.find_subagent_job(id_prefix) else {
+            return Ok(vec![RuntimeEvent::MessageDelta {
+                role: "system".to_string(),
+                content: format!("No sub-agent matches '{id_prefix}'."),
+            }]);
+        };
+        let (worktree_path, changed_files) =
+            self.subagent_worktree_details(&self.snapshot.background_jobs[index])?;
+        if changed_files.is_empty() {
+            return Ok(vec![RuntimeEvent::MessageDelta {
+                role: "system".to_string(),
+                content: format!(
+                    "Sub-agent {} has no changed files to merge.",
+                    short_id(&self.snapshot.background_jobs[index])
+                ),
+            }]);
+        }
+
+        let mut merged = Vec::new();
+        let canonical_worktree = worktree_path.canonicalize()?;
+        for rel in changed_files {
+            validate_agent_relative_path(&rel)?;
+            let source = canonical_worktree.join(&rel);
+            let canonical_source = source
+                .canonicalize()
+                .with_context(|| format!("missing sub-agent output file '{}'", source.display()))?;
+            anyhow::ensure!(
+                canonical_source.starts_with(&canonical_worktree),
+                "sub-agent source escapes worktree: {}",
+                rel
+            );
+            anyhow::ensure!(
+                canonical_source.is_file(),
+                "sub-agent merge source is not a file: {}",
+                rel
+            );
+            let target = resolve_workspace_path(&rel, &self.workspace_root)
+                .map_err(|e| anyhow::anyhow!("invalid merge target '{}': {}", rel, e))?;
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&canonical_source, &target)?;
+            merged.push(rel);
+        }
+
+        let merged_count = merged.len();
+        if let Some(metadata) = self.snapshot.background_jobs[index].metadata.as_mut()
+            && let Some(obj) = metadata.as_object_mut()
+        {
+            obj.insert("merged".to_string(), Value::Bool(true));
+            obj.insert(
+                "merged_files".to_string(),
+                serde_json::json!(merged.clone()),
+            );
+        }
+        let job = self.snapshot.background_jobs[index].clone();
+        Ok(vec![
+            RuntimeEvent::BackgroundJobUpdated { job },
+            RuntimeEvent::MessageDelta {
+                role: "system".to_string(),
+                content: format!(
+                    "Merged {} file(s) from sub-agent {}.",
+                    merged_count,
+                    short_id(&self.snapshot.background_jobs[index])
+                ),
+            },
+        ])
+    }
+
+    pub fn cleanup_subagent_worktree(
+        &mut self,
+        id_prefix: &str,
+    ) -> anyhow::Result<Vec<RuntimeEvent>> {
+        let Some(index) = self.find_subagent_job(id_prefix) else {
+            return Ok(vec![RuntimeEvent::MessageDelta {
+                role: "system".to_string(),
+                content: format!("No sub-agent matches '{id_prefix}'."),
+            }]);
+        };
+        let (worktree_path, _) =
+            self.subagent_worktree_details(&self.snapshot.background_jobs[index])?;
+        if worktree_path.exists() {
+            let _ = std::process::Command::new("git")
+                .args([
+                    "worktree",
+                    "remove",
+                    "--force",
+                    &worktree_path.display().to_string(),
+                ])
+                .current_dir(&self.workspace_root)
+                .output();
+        }
+        if worktree_path.exists() {
+            std::fs::remove_dir_all(&worktree_path)?;
+        }
+        if let Some(metadata) = self.snapshot.background_jobs[index].metadata.as_mut()
+            && let Some(obj) = metadata.as_object_mut()
+        {
+            obj.insert("cleaned_up".to_string(), Value::Bool(true));
+        }
+        let job = self.snapshot.background_jobs[index].clone();
+        Ok(vec![
+            RuntimeEvent::BackgroundJobUpdated { job },
+            RuntimeEvent::MessageDelta {
+                role: "system".to_string(),
+                content: format!(
+                    "Cleaned up sub-agent {} worktree.",
+                    short_id(&self.snapshot.background_jobs[index])
+                ),
+            },
+        ])
+    }
+
+    fn find_subagent_job(&self, id_prefix: &str) -> Option<usize> {
+        self.snapshot.background_jobs.iter().position(|job| {
+            matches!(job.kind, BackgroundJobKind::SubAgent) && job.id.starts_with(id_prefix)
+        })
+    }
+
+    fn subagent_worktree_details(
+        &self,
+        job: &BackgroundJob,
+    ) -> anyhow::Result<(PathBuf, Vec<String>)> {
+        let metadata = job
+            .metadata
+            .as_ref()
+            .and_then(Value::as_object)
+            .context("missing sub-agent metadata")?;
+        let raw_worktree = metadata
+            .get("worktree_path")
+            .and_then(Value::as_str)
+            .context("missing worktree_path")?;
+        let worktree_path = PathBuf::from(raw_worktree);
+        let canonical_base = self
+            .workspace_root
+            .join(".charm")
+            .join("worktrees")
+            .canonicalize()
+            .context("missing .charm/worktrees directory")?;
+        let canonical_worktree = worktree_path
+            .canonicalize()
+            .with_context(|| format!("missing worktree '{}'", worktree_path.display()))?;
+        anyhow::ensure!(
+            canonical_worktree.starts_with(&canonical_base),
+            "sub-agent worktree path is outside .charm/worktrees"
+        );
+        let changed_files = metadata
+            .get("changed_files")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for rel in &changed_files {
+            validate_agent_relative_path(rel)?;
+        }
+        Ok((canonical_worktree, changed_files))
     }
 
     pub async fn switch_session_by_id(
@@ -1644,6 +2180,11 @@ impl SessionRuntime {
             );
         }
         self.autonomy = self.snapshot.metadata.autonomy_level;
+        self.trace_store = self
+            .trace_store
+            .for_session(self.snapshot.metadata.session_id.clone());
+        self.current_turn_id = None;
+        self.turn_repo_evidence_seen = false;
         if let Some(pinned) = &self.snapshot.metadata.pinned_model {
             self.model_name = pinned.clone();
             self.model_display = pinned.clone();
@@ -1681,6 +2222,244 @@ impl SessionRuntime {
     }
 }
 
+fn short_id(job: &BackgroundJob) -> String {
+    job.id.chars().take(8).collect()
+}
+
+fn validate_agent_relative_path(path: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !path.trim().is_empty(),
+        "changed file path must not be empty"
+    );
+    let rel = Path::new(path);
+    anyhow::ensure!(
+        rel.is_relative(),
+        "changed file path must be relative: {}",
+        path
+    );
+    for component in rel.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("changed file path escapes workspace: {}", path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verification_from_contract(contract: &TaskContract) -> VerificationState {
+    VerificationState {
+        required: contract.verification.clone(),
+        observed: Vec::new(),
+        satisfied: false,
+        last_status: Some("waiting for verification evidence".to_string()),
+        updated_at: Some(Utc::now()),
+    }
+}
+
+fn verification_command(call: &ToolCall, result: &ToolResult) -> Option<String> {
+    match call {
+        ToolCall::RunCommand { command, .. } => Some(command.clone()),
+        ToolCall::PollCommand { .. } => result
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("command"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+fn parsed_completion_claim_without_verification(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    [
+        "done",
+        "fixed",
+        "complete",
+        "completed",
+        "resolved",
+        "implemented",
+        "완료",
+        "수정했",
+        "고쳤",
+        "끝났",
+        "해결",
+        "구현했",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn source_kind_for_tool(call: &ToolCall) -> SourceKind {
+    match call {
+        ToolCall::RunCommand { command, .. } if command.contains("cargo test") => {
+            SourceKind::TestOutput
+        }
+        ToolCall::RunCommand { command, .. }
+            if command.contains("cargo check")
+                || command.contains("cargo build")
+                || command.contains("cargo clippy") =>
+        {
+            SourceKind::CargoOutput
+        }
+        ToolCall::RunCommand { .. } | ToolCall::PollCommand { .. } => SourceKind::CommandOutput,
+        ToolCall::GrepSearch { .. }
+        | ToolCall::GlobSearch { .. }
+        | ToolCall::ParallelSearch { .. } => SourceKind::SearchResults,
+        ToolCall::ReadRange { .. } | ToolCall::ReadSymbol { .. } => SourceKind::CodeSnippet,
+        _ => SourceKind::CommandOutput,
+    }
+}
+
+fn requires_repo_evidence_before_execution(call: &ToolCall) -> bool {
+    matches!(
+        call,
+        ToolCall::EditPatch { .. } | ToolCall::WriteFile { .. }
+    )
+}
+
+fn tool_provides_repo_evidence(call: &ToolCall) -> bool {
+    matches!(
+        call,
+        ToolCall::ReadRange { .. }
+            | ToolCall::ReadSymbol { .. }
+            | ToolCall::GrepSearch { .. }
+            | ToolCall::GlobSearch { .. }
+            | ToolCall::ListDir { .. }
+            | ToolCall::SemanticSearch { .. }
+            | ToolCall::ParallelSearch { .. }
+    )
+}
+
+fn evidence_queries_for_message(message: &str) -> Vec<String> {
+    let mut queries = Vec::new();
+    let trimmed = message.trim();
+    if !trimmed.is_empty() {
+        queries.push(trimmed.to_string());
+    }
+
+    for token in trimmed.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-')) {
+        let token = token.trim_matches('-');
+        if token.len() < 4 || is_low_signal_query_token(token) {
+            continue;
+        }
+        if !queries.iter().any(|existing| existing == token) {
+            queries.push(token.to_string());
+        }
+    }
+
+    queries
+}
+
+fn is_low_signal_query_token(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "fix"
+            | "add"
+            | "use"
+            | "using"
+            | "update"
+            | "change"
+            | "client"
+            | "api"
+            | "sdk"
+            | "test"
+            | "tests"
+            | "current"
+            | "state"
+            | "with"
+            | "from"
+            | "into"
+            | "the"
+    )
+}
+
+fn reference_gate_required(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        " api",
+        "sdk",
+        "dependency",
+        "dependencies",
+        "crate",
+        "package",
+        "library",
+        "upgrade",
+        "migrate",
+        "version",
+        "docs",
+        "documentation",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn reference_packages_for_message(message: &str, packages: Vec<PackageId>) -> Vec<PackageId> {
+    let lower = message.to_ascii_lowercase();
+    let mut matched = packages
+        .iter()
+        .filter(|package| lower.contains(&package.name.to_ascii_lowercase()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if matched.is_empty() && reference_gate_required(message) {
+        matched = packages.into_iter().take(3).collect();
+    }
+
+    matched
+}
+
+fn local_reference_source_roots(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![
+        workspace_root.join(".cargo").join("registry").join("src"),
+        workspace_root.join("vendor"),
+    ];
+
+    if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
+        roots.push(PathBuf::from(cargo_home).join("registry").join("src"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        roots.push(
+            PathBuf::from(home)
+                .join(".cargo")
+                .join("registry")
+                .join("src"),
+        );
+    }
+
+    roots
+}
+
+fn local_reference_gate_pack(
+    broker: &ReferenceBroker,
+    message: &str,
+    package: PackageId,
+) -> ReferencePack {
+    let mut pack = broker.compile_reference_pack(
+        ReferenceSourceKind::LocalSource,
+        vec![RawFinding {
+            kind: FindingKind::Caveat,
+            title: Some("Reference gate required".to_string()),
+            content: format!(
+                "Do not rely on model memory alone for {}. Resolve installed source or official docs before implementing API-specific behavior.",
+                package.name
+            ),
+            language: None,
+            source_url: None,
+        }],
+        message,
+    );
+    pack.library = Some(package.name);
+    pack.version = package.version;
+    pack.confidence = ReferenceConfidence::Uncertain;
+    pack.relevant_rules.push(
+        "Reference-first: verify package APIs with local source, docs MCP, or official docs."
+            .to_string(),
+    );
+    pack
+}
+
 fn help_text() -> String {
     r#"Charm Help
 ──────────────────────────────────────────
@@ -1700,8 +2479,12 @@ Slash commands
   /model <id>            Pin a model for this session
   /session [next|prev|<id>]  Rotate between sessions
   /agent spawn <task>    Start a background sub-agent
-  /agent list|kill <id>  Inspect / cancel sub-agents
+  /agent list|diff <id>  Inspect sub-agent output
+  /agent merge|cleanup <id>  Apply or remove sub-agent worktree
+  /agent kill <id>      Cancel a sub-agent
   /approvals             Show pending approvals
+  /approvals approve <id>  Approve a pending tool request
+  /approvals deny <id>  Deny a pending tool request
   /context add <path>    Pin a workspace context chip
   /context clear         Clear context chips
   /mcp / /lsp            Inspect MCP / LSP snapshots
@@ -1716,16 +2499,21 @@ Keyboard
   Ctrl+N          New session
   Ctrl+Y          Cycle autonomy profile
   Ctrl+A          Sub-agent queue
+  Ctrl+Shift+A    Approval queue
   Ctrl+Tab        Next session
   Ctrl+Shift+Tab  Previous session
   Ctrl+B / Ctrl+D Toggle left / right docks
   Tab             Autocomplete slash command (completes common prefix)
+  Shift+Enter     Insert newline in composer
+  Option+Enter    Insert newline in composer
+  Option+←/→      Move by word (Alt/Meta fallback)
+  Option+Backspace/Delete  Delete word backward/forward
   ↑ / ↓           Navigate slash dropdown / overlay list
   F1 / ?          Open this help overlay
   PgUp / PgDn     Scroll transcript page-by-page
   Shift+Up/Down   Fine-grain scroll (disengages auto-follow)
   Mouse wheel     Scroll transcript (wheel-down at bottom re-engages follow)
-  Esc             Dismiss overlay / cancel
+  Esc             Dismiss overlay, clear draft, then quit
 
 Autonomy levels (see docs/charm-strategy.md § Autonomy Profiles)
   conservative  Every write/exec needs approval. Reads auto.
@@ -1737,7 +2525,7 @@ Autonomy levels (see docs/charm-strategy.md § Autonomy Profiles)
 Coming soon
   • Auto model routing via `charm delegate` (Planner/Worker).
   • TokenSaver-backed /compact with code-span preservation.
-  • Sub-agent result review, merge, and cleanup workflow.
+  • Sub-agent result PR/export workflow.
 "#
     .to_string()
 }
@@ -1764,6 +2552,10 @@ fn new_session_snapshot(workspace_root: &Path, prompt: Option<String>) -> Sessio
         background_jobs: Vec::new(),
         preflight: WorkspacePreflight::default(),
         composer: Default::default(),
+        current_task_contract: None,
+        verification: VerificationState::default(),
+        repo_evidence: Vec::new(),
+        reference_packs: Vec::new(),
     }
 }
 
@@ -2067,6 +2859,26 @@ mod tests {
         })
     }
 
+    struct FailingModel;
+
+    #[async_trait]
+    impl RuntimeModel for FailingModel {
+        async fn chat(&self, _request: ChatRequest) -> anyhow::Result<(Message, Option<Usage>)> {
+            Err(anyhow::anyhow!("provider unavailable"))
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: ChatRequest,
+        ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>> {
+            Err(anyhow::anyhow!("stream unavailable"))
+        }
+
+        fn tool_schemas(&self) -> Vec<ToolSchema> {
+            crate::providers::types::default_tool_schemas()
+        }
+    }
+
     #[tokio::test]
     async fn bootstrap_emits_preflight_lsp_and_mcp_events() {
         let dir = tempdir().unwrap();
@@ -2160,6 +2972,489 @@ mod tests {
             runtime.snapshot().transcript[0].content,
             "fix the architecture"
         );
+    }
+
+    #[tokio::test]
+    async fn submit_input_concretizes_turn_and_injects_contract_into_system_prompt() {
+        let dir = tempdir().unwrap();
+        let model = fake_model(vec![Message {
+            role: "assistant".to_string(),
+            content: Some("Done".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_details: None,
+        }]);
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+
+        runtime
+            .submit_input("Fix src/main.rs panic and run tests")
+            .await
+            .unwrap();
+
+        let contract = runtime
+            .snapshot()
+            .current_task_contract
+            .as_ref()
+            .expect("turn should have a concretized task contract");
+        assert_eq!(contract.objective, "Fix src/main.rs panic and run tests");
+        assert!(
+            contract
+                .verification
+                .iter()
+                .any(|item| item.contains("Build") || item.contains("test"))
+        );
+
+        let system = runtime.snapshot().messages[0]
+            .content
+            .as_ref()
+            .expect("system prompt");
+        assert!(system.contains("## Current Task Contract"));
+        assert!(system.contains("Fix src/main.rs panic and run tests"));
+        assert!(system.contains("## Verification Gate"));
+    }
+
+    #[tokio::test]
+    async fn submit_input_persists_turn_contract_and_model_trace() {
+        let dir = tempdir().unwrap();
+        let model = fake_model(vec![Message {
+            role: "assistant".to_string(),
+            content: Some("Traceable response".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_details: None,
+        }]);
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+        let session_id = runtime.snapshot().metadata.session_id.clone();
+
+        runtime.submit_input("Explain the repo").await.unwrap();
+
+        let trace_path = dir
+            .path()
+            .join(".charm")
+            .join("traces")
+            .join(format!("{session_id}.jsonl"));
+        let trace = std::fs::read_to_string(trace_path).expect("trace jsonl");
+        assert!(trace.contains("\"event\":\"task_contract\""));
+        assert!(trace.contains("\"event\":\"model_response\""));
+        assert!(trace.contains("Traceable response"));
+    }
+
+    #[tokio::test]
+    async fn successful_command_tool_updates_verification_state_and_trace() {
+        let dir = tempdir().unwrap();
+        let model = fake_model(vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some("Running verification".to_string()),
+                tool_calls: Some(vec![ToolCallBlock {
+                    id: "call-verify".to_string(),
+                    r#type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "run_command".to_string(),
+                        arguments: serde_json::json!({
+                            "command": "printf 'verification ok\\n'",
+                            "risk_class": "safe"
+                        })
+                        .to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Some("Verified".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+            },
+        ]);
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+        let session_id = runtime.snapshot().metadata.session_id.clone();
+
+        runtime
+            .submit_input("Verify the current state")
+            .await
+            .unwrap();
+
+        assert!(
+            runtime
+                .snapshot()
+                .verification
+                .observed
+                .iter()
+                .any(|item| item.contains("printf 'verification ok"))
+        );
+        assert!(runtime.snapshot().verification.satisfied);
+
+        let trace_path = dir
+            .path()
+            .join(".charm")
+            .join("traces")
+            .join(format!("{session_id}.jsonl"));
+        let trace = std::fs::read_to_string(trace_path).expect("trace jsonl");
+        assert!(trace.contains("\"event\":\"tool_result\""));
+        assert!(trace.contains("\"minified_output\""));
+        assert!(trace.contains("\"raw_ref\""));
+        assert!(trace.contains("verification ok"));
+    }
+
+    #[tokio::test]
+    async fn edit_tool_is_blocked_until_repo_evidence_is_observed() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        let model = fake_model(vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some("Editing directly".to_string()),
+                tool_calls: Some(vec![ToolCallBlock {
+                    id: "call-edit".to_string(),
+                    r#type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "edit_patch".to_string(),
+                        arguments: serde_json::json!({
+                            "file_path": "src/main.rs",
+                            "old_string": "fn main() {}\n",
+                            "new_string": "fn main() { println!(\"hi\"); }\n"
+                        })
+                        .to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Some("Need to inspect first".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+            },
+        ]);
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+        let session_id = runtime.snapshot().metadata.session_id.clone();
+
+        runtime.submit_input("Adjust greeting").await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src").join("main.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        let tool_message = runtime
+            .snapshot()
+            .messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .and_then(|message| message.content.as_ref())
+            .expect("blocked tool result");
+        assert!(tool_message.contains("Tool policy gate"));
+
+        let trace_path = dir
+            .path()
+            .join(".charm")
+            .join("traces")
+            .join(format!("{session_id}.jsonl"));
+        let trace = std::fs::read_to_string(trace_path).expect("trace jsonl");
+        assert!(trace.contains("\"event\":\"tool_policy_blocked\""));
+    }
+
+    #[tokio::test]
+    async fn submit_input_collects_repo_evidence_before_model_call() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src").join("main.rs"),
+            "fn panic_path() { panic!(\"boom\"); }\n",
+        )
+        .unwrap();
+        let model = fake_model(vec![Message {
+            role: "assistant".to_string(),
+            content: Some("I saw repo evidence".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_details: None,
+        }]);
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+        let session_id = runtime.snapshot().metadata.session_id.clone();
+
+        runtime.submit_input("Fix panic_path").await.unwrap();
+
+        assert!(
+            runtime
+                .snapshot()
+                .repo_evidence
+                .iter()
+                .any(|item| item.file_path.contains("src/main.rs"))
+        );
+        let system = runtime.snapshot().messages[0]
+            .content
+            .as_ref()
+            .expect("system prompt");
+        assert!(system.contains("## Repo Evidence"));
+        assert!(system.contains("panic_path"));
+
+        let trace_path = dir
+            .path()
+            .join(".charm")
+            .join("traces")
+            .join(format!("{session_id}.jsonl"));
+        let trace = std::fs::read_to_string(trace_path).expect("trace jsonl");
+        assert!(trace.contains("\"event\":\"repo_evidence\""));
+    }
+
+    #[tokio::test]
+    async fn external_api_request_adds_reference_gate_pack_to_prompt() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n\n[dependencies]\nreqwest = \"0.12\"\n",
+        )
+        .unwrap();
+        let source_dir = dir
+            .path()
+            .join(".cargo")
+            .join("registry")
+            .join("src")
+            .join("index")
+            .join("reqwest-0.12");
+        std::fs::create_dir_all(source_dir.join("src")).unwrap();
+        std::fs::write(
+            source_dir.join("README.md"),
+            "# reqwest\n\nUse Client::new() for HTTP clients.\n",
+        )
+        .unwrap();
+        let model = fake_model(vec![Message {
+            role: "assistant".to_string(),
+            content: Some("Need docs".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_details: None,
+        }]);
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+        let session_id = runtime.snapshot().metadata.session_id.clone();
+
+        runtime
+            .submit_input("Use the reqwest API to add a client")
+            .await
+            .unwrap();
+
+        assert!(
+            runtime
+                .snapshot()
+                .reference_packs
+                .iter()
+                .any(|pack| pack.library.as_deref() == Some("reqwest"))
+        );
+        let system = runtime.snapshot().messages[0]
+            .content
+            .as_ref()
+            .expect("system prompt");
+        assert!(system.contains("## Reference Gate"));
+        assert!(system.contains("reqwest"));
+        assert!(system.contains("Client::new"));
+
+        let trace_path = dir
+            .path()
+            .join(".charm")
+            .join("traces")
+            .join(format!("{session_id}.jsonl"));
+        let trace = std::fs::read_to_string(trace_path).expect("trace jsonl");
+        assert!(trace.contains("\"event\":\"reference_gate\""));
+    }
+
+    #[tokio::test]
+    async fn completion_claim_without_verification_emits_gap_event() {
+        let dir = tempdir().unwrap();
+        let model = fake_model(vec![Message {
+            role: "assistant".to_string(),
+            content: Some("Done, fixed and complete.".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_details: None,
+        }]);
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+        let session_id = runtime.snapshot().metadata.session_id.clone();
+
+        let events = runtime.submit_input("Fix the issue").await.unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta { role, content }
+                if role == "system" && content.contains("Verification gate not satisfied")
+        )));
+        assert!(
+            runtime
+                .snapshot()
+                .verification
+                .last_status
+                .as_ref()
+                .is_some_and(|status| status.contains("completion claim blocked"))
+        );
+
+        let trace_path = dir
+            .path()
+            .join(".charm")
+            .join("traces")
+            .join(format!("{session_id}.jsonl"));
+        let trace = std::fs::read_to_string(trace_path).expect("trace jsonl");
+        assert!(trace.contains("\"event\":\"verification_gap\""));
+    }
+
+    #[tokio::test]
+    async fn compact_context_rolls_old_messages_into_summary() {
+        let dir = tempdir().unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+
+        for idx in 0..12 {
+            runtime.snapshot.messages.push(Message {
+                role: "user".to_string(),
+                content: Some(format!("old request {idx}")),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+            });
+            runtime.snapshot.messages.push(Message {
+                role: "assistant".to_string(),
+                content: Some(format!("old decision {idx}")),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+            });
+        }
+
+        let events = runtime.submit_input("/compact").await.unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ContextCompacted {
+                removed_messages,
+                ..
+            } if *removed_messages > 0
+        )));
+        assert_eq!(runtime.snapshot.messages[0].role, "system");
+        assert!(
+            runtime.snapshot.messages[1]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("[Earlier:"))
+        );
+        assert!(runtime.snapshot.messages.len() < 26);
     }
 
     #[tokio::test]
@@ -2624,6 +3919,160 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn agent_merge_copies_worktree_changes_to_primary_workspace() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+        let model = fake_model(Vec::new());
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+
+        let worktree = create_test_worktree(dir.path(), "merge-job");
+        std::fs::write(worktree.join("subagent-output.txt"), "ready to merge").unwrap();
+        runtime.snapshot.background_jobs.push(BackgroundJob {
+            id: "merge-job-1234".to_string(),
+            title: "merge test".to_string(),
+            status: BackgroundJobStatus::Completed,
+            detail: "ready".to_string(),
+            kind: BackgroundJobKind::SubAgent,
+            progress: Some(100),
+            metadata: Some(serde_json::json!({
+                "worktree_path": worktree,
+                "changed_files": ["subagent-output.txt"],
+                "turns": 2
+            })),
+        });
+
+        let events = runtime
+            .submit_input("/agent merge merge-job")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("subagent-output.txt")).unwrap(),
+            "ready to merge"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta { content, .. } if content.contains("Merged 1 file")
+        )));
+        let metadata = runtime.snapshot.background_jobs[0]
+            .metadata
+            .as_ref()
+            .unwrap();
+        assert_eq!(metadata.get("merged").and_then(Value::as_bool), Some(true));
+    }
+
+    #[tokio::test]
+    async fn agent_cleanup_removes_worktree_after_merge_review() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+        let model = fake_model(Vec::new());
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+
+        let worktree = create_test_worktree(dir.path(), "cleanup-job");
+        runtime.snapshot.background_jobs.push(BackgroundJob {
+            id: "cleanup-job-1234".to_string(),
+            title: "cleanup test".to_string(),
+            status: BackgroundJobStatus::Completed,
+            detail: "ready".to_string(),
+            kind: BackgroundJobKind::SubAgent,
+            progress: Some(100),
+            metadata: Some(serde_json::json!({
+                "worktree_path": worktree,
+                "changed_files": [],
+                "merged": true
+            })),
+        });
+
+        let events = runtime
+            .submit_input("/agent cleanup cleanup-job")
+            .await
+            .unwrap();
+
+        assert!(!worktree.exists());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta { content, .. } if content.contains("Cleaned up")
+        )));
+        let metadata = runtime.snapshot.background_jobs[0]
+            .metadata
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            metadata.get("cleaned_up").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_merge_rejects_changed_file_paths_that_escape_workspace() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+        let model = fake_model(Vec::new());
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+
+        let worktree = create_test_worktree(dir.path(), "escape-job");
+        runtime.snapshot.background_jobs.push(BackgroundJob {
+            id: "escape-job-1234".to_string(),
+            title: "escape test".to_string(),
+            status: BackgroundJobStatus::Completed,
+            detail: "ready".to_string(),
+            kind: BackgroundJobKind::SubAgent,
+            progress: Some(100),
+            metadata: Some(serde_json::json!({
+                "worktree_path": worktree,
+                "changed_files": ["../escape.txt"]
+            })),
+        });
+
+        let err = runtime
+            .submit_input("/agent merge escape-job")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("escapes workspace"));
+        assert!(!dir.path().join("escape.txt").exists());
+    }
+
     fn init_git_repo(path: &Path) {
         fn git(path: &Path, args: &[&str]) {
             let output = std::process::Command::new("git")
@@ -2646,6 +4095,30 @@ mod tests {
         std::fs::write(path.join("README.md"), "fixture\n").unwrap();
         git(path, &["add", "README.md"]);
         git(path, &["commit", "-q", "-m", "init"]);
+    }
+
+    fn create_test_worktree(root: &Path, name: &str) -> PathBuf {
+        let worktree = root.join(".charm").join("worktrees").join(name);
+        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        let output = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                &worktree.display().to_string(),
+                "HEAD",
+            ])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git worktree add failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        worktree
     }
 
     struct FakeStreamingModel {
@@ -2842,6 +4315,165 @@ mod tests {
             events.iter().any(
                 |e| matches!(e, RuntimeEvent::MessageDelta { role, .. } if role == "assistant")
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_internal_command_emits_done_event() {
+        let dir = tempdir().unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.submit_input_streaming("/help", tx).await.unwrap();
+
+        let events: Vec<RuntimeEvent> = rx.try_iter().collect();
+        assert!(
+            events.iter().any(
+                |event| matches!(event, RuntimeEvent::MessageDelta { content, .. } if content.contains("Charm Help"))
+            )
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::StreamDone { .. })),
+            "internal commands must clear TUI processing state"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_empty_intent_override_emits_done_event() {
+        let dir = tempdir().unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.submit_input_streaming("/plan", tx).await.unwrap();
+
+        let events: Vec<RuntimeEvent> = rx.try_iter().collect();
+        assert!(
+            events.iter().any(
+                |event| matches!(event, RuntimeEvent::MessageDelta { content, .. } if content.contains("Intent set to Plan"))
+            )
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::StreamDone { .. })),
+            "empty slash intent overrides must clear TUI processing state"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_model_failure_reports_error_without_ending_repl() {
+        let dir = tempdir().unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            Arc::new(FailingModel),
+        )
+        .await
+        .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.submit_input_streaming("hello", tx).await.unwrap();
+
+        let events: Vec<RuntimeEvent> = rx.try_iter().collect();
+        assert!(
+            events.iter().any(
+                |event| matches!(event, RuntimeEvent::MessageDelta { role, content } if role == "system" && content.contains("Model error"))
+            )
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::StreamDone { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_fallback_approval_request_emits_done_event() {
+        let dir = tempdir().unwrap();
+        let model_message = Message {
+            role: "assistant".to_string(),
+            content: Some("Need approval".to_string()),
+            tool_calls: Some(vec![ToolCallBlock {
+                id: "call-approval".to_string(),
+                r#type: "function".to_string(),
+                function: FunctionCall {
+                    name: "run_command".to_string(),
+                    arguments: serde_json::json!({
+                        "command": "rm -rf /tmp/demo",
+                        "risk_class": "destructive"
+                    })
+                    .to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_details: None,
+        };
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model_no_stream(model_message),
+        )
+        .await
+        .unwrap();
+        runtime.set_autonomy(AutonomyLevel::Conservative, "test");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.submit_input_streaming("danger", tx).await.unwrap();
+
+        let events: Vec<RuntimeEvent> = rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::ApprovalRequested { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::StreamDone { .. })),
+            "approval requests must clear TUI processing state"
         );
     }
 
