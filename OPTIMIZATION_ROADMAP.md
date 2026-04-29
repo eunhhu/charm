@@ -46,9 +46,9 @@ TaskContract
 
 ## 현재 진행 요약
 
-- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, repeated-failure precedent gate, GitHub issue precedent provider, command cancel, read-range FileCache, TokenSaver-backed `/compact`.
+- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, repeated-failure precedent gate, GitHub issue/discussion precedent provider, command cancel, read-range FileCache, TokenSaver-backed `/compact`.
 - **부분/Wired**: Context7/local package/registry/web reference provider, FastExecutor read-only batch path, trace linkage.
-- **남음**: GitHub discussion/GraphQL precedent provider, side-effect scope guard 정밀화, replay/audit UI, persistent cache, full TUI parallel tool execution.
+- **남음**: side-effect scope guard 정밀화, replay/audit UI, persistent cache, full TUI parallel tool execution.
 
 ## 제품 레이어 로드맵
 
@@ -97,11 +97,11 @@ pub struct TaskContract {
 - [x] local package source/type definitions 조회
   - Status: Wired. vendored/local package source roots 우선 조회.
 - [x] registry/web search fallback 정책
-  - Status: Partially Wired. npm/PyPI/crates.io + web search fallback 존재. GitHub issue/discussion 전용 precedent search는 남음.
+  - Status: Wired. npm/PyPI/crates.io + web search fallback 존재. GitHub issue/discussion 전용 precedent search도 repeated-failure gate에 연결됨.
 - [x] `ReferencePack` 구조 도입
   - Status: Wired. `ReferenceBroker`가 provider 결과를 `ReferencePack`으로 컴파일하고 session prompt에 주입.
 - [x] 두 번 이상 local debugging 실패 시 external precedent search 강제
-  - Status: Wired. 연속 command failure 2회 이후 GitHub issue search 결과를 `GitHubIssues` precedent pack과 trace event로 주입. GitHub Discussions/GraphQL 검색은 후속 작업.
+  - Status: Wired. 연속 command failure 2회 이후 GitHub issue search와 package repo 기반 GitHub Discussions GraphQL 결과를 `GitHubIssues` precedent pack과 trace event로 주입.
 
 ```rust
 pub struct ReferencePack {

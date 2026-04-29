@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -114,6 +114,15 @@ pub struct IssueResult {
     pub title: String,
     pub url: String,
     pub status: IssueStatus,
+    pub relevance_score: f64,
+}
+
+/// Search result from GitHub Discussions GraphQL API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscussionResult {
+    pub title: String,
+    pub url: String,
+    pub answered: bool,
     pub relevance_score: f64,
 }
 
@@ -283,6 +292,19 @@ impl ReferenceBroker {
         );
         let body = (self.http_get)(url).await?;
         parse_github_issue_search(&body)
+    }
+
+    /// Search package GitHub Discussions for answered precedents matching an error.
+    pub async fn search_discussions(
+        &self,
+        package: &PackageId,
+        error_message: &str,
+    ) -> anyhow::Result<Vec<DiscussionResult>> {
+        let Some((owner, repo)) = self.github_repo_for_package(package).await? else {
+            return Ok(Vec::new());
+        };
+        self.search_discussions_in_repo(&owner, &repo, error_message)
+            .await
     }
 
     /// Compile raw findings into a ReferencePack
@@ -685,6 +707,146 @@ impl ReferenceBroker {
 
         registry_pack(self, package, version, findings, "crates.io")
     }
+
+    async fn github_repo_for_package(
+        &self,
+        package: &PackageId,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let Some(registry) = package.registry.as_deref() else {
+            return Ok(None);
+        };
+        match registry.to_ascii_lowercase().as_str() {
+            "crates.io" | "cargo" | "crates" => self.github_repo_from_crates_io(package).await,
+            "npm" => self.github_repo_from_npm(package).await,
+            "pypi" => self.github_repo_from_pypi(package).await,
+            _ => Ok(None),
+        }
+    }
+
+    async fn github_repo_from_crates_io(
+        &self,
+        package: &PackageId,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let encoded = urlencoding::encode(&package.name);
+        let url = format!("https://crates.io/api/v1/crates/{encoded}");
+        let body = (self.http_get)(url).await?;
+        let json: serde_json::Value = serde_json::from_str(&body)?;
+        let Some(crate_info) = json.get("crate") else {
+            return Ok(None);
+        };
+        for field in ["repository", "homepage", "documentation"] {
+            if let Some(repo) = crate_info
+                .get(field)
+                .and_then(str_value)
+                .and_then(|url| github_repo_from_url(&url))
+            {
+                return Ok(Some(repo));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn github_repo_from_npm(
+        &self,
+        package: &PackageId,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let url = format!(
+            "https://registry.npmjs.org/{}",
+            urlencoding::encode(&package.name)
+        );
+        let body = (self.http_get)(url).await?;
+        let json: serde_json::Value = serde_json::from_str(&body)?;
+        let candidates = [
+            json.pointer("/repository/url").and_then(str_value),
+            json.get("repository").and_then(str_value),
+            json.get("homepage").and_then(str_value),
+            json.pointer("/bugs/url").and_then(str_value),
+        ];
+        Ok(candidates
+            .into_iter()
+            .flatten()
+            .find_map(|url| github_repo_from_url(&url)))
+    }
+
+    async fn github_repo_from_pypi(
+        &self,
+        package: &PackageId,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let encoded = urlencoding::encode(&package.name);
+        let url = if let Some(version) = package.version.as_deref() {
+            format!("https://pypi.org/pypi/{encoded}/{version}/json")
+        } else {
+            format!("https://pypi.org/pypi/{encoded}/json")
+        };
+        let body = (self.http_get)(url).await?;
+        let json: serde_json::Value = serde_json::from_str(&body)?;
+        let Some(info) = json.get("info") else {
+            return Ok(None);
+        };
+
+        for field in ["home_page", "project_url"] {
+            if let Some(repo) = info
+                .get(field)
+                .and_then(str_value)
+                .and_then(|url| github_repo_from_url(&url))
+            {
+                return Ok(Some(repo));
+            }
+        }
+        if let Some(project_urls) = info
+            .get("project_urls")
+            .and_then(serde_json::Value::as_object)
+        {
+            for key in ["Source", "Source Code", "Repository", "Homepage", "GitHub"] {
+                if let Some(repo) = project_urls
+                    .get(key)
+                    .and_then(str_value)
+                    .and_then(|url| github_repo_from_url(&url))
+                {
+                    return Ok(Some(repo));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn search_discussions_in_repo(
+        &self,
+        owner: &str,
+        repo: &str,
+        error_message: &str,
+    ) -> anyhow::Result<Vec<DiscussionResult>> {
+        let payload = serde_json::json!({
+            "query": r#"
+query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    discussions(first: 20, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes {
+        title
+        url
+        bodyText
+        isAnswered
+        answer {
+          bodyText
+          url
+        }
+      }
+    }
+  }
+}
+"#,
+            "variables": {
+                "owner": owner,
+                "name": repo,
+            }
+        });
+        let body = (self.http_post)(
+            "https://api.github.com/graphql".to_string(),
+            payload.to_string(),
+        )
+        .await?;
+        parse_github_discussions(&body, error_message)
+    }
 }
 
 fn default_http_get() -> HttpGet {
@@ -699,7 +861,11 @@ fn default_http_get() -> HttpGet {
                         .redirect(reqwest::redirect::Policy::none()),
                 )
                 .build()?;
-            let response = client.get(&url).send().await?;
+            let mut request = client.get(&url);
+            if let Some(token) = github_api_token_for_url(&url) {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await?;
             let status = response.status();
             if !status.is_success() {
                 anyhow::bail!("GET {url} failed with {status}");
@@ -727,6 +893,9 @@ fn default_http_post() -> HttpPost {
                 .body(body);
             if let Ok(api_key) = std::env::var("CONTEXT7_API_KEY") {
                 request = request.header("CONTEXT7_API_KEY", api_key);
+            }
+            if let Some(token) = github_api_token_for_url(&url) {
+                request = request.bearer_auth(token);
             }
             let response = request.send().await?;
             let status = response.status();
@@ -872,6 +1041,25 @@ fn validate_context7_endpoint(endpoint: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn is_github_api_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "api.github.com")
+}
+
+fn github_api_token_for_url(url: &str) -> Option<String> {
+    is_github_api_url(url).then(github_token).flatten()
+}
+
+fn github_token() -> Option<String> {
+    std::env::var("GITHUB_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("GH_TOKEN").ok())
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
 fn parse_github_issue_search(body: &str) -> anyhow::Result<Vec<IssueResult>> {
     #[derive(Deserialize)]
     struct SearchResponse {
@@ -912,6 +1100,62 @@ fn parse_github_issue_search(body: &str) -> anyhow::Result<Vec<IssueResult>> {
         .collect())
 }
 
+fn parse_github_discussions(
+    body: &str,
+    error_message: &str,
+) -> anyhow::Result<Vec<DiscussionResult>> {
+    let json: serde_json::Value = serde_json::from_str(body)?;
+    if let Some(errors) = json.get("errors") {
+        anyhow::bail!("GitHub GraphQL returned errors: {errors}");
+    }
+    let Some(nodes) = json
+        .pointer("/data/repository/discussions/nodes")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut results = Vec::new();
+    for node in nodes {
+        let Some(title) = node.get("title").and_then(str_value) else {
+            continue;
+        };
+        let Some(url) = node.get("url").and_then(str_value) else {
+            continue;
+        };
+        let body_text = node.get("bodyText").and_then(str_value).unwrap_or_default();
+        let answer_text = node
+            .pointer("/answer/bodyText")
+            .and_then(str_value)
+            .unwrap_or_default();
+        let answered = node
+            .get("isAnswered")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| node.get("answer").is_some_and(|answer| !answer.is_null()));
+        let relevance_score = discussion_relevance(
+            error_message,
+            &format!("{title}\n{body_text}\n{answer_text}"),
+            answered,
+        );
+        if relevance_score > 0.0 {
+            results.push(DiscussionResult {
+                title,
+                url,
+                answered,
+                relevance_score,
+            });
+        }
+    }
+
+    results.sort_by(|a, b| {
+        b.relevance_score
+            .partial_cmp(&a.relevance_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(5);
+    Ok(results)
+}
+
 fn first_meaningful_line(message: &str) -> Option<&str> {
     message.lines().map(str::trim).find(|line| {
         !line.is_empty()
@@ -919,6 +1163,71 @@ fn first_meaningful_line(message: &str) -> Option<&str> {
             && !line.starts_with("Finished ")
             && !line.starts_with("Compiling ")
     })
+}
+
+fn discussion_relevance(error_message: &str, text: &str, answered: bool) -> f64 {
+    let signature = first_meaningful_line(error_message).unwrap_or(error_message);
+    let tokens = relevance_tokens(signature);
+    let haystack = text.to_ascii_lowercase();
+    let matched = tokens
+        .iter()
+        .filter(|token| haystack.contains(token.as_str()))
+        .count();
+    if matched == 0 {
+        return 0.0;
+    }
+    let base = matched as f64 / tokens.len().max(1) as f64;
+    if answered { base + 0.25 } else { base }
+}
+
+fn relevance_tokens(text: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|token| token.len() >= 4)
+        .filter(|token| seen.insert(token.clone()))
+        .collect()
+}
+
+fn github_repo_from_url(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if let Some(path) = trimmed.strip_prefix("git@github.com:") {
+        return github_repo_from_path(path);
+    }
+    if let Some(path) = trimmed.strip_prefix("github:") {
+        return github_repo_from_path(path);
+    }
+
+    let normalized = trimmed.strip_prefix("git+").unwrap_or(trimmed);
+    let parsed = reqwest::Url::parse(normalized).ok()?;
+    if parsed.host_str()?.to_ascii_lowercase() != "github.com" {
+        return None;
+    }
+    let mut segments = parsed.path_segments()?;
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    github_repo_from_parts(owner, repo)
+}
+
+fn github_repo_from_path(path: &str) -> Option<(String, String)> {
+    let path = path.trim_start_matches('/').trim_end_matches('/');
+    let mut segments = path.split('/');
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    github_repo_from_parts(owner, repo)
+}
+
+fn github_repo_from_parts(owner: &str, repo: &str) -> Option<(String, String)> {
+    let owner = owner.trim();
+    let repo = repo
+        .trim()
+        .trim_end_matches(".git")
+        .trim_end_matches('/')
+        .trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
 }
 
 fn extract_mcp_text(body: &str) -> anyhow::Result<String> {
@@ -1388,6 +1697,87 @@ pandas
         assert_eq!(issues[0].status, IssueStatus::Open);
         assert_eq!(issues[1].status, IssueStatus::Closed);
         assert!(issues[0].relevance_score > issues[1].relevance_score);
+    }
+
+    #[tokio::test]
+    async fn test_search_discussions_resolves_github_repo_and_parses_graphql() {
+        let broker = ReferenceBroker::new()
+            .with_http_get(|url| async move {
+                assert_eq!(url, "https://crates.io/api/v1/crates/tokio");
+                Ok(r#"{
+  "crate": {
+    "id": "tokio",
+    "max_version": "1.44.0",
+    "description": "runtime",
+    "repository": "https://github.com/tokio-rs/tokio"
+  }
+}"#
+                .to_string())
+            })
+            .with_http_post(|url, body| async move {
+                assert_eq!(url, "https://api.github.com/graphql");
+                let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(
+                    payload.pointer("/variables/owner").and_then(str_value),
+                    Some("tokio-rs".to_string())
+                );
+                assert_eq!(
+                    payload.pointer("/variables/name").and_then(str_value),
+                    Some("tokio".to_string())
+                );
+                Ok(r#"{
+  "data": {
+    "repository": {
+      "discussions": {
+        "nodes": [
+          {
+            "title": "unresolved import after feature flags",
+            "url": "https://github.com/tokio-rs/tokio/discussions/7",
+            "bodyText": "error[E0432] unresolved import Runtime",
+            "isAnswered": true,
+            "answer": {
+              "bodyText": "enable the full feature",
+              "url": "https://github.com/tokio-rs/tokio/discussions/7#discussioncomment-1"
+            }
+          },
+          {
+            "title": "unrelated topic",
+            "url": "https://github.com/tokio-rs/tokio/discussions/8",
+            "bodyText": "other topic",
+            "isAnswered": false,
+            "answer": null
+          }
+        ]
+      }
+    }
+  }
+}"#
+                .to_string())
+            });
+
+        let discussions = broker
+            .search_discussions(
+                &PackageId {
+                    name: "tokio".to_string(),
+                    version: Some("1.44.0".to_string()),
+                    registry: Some("crates.io".to_string()),
+                },
+                "error[E0432]: unresolved import",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(discussions.len(), 1);
+        assert_eq!(
+            discussions[0].title,
+            "unresolved import after feature flags"
+        );
+        assert!(discussions[0].answered);
+        assert_eq!(
+            discussions[0].url,
+            "https://github.com/tokio-rs/tokio/discussions/7"
+        );
+        assert!(discussions[0].relevance_score > 0.0);
     }
 
     #[tokio::test]

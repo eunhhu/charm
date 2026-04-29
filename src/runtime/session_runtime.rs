@@ -751,26 +751,47 @@ impl SessionRuntime {
                 registry: None,
             });
 
-        match self
+        let mut findings = Vec::new();
+        if let Ok(issues) = self
             .reference_broker
             .search_issues(&package, signature)
             .await
         {
-            Ok(issues) => issues
-                .into_iter()
-                .map(|issue| RawFinding {
+            findings.extend(issues.into_iter().map(|issue| RawFinding {
+                kind: FindingKind::Caveat,
+                title: Some(format!("GitHub precedent: {}", issue.title)),
+                content: format!(
+                    "{:?} issue matched repeated local failure with relevance {:.2}: {}",
+                    issue.status, issue.relevance_score, issue.title
+                ),
+                language: None,
+                source_url: Some(issue.url),
+            }));
+        }
+        if let Ok(discussions) = self
+            .reference_broker
+            .search_discussions(&package, signature)
+            .await
+        {
+            findings.extend(discussions.into_iter().map(|discussion| {
+                let status = if discussion.answered {
+                    "Answered"
+                } else {
+                    "Open"
+                };
+                RawFinding {
                     kind: FindingKind::Caveat,
-                    title: Some(format!("GitHub precedent: {}", issue.title)),
+                    title: Some(format!("GitHub discussion precedent: {}", discussion.title)),
                     content: format!(
-                        "{:?} issue matched repeated local failure with relevance {:.2}: {}",
-                        issue.status, issue.relevance_score, issue.title
+                        "{status} discussion matched repeated local failure with relevance {:.2}: {}",
+                        discussion.relevance_score, discussion.title
                     ),
                     language: None,
-                    source_url: Some(issue.url),
-                })
-                .collect(),
-            Err(_) => Vec::new(),
+                    source_url: Some(discussion.url),
+                }
+            }));
         }
+        findings
     }
 
     fn verification_gap_event(&mut self, content: &str) -> Option<RuntimeEvent> {
@@ -3691,6 +3712,110 @@ mod tests {
             .join(format!("{session_id}.jsonl"));
         let trace = std::fs::read_to_string(trace_path).expect("trace jsonl");
         assert!(trace.contains("\"event\":\"external_precedent_required\""));
+    }
+
+    #[tokio::test]
+    async fn repeated_command_failures_include_github_discussion_precedents() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[dependencies]
+tokio = "1.44"
+"#,
+        )
+        .unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+        runtime.reference_broker = ReferenceBroker::new()
+            .with_http_get(|url| async move {
+                if url.starts_with("https://api.github.com/search/issues?q=") {
+                    return Ok(r#"{ "total_count": 0, "items": [] }"#.to_string());
+                }
+                assert_eq!(url, "https://crates.io/api/v1/crates/tokio");
+                Ok(r#"{
+  "crate": {
+    "id": "tokio",
+    "max_version": "1.44.0",
+    "repository": "https://github.com/tokio-rs/tokio"
+  }
+}"#
+                .to_string())
+            })
+            .with_http_post(|url, body| async move {
+                assert_eq!(url, "https://api.github.com/graphql");
+                assert!(body.contains("tokio-rs"));
+                assert!(body.contains("tokio"));
+                Ok(r#"{
+  "data": {
+    "repository": {
+      "discussions": {
+        "nodes": [
+          {
+            "title": "unresolved import after feature flags",
+            "url": "https://github.com/tokio-rs/tokio/discussions/7",
+            "bodyText": "error[E0432] unresolved import tokio::runtime",
+            "isAnswered": true,
+            "answer": { "bodyText": "enable the full feature", "url": "https://github.com/tokio-rs/tokio/discussions/7#discussioncomment-1" }
+          }
+        ]
+      }
+    }
+  }
+}"#
+                .to_string())
+            });
+        runtime.current_turn_id = Some("turn-discussion-precedent".to_string());
+
+        let call = ToolCall::RunCommand {
+            command: "cargo test".to_string(),
+            cwd: None,
+            blocking: true,
+            timeout_ms: None,
+            risk_class: RiskClass::SafeExec,
+        };
+        let failure = ToolResult {
+            success: false,
+            output: "error[E0432]: unresolved import tokio::runtime\nfailed to compile".to_string(),
+            error: None,
+            metadata: Some(serde_json::json!({ "exit_code": 101 })),
+        };
+
+        runtime
+            .record_tool_result(&call, "run_command", &failure)
+            .await
+            .unwrap();
+        runtime
+            .record_tool_result(&call, "run_command", &failure)
+            .await
+            .unwrap();
+
+        assert!(runtime.snapshot().reference_packs.iter().any(|pack| {
+            pack.source_kind == ReferenceSourceKind::GitHubIssues
+                && pack
+                    .source_refs
+                    .iter()
+                    .any(|source| source.url == "https://github.com/tokio-rs/tokio/discussions/7")
+                && pack
+                    .caveats
+                    .iter()
+                    .any(|caveat| caveat.contains("Answered discussion matched"))
+        }));
     }
 
     #[tokio::test]

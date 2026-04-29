@@ -312,7 +312,6 @@ rtk cargo test
 - **Delegate 모드**: 실험적 기능
 
 ### 개발 중인 기능
-- Reference-first 정책 고도화: GitHub discussion/GraphQL precedent provider 연결
 - TaskConcretizer side-effect scan의 scope guard 정밀도 개선
 - TokenSaver-backed `/compact`의 replay/audit UI 연결
 - AgentTraceStore 기반 audit/replay UI
