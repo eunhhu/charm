@@ -568,6 +568,7 @@ impl SessionRuntime {
         result: &ToolResult,
     ) -> anyhow::Result<()> {
         self.observe_verification(call, result);
+        self.maybe_force_external_precedent(call, result);
         let minified = self.token_saver.minify(MinifyRequest {
             source_kind: source_kind_for_tool(call),
             raw: result.output.clone(),
@@ -639,6 +640,75 @@ impl SessionRuntime {
                 .unwrap_or(false);
         self.snapshot.verification.last_status = Some(format!("command {status}: {command}"));
         self.snapshot.verification.updated_at = Some(Utc::now());
+    }
+
+    fn maybe_force_external_precedent(&mut self, call: &ToolCall, result: &ToolResult) {
+        if result.success {
+            return;
+        }
+        if result
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("running"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let Some(command) = verification_command(call, result) else {
+            return;
+        };
+        let failed_count = consecutive_failed_command_count(&self.snapshot.verification.observed);
+        if failed_count < 2 {
+            return;
+        }
+
+        let signature = failure_signature(result);
+        let query = format!("{} {}", command, signature);
+        if self.snapshot.reference_packs.iter().any(|pack| {
+            pack.source_kind == ReferenceSourceKind::GitHubIssues && pack.query == query
+        }) {
+            return;
+        }
+
+        let mut pack = ReferenceBroker::new().compile_reference_pack(
+            ReferenceSourceKind::GitHubIssues,
+            vec![RawFinding {
+                kind: FindingKind::Caveat,
+                title: Some("External precedent required".to_string()),
+                content: format!(
+                    "Local debugging has failed {failed_count} times. Stop guessing and search official issues, changelogs, migration guides, or known fixes before applying another local fix. Last failure: {signature}"
+                ),
+                language: None,
+                source_url: None,
+            }],
+            &query,
+        );
+        pack.confidence = ReferenceConfidence::Uncertain;
+        pack.relevant_rules.push(
+            "After two failed local fix cycles, stop guessing and verify external precedent before the next implementation attempt."
+                .to_string(),
+        );
+        self.snapshot.reference_packs.push(pack.clone());
+        self.snapshot.verification.last_status = Some(format!(
+            "external precedent required after {failed_count} failed command attempts: {command}"
+        ));
+        self.snapshot.verification.updated_at = Some(Utc::now());
+        self.append_transcript(
+            "system",
+            format!(
+                "External precedent required after {failed_count} failed command attempts. Search known fixes before continuing: {signature}"
+            ),
+        );
+        let _ = self.trace_current_turn(
+            "external_precedent_required",
+            serde_json::json!({
+                "command": command,
+                "failed_count": failed_count,
+                "signature": signature,
+                "reference_pack": pack,
+            }),
+        );
     }
 
     fn verification_gap_event(&mut self, content: &str) -> Option<RuntimeEvent> {
@@ -1722,7 +1792,35 @@ impl SessionRuntime {
 
     pub fn compact_context(&mut self) -> Vec<RuntimeEvent> {
         let before = self.snapshot.messages.len();
+        let raw_compacted = ContextCompressor::compaction_raw(&self.snapshot.messages, 12);
+        let minified_evidence = if raw_compacted.trim().is_empty() {
+            None
+        } else {
+            Some(self.token_saver.minify(MinifyRequest {
+                source_kind: SourceKind::CommandOutput,
+                raw: raw_compacted,
+                budget: TokenBudget::new(800),
+                preserve: PreservePolicy {
+                    head_lines: Some(40),
+                    tail_lines: Some(10),
+                    ..PreservePolicy::default()
+                },
+            }))
+        };
         let removed = ContextCompressor::compact_now(&mut self.snapshot.messages, 12);
+        if removed > 0 {
+            if let Some(minified) = minified_evidence.as_ref() {
+                if let Some(summary) = self
+                    .snapshot
+                    .messages
+                    .get_mut(1)
+                    .and_then(|message| message.content.as_mut())
+                {
+                    summary.push_str("\nTokenSaver evidence:\n");
+                    summary.push_str(&minified.text);
+                }
+            }
+        }
         self.refresh_system_prompt();
         let after = self.snapshot.messages.len();
         let net_removed = before.saturating_sub(after);
@@ -1739,6 +1837,7 @@ impl SessionRuntime {
                 "removed_messages": removed,
                 "net_removed_messages": net_removed,
                 "remaining_messages": after,
+                "minified_evidence": minified_evidence,
             }),
         );
         self.append_transcript("system", summary.clone());
@@ -2271,6 +2370,43 @@ fn verification_command(call: &ToolCall, result: &ToolResult) -> Option<String> 
     }
 }
 
+fn consecutive_failed_command_count(observed: &[String]) -> usize {
+    observed
+        .iter()
+        .rev()
+        .take_while(|entry| entry.starts_with("command failed:"))
+        .count()
+}
+
+fn failure_signature(result: &ToolResult) -> String {
+    let source = result
+        .error
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or(&result.output);
+    source
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed == "---stderr---" {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .map(|line| truncate_for_prompt(line, 240))
+        .unwrap_or_else(|| "unknown failure".to_string())
+}
+
+fn truncate_for_prompt(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
 fn parsed_completion_claim_without_verification(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
     [
@@ -2476,7 +2612,7 @@ Slash commands
   /autonomy <level>      conservative|balanced|aggressive|yolo
   /yolo                  Shortcut: /autonomy yolo (loud destructive trace)
   /safe                  Shortcut: /autonomy conservative
-  /compact               Roll old turns into a summary (TokenSaver TODO)
+  /compact               Roll old turns into a TokenSaver-backed summary
   /clear                 Clear transcript (keep system prompt)
   /model <id>            Pin a model for this session
   /session [next|prev|<id>]  Rotate between sessions
@@ -2526,7 +2662,7 @@ Autonomy levels (see docs/charm-strategy.md § Autonomy Profiles)
 
 Coming soon
   • Auto model routing via `charm delegate` (Planner/Worker).
-  • TokenSaver-backed /compact with code-span preservation.
+  • Trace replay/audit UI and persistent evidence browser.
   • Sub-agent result PR/export workflow.
 "#
     .to_string()
@@ -3405,6 +3541,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_command_failures_force_external_precedent_pack() {
+        let dir = tempdir().unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+        let session_id = runtime.snapshot().metadata.session_id.clone();
+        runtime.current_turn_id = Some("turn-precedent".to_string());
+
+        let call = ToolCall::RunCommand {
+            command: "cargo test".to_string(),
+            cwd: None,
+            blocking: true,
+            timeout_ms: None,
+            risk_class: RiskClass::SafeExec,
+        };
+        let failure = ToolResult {
+            success: false,
+            output: "error[E0432]: unresolved import `demo`\nfailed to compile".to_string(),
+            error: Some("cargo test failed".to_string()),
+            metadata: Some(serde_json::json!({ "exit_code": 101 })),
+        };
+
+        runtime
+            .record_tool_result(&call, "run_command", &failure)
+            .unwrap();
+        assert!(runtime.snapshot().reference_packs.is_empty());
+
+        runtime
+            .record_tool_result(&call, "run_command", &failure)
+            .unwrap();
+
+        assert!(runtime.snapshot().reference_packs.iter().any(|pack| {
+            pack.source_kind == ReferenceSourceKind::GitHubIssues
+                && pack.query.contains("cargo test")
+                && pack
+                    .relevant_rules
+                    .iter()
+                    .any(|rule| rule.contains("stop guessing"))
+        }));
+
+        let trace_path = dir
+            .path()
+            .join(".charm")
+            .join("traces")
+            .join(format!("{session_id}.jsonl"));
+        let trace = std::fs::read_to_string(trace_path).expect("trace jsonl");
+        assert!(trace.contains("\"event\":\"external_precedent_required\""));
+    }
+
+    #[tokio::test]
     async fn compact_context_rolls_old_messages_into_summary() {
         let dir = tempdir().unwrap();
         let (mut runtime, _) = SessionRuntime::bootstrap(
@@ -3458,6 +3655,66 @@ mod tests {
                 .is_some_and(|content| content.contains("[Earlier:"))
         );
         assert!(runtime.snapshot.messages.len() < 26);
+    }
+
+    #[tokio::test]
+    async fn compact_context_preserves_minified_old_tool_evidence() {
+        let dir = tempdir().unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+
+        for idx in 0..12 {
+            runtime.snapshot.messages.push(Message {
+                role: "user".to_string(),
+                content: Some(format!("old request {idx}")),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+            });
+            runtime.snapshot.messages.push(Message {
+                role: "tool".to_string(),
+                content: Some(
+                    serde_json::to_string(&ToolResult {
+                        success: true,
+                        output: format!("src/lib.rs\n12: let important_{idx} = value;"),
+                        error: None,
+                        metadata: None,
+                    })
+                    .unwrap(),
+                ),
+                tool_calls: None,
+                tool_call_id: Some(format!("tool-{idx}")),
+                reasoning: None,
+                reasoning_details: None,
+            });
+        }
+
+        let events = runtime.submit_input("/compact").await.unwrap();
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::ContextCompacted { .. }))
+        );
+        let summary = runtime.snapshot.messages[1]
+            .content
+            .as_deref()
+            .unwrap_or_default();
+        assert!(summary.contains("TokenSaver evidence"));
+        assert!(summary.contains("12: let important_0 = value;"));
     }
 
     #[tokio::test]

@@ -332,13 +332,14 @@ fn interactive_workflow_rules(intent: RouterIntent, autonomy: AutonomyLevel) -> 
 
 fn task_contract_rules(contract: &TaskContract) -> String {
     format!(
-        "## Current Task Contract\n- Objective: {}\n- Abstraction score: {:.2}\n- Depth: {:?}\n- Scope: {}\n- Acceptance: {}\n- Verification: {}\n- Assumptions: {}\n- Open questions: {}\n",
+        "## Current Task Contract\n- Objective: {}\n- Abstraction score: {:.2}\n- Depth: {:?}\n- Scope: {}\n- Acceptance: {}\n- Verification: {}\n- Side effects: {}\n- Assumptions: {}\n- Open questions: {}\n",
         contract.objective,
         contract.abstraction_score,
         contract.depth,
         join_or_none(&contract.scope),
         join_or_none(&contract.acceptance),
         join_or_none(&contract.verification),
+        join_or_none(&contract.side_effects),
         join_or_none(&contract.assumptions),
         join_or_none(&contract.open_questions),
     )

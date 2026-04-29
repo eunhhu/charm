@@ -57,11 +57,29 @@ impl ContextCompressor {
         removed
     }
 
-    fn compress_with_recent_count(messages: &mut Vec<Message>, preserve_recent: usize) -> usize {
-        let mut to_compress = messages.len().saturating_sub(preserve_recent);
-        while to_compress < messages.len() && messages[to_compress].role == "tool" {
-            to_compress += 1;
+    pub fn compaction_raw(messages: &[Message], preserve_recent: usize) -> String {
+        let working = if messages
+            .first()
+            .is_some_and(|message| message.role == "system")
+        {
+            &messages[1..]
+        } else {
+            messages
+        };
+        let to_compress = compaction_boundary(working, preserve_recent.max(2));
+        if to_compress == 0 {
+            return String::new();
         }
+
+        working[..to_compress]
+            .iter()
+            .filter_map(raw_compaction_content)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn compress_with_recent_count(messages: &mut Vec<Message>, preserve_recent: usize) -> usize {
+        let to_compress = compaction_boundary(messages, preserve_recent);
         if to_compress == 0 {
             return 0;
         }
@@ -169,6 +187,36 @@ impl ContextCompressor {
 
         parts.join("; ")
     }
+}
+
+fn compaction_boundary(messages: &[Message], preserve_recent: usize) -> usize {
+    let mut to_compress = messages.len().saturating_sub(preserve_recent);
+    while to_compress < messages.len() && messages[to_compress].role == "tool" {
+        to_compress += 1;
+    }
+    to_compress
+}
+
+fn raw_compaction_content(message: &Message) -> Option<String> {
+    let content = message.content.as_deref()?;
+    if message.role != "tool" {
+        return Some(content.to_string());
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+        let mut parts = Vec::new();
+        if let Some(output) = value.get("output").and_then(serde_json::Value::as_str) {
+            parts.push(output.to_string());
+        }
+        if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+            parts.push(error.to_string());
+        }
+        if !parts.is_empty() {
+            return Some(parts.join("\n"));
+        }
+    }
+
+    Some(content.to_string())
 }
 
 fn push_excerpt(target: &mut Vec<String>, content: &str, max_items: usize) {

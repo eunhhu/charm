@@ -161,7 +161,7 @@ impl TaskConcretizer {
             repo_anchors: Vec::new(),
             acceptance: vec!["User request is addressed with grounded evidence".to_string()],
             verification,
-            side_effects: Vec::new(),
+            side_effects: infer_side_effects(request),
             assumptions: vec!["Assuming standard project structure".to_string()],
             open_questions: Vec::new(),
             depth: ExecutionDepth::Normal,
@@ -169,6 +169,11 @@ impl TaskConcretizer {
     }
 
     fn build_contract_with_assumptions(&self, request: &str, score: f64) -> TaskContract {
+        let mut side_effects = infer_side_effects(request);
+        push_unique(
+            &mut side_effects,
+            "May affect related code paths".to_string(),
+        );
         TaskContract {
             abstraction_score: score,
             objective: request.to_string(),
@@ -176,7 +181,7 @@ impl TaskConcretizer {
             repo_anchors: Vec::new(),
             acceptance: vec!["Minimal viable improvement".to_string()],
             verification: vec!["Build passes".to_string(), "Basic smoke test".to_string()],
-            side_effects: vec!["May affect related code paths".to_string()],
+            side_effects,
             assumptions: vec![
                 "Assuming common patterns".to_string(),
                 "Will verify before committing".to_string(),
@@ -200,6 +205,91 @@ impl TaskConcretizer {
         } else {
             "Could you specify which files or components are involved?".to_string()
         }
+    }
+}
+
+fn infer_side_effects(request: &str) -> Vec<String> {
+    let lower = request.to_ascii_lowercase();
+    let mut effects = Vec::new();
+
+    if contains_any(
+        &lower,
+        &["tui", "terminal", "shortcut", "keybinding", "mac"],
+    ) {
+        push_unique(
+            &mut effects,
+            "May affect TUI input/keybinding compatibility".to_string(),
+        );
+    }
+    if contains_any(
+        &lower,
+        &["repl", "session", "runtime", "background", "sub-agent"],
+    ) {
+        push_unique(
+            &mut effects,
+            "May affect session/runtime state and persistence".to_string(),
+        );
+    }
+    if contains_any(&lower, &["auth", "token", "api key", "provider", "model"]) {
+        push_unique(
+            &mut effects,
+            "May affect authentication, provider routing, or model selection".to_string(),
+        );
+    }
+    if contains_any(&lower, &["database", "schema", "migration", "persisted"]) {
+        push_unique(
+            &mut effects,
+            "May affect persisted data or schema compatibility".to_string(),
+        );
+    }
+    if contains_any(&lower, &["cli", "flag", "argument", "command"]) {
+        push_unique(
+            &mut effects,
+            "May affect CLI surface or backward compatibility".to_string(),
+        );
+    }
+    if contains_any(&lower, &["cache", "index", "search", "retrieval"]) {
+        push_unique(
+            &mut effects,
+            "May affect cache/index correctness or retrieval freshness".to_string(),
+        );
+    }
+    if contains_any(
+        &lower,
+        &[
+            "dependency",
+            "upgrade",
+            "migrate",
+            "crate",
+            "package",
+            "sdk",
+        ],
+    ) {
+        push_unique(
+            &mut effects,
+            "May affect dependency/API compatibility".to_string(),
+        );
+    }
+    if contains_any(
+        &lower,
+        &["delete", "remove", "reset", "rm -rf", "destructive"],
+    ) {
+        push_unique(
+            &mut effects,
+            "May be destructive; require approval or checkpoint before execution".to_string(),
+        );
+    }
+
+    effects
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn push_unique(items: &mut Vec<String>, value: String) {
+    if !items.iter().any(|item| item == &value) {
+        items.push(value);
     }
 }
 
@@ -293,5 +383,25 @@ mod tests {
                 panic!("Expected NeedsClarification for abstract request");
             }
         }
+    }
+
+    #[test]
+    fn concretize_for_auto_infers_side_effects_from_request_surface() {
+        let concretizer = TaskConcretizer::new();
+        let contract = concretizer
+            .concretize_for_auto("Fix Mac shortcuts in the TUI REPL and session runtime");
+
+        assert!(
+            contract
+                .side_effects
+                .iter()
+                .any(|effect| { effect.contains("TUI input/keybinding compatibility") })
+        );
+        assert!(
+            contract
+                .side_effects
+                .iter()
+                .any(|effect| effect.contains("session/runtime state"))
+        );
     }
 }

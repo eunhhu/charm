@@ -46,9 +46,9 @@ TaskContract
 
 ## 현재 진행 요약
 
-- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, command cancel, read-range FileCache.
+- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, repeated-failure precedent gate, command cancel, read-range FileCache, TokenSaver-backed `/compact`.
 - **부분/Wired**: Context7/local package/registry/web reference provider, FastExecutor read-only batch path, trace linkage.
-- **남음**: 반복 실패 기반 external precedent search, side-effect scan, `/compact`의 TokenSaver 연결, replay/audit UI, persistent cache, full TUI parallel tool execution.
+- **남음**: 실제 GitHub issue/discussion precedent provider, side-effect scope guard 정밀화, replay/audit UI, persistent cache, full TUI parallel tool execution.
 
 ## 제품 레이어 로드맵
 
@@ -85,7 +85,8 @@ pub struct TaskContract {
   - Status: Wired. objective/scope/acceptance/verification/assumptions/open questions 기본 추출.
 - [x] ask / inspect / auto-assume / execute 결정
   - Status: Partially Wired. 현재 자동 세션은 conservative assumption + evidence collection 중심. 사용자 질의 interrupt 정책은 추가 필요.
-- [ ] side-effect scan 추가
+- [x] side-effect scan 추가
+  - Status: Wired. 요청 surface에서 TUI/keybinding, session/runtime, auth/provider, schema, CLI, cache/index, dependency/API, destructive risk를 contract에 기록.
 
 ### Phase 2: Reference-First Layer
 
@@ -99,7 +100,8 @@ pub struct TaskContract {
   - Status: Partially Wired. npm/PyPI/crates.io + web search fallback 존재. GitHub issue/discussion 전용 precedent search는 남음.
 - [x] `ReferencePack` 구조 도입
   - Status: Wired. `ReferenceBroker`가 provider 결과를 `ReferencePack`으로 컴파일하고 session prompt에 주입.
-- [ ] 두 번 이상 local debugging 실패 시 external precedent search 강제
+- [x] 두 번 이상 local debugging 실패 시 external precedent search 강제
+  - Status: Wired. 연속 command failure 2회 이후 `GitHubIssues` precedent pack과 trace event를 주입. 실제 provider 검색 연결은 후속 작업.
 
 ```rust
 pub struct ReferencePack {
@@ -336,7 +338,7 @@ pub struct HierarchicalMemory {
 7. FastContextWorker evidence format
 8. ~~AgentTraceStore raw/minified 분리~~
 9. ~~VerificationGate와 완료 선언 정책~~
-10. 컨텍스트 압축 개선(TokenSaver-backed `/compact`)
+10. ~~컨텍스트 압축 개선(TokenSaver-backed `/compact`)~~
 
 ### 중기 구현 (2-4주)
 11. 도구 스키마 캐싱과 병렬 tool execution 안정화

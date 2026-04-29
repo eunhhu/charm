@@ -312,9 +312,9 @@ rtk cargo test
 - **Delegate 모드**: 실험적 기능
 
 ### 개발 중인 기능
-- Reference-first 정책 고도화: 실패 반복 시 external precedent search 강제
-- TaskConcretizer side-effect scan과 더 정교한 ask/assume/execute 분기
-- TokenSaver-backed `/compact`와 code-span 보존 압축
+- Reference-first 정책 고도화: 실제 GitHub issue/discussion 검색 provider 연결
+- TaskConcretizer side-effect scan의 scope guard 정밀도 개선
+- TokenSaver-backed `/compact`의 replay/audit UI 연결
 - AgentTraceStore 기반 audit/replay UI
 - 컨텍스트 압축 최적화
 - 멀티모달 입력 지원
