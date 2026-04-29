@@ -8,7 +8,7 @@ use super::types::{
 };
 use super::workspace::{build_preflight, collect_lsp_snapshot, refresh_lsp_snapshot};
 use crate::agent::context_compressor::ContextCompressor;
-use crate::agent::parser::ToolParser;
+use crate::agent::parser::{ParsedToolCall, ToolParser};
 use crate::agent::prompt::PromptAssembler;
 use crate::agent::reference_broker::{
     FindingKind, PackageId, RawFinding, ReferenceBroker, ReferenceConfidence, ReferencePack,
@@ -30,7 +30,7 @@ use crate::providers::client::ProviderClient;
 use crate::providers::sse::{StreamChunk, accumulate_stream_to_response};
 use crate::providers::types::{ChatRequest, Message, ToolSchema, Usage};
 use crate::retrieval::worker::RetrievalWorker;
-use crate::tools::ToolRegistry;
+use crate::tools::{FastExecutor, ToolRegistry};
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -52,6 +52,36 @@ const MAX_RESOLVED_APPROVALS: usize = 20;
 /// Maximum completed/failed/cancelled background jobs retained. Running and
 /// queued jobs are never trimmed.
 const MAX_COMPLETED_JOBS: usize = 20;
+
+struct PreparedToolCall {
+    id: String,
+    call: ToolCall,
+    tool_name: String,
+    risk: RiskClass,
+    execution: ToolExecution,
+}
+
+impl PreparedToolCall {
+    fn from_parsed(parsed: ParsedToolCall) -> Self {
+        let tool_name = tool_name(&parsed.call).to_string();
+        Self {
+            id: parsed.id,
+            risk: tool_risk(&parsed.call),
+            execution: ToolExecution {
+                tool_name: tool_name.clone(),
+                summary: serde_json::to_string(&parsed.call).unwrap_or_else(|_| tool_name.clone()),
+                result_preview: None,
+            },
+            tool_name,
+            call: parsed.call,
+        }
+    }
+}
+
+enum ToolCallFlow {
+    Continue,
+    AwaitingApproval,
+}
 
 #[async_trait]
 pub trait RuntimeModel: Send + Sync {
@@ -634,6 +664,176 @@ impl SessionRuntime {
         result
     }
 
+    async fn process_prepared_tool_calls<F>(
+        &mut self,
+        prepared: Vec<PreparedToolCall>,
+        mut emit: F,
+    ) -> anyhow::Result<ToolCallFlow>
+    where
+        F: FnMut(RuntimeEvent),
+    {
+        if prepared.is_empty() {
+            return Ok(ToolCallFlow::Continue);
+        }
+
+        if self.can_parallelize_tool_batch(&prepared) {
+            for item in &prepared {
+                emit(RuntimeEvent::ToolCallStarted {
+                    execution: item.execution.clone(),
+                });
+            }
+
+            let results = self.execute_parallel_tool_batch(&prepared).await?;
+            for (item, result) in prepared.iter().zip(results.into_iter()) {
+                self.store_tool_result_message(
+                    &item.call,
+                    &item.tool_name,
+                    item.id.clone(),
+                    &result,
+                )
+                .await?;
+                emit(RuntimeEvent::ToolCallFinished {
+                    execution: item.execution.clone(),
+                    result,
+                });
+            }
+            return Ok(ToolCallFlow::Continue);
+        }
+
+        for item in prepared {
+            if let Some(result) = self.scope_guard_result(&item.call, &item.tool_name) {
+                emit(RuntimeEvent::ToolCallStarted {
+                    execution: item.execution.clone(),
+                });
+                self.store_tool_result_message(&item.call, &item.tool_name, item.id, &result)
+                    .await?;
+                emit(RuntimeEvent::ToolCallFinished {
+                    execution: item.execution,
+                    result,
+                });
+                continue;
+            }
+
+            if requires_tool_approval(self.autonomy, &item.call) {
+                let approval = ApprovalRequest {
+                    id: Uuid::new_v4().to_string(),
+                    tool_name: item.tool_name,
+                    summary: item.execution.summary.clone(),
+                    risk: item.risk,
+                    status: ApprovalStatus::Pending,
+                    created_at: Utc::now(),
+                    tool_arguments: Some(serialize_tool_call(&item.call)?),
+                    tool_call_id: Some(item.id),
+                };
+                self.snapshot.approvals.push(approval.clone());
+                self.refresh_counts();
+                emit(RuntimeEvent::ApprovalRequested { approval });
+                return Ok(ToolCallFlow::AwaitingApproval);
+            }
+
+            if let Some(warn) = self.yolo_bypass_event(&item.tool_name, &item.risk) {
+                emit(warn);
+            }
+
+            emit(RuntimeEvent::ToolCallStarted {
+                execution: item.execution.clone(),
+            });
+            let result = self
+                .execute_tool_with_gates(&item.call, &item.tool_name)
+                .await;
+            if let Some(event) = self.running_command_event(&result) {
+                emit(event);
+            }
+            self.store_tool_result_message(&item.call, &item.tool_name, item.id, &result)
+                .await?;
+            emit(RuntimeEvent::ToolCallFinished {
+                execution: item.execution,
+                result,
+            });
+        }
+
+        Ok(ToolCallFlow::Continue)
+    }
+
+    fn can_parallelize_tool_batch(&self, prepared: &[PreparedToolCall]) -> bool {
+        prepared.len() > 1
+            && prepared.iter().all(|item| {
+                tool_can_run_in_parallel_batch(&item.call)
+                    && matches!(item.risk, RiskClass::SafeRead)
+                    && !requires_tool_approval(self.autonomy, &item.call)
+                    && self
+                        .scope_guard_result(&item.call, &item.tool_name)
+                        .is_none()
+            })
+    }
+
+    async fn execute_parallel_tool_batch(
+        &mut self,
+        prepared: &[PreparedToolCall],
+    ) -> anyhow::Result<Vec<ToolResult>> {
+        self.trace_current_turn(
+            "parallel_tool_batch",
+            serde_json::json!({
+                "tool_count": prepared.len(),
+                "tools": prepared.iter().map(|item| item.tool_name.as_str()).collect::<Vec<_>>(),
+                "tool_call_ids": prepared.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            }),
+        )?;
+
+        let calls = prepared
+            .iter()
+            .map(|item| item.call.clone())
+            .collect::<Vec<_>>();
+        let mut results = FastExecutor::execute_batch(calls, &mut self.registry).await?;
+        results.resize_with(prepared.len(), || ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some("Tool execution failed: missing parallel batch result".to_string()),
+            metadata: None,
+        });
+        results.truncate(prepared.len());
+
+        for (item, result) in prepared.iter().zip(results.iter()) {
+            if tool_provides_repo_evidence(&item.call) && result.success {
+                self.turn_repo_evidence_seen = true;
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn running_command_event(&mut self, result: &ToolResult) -> Option<RuntimeEvent> {
+        if !result
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("running"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        let command_id = result
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("command_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("command")
+            .to_string();
+        let job = crate::runtime::types::BackgroundJob {
+            id: command_id.clone(),
+            title: format!("Command {}", command_id),
+            status: crate::runtime::types::BackgroundJobStatus::Running,
+            detail: result.output.clone(),
+            kind: crate::runtime::types::BackgroundJobKind::Command,
+            progress: None,
+            metadata: None,
+        };
+        self.snapshot.background_jobs.push(job.clone());
+        self.refresh_counts();
+        Some(RuntimeEvent::BackgroundJobUpdated { job })
+    }
+
     fn scope_guard_result(&self, call: &ToolCall, tool_name: &str) -> Option<ToolResult> {
         let contract = self.snapshot.current_task_contract.as_ref()?;
         let targets = tool_scope_targets(call);
@@ -1038,92 +1238,16 @@ impl SessionRuntime {
                 break;
             }
 
-            for parsed in parsed_calls {
-                let id = parsed.id;
-                let call = parsed.call;
-                let tool_name = tool_name(&call).to_string();
-                let risk = tool_risk(&call);
-                let execution = ToolExecution {
-                    tool_name: tool_name.clone(),
-                    summary: serde_json::to_string(&call).unwrap_or_else(|_| tool_name.clone()),
-                    result_preview: None,
-                };
-
-                if let Some(result) = self.scope_guard_result(&call, &tool_name) {
-                    events.push(RuntimeEvent::ToolCallStarted {
-                        execution: execution.clone(),
-                    });
-                    self.store_tool_result_message(&call, &tool_name, id, &result)
-                        .await?;
-                    events.push(RuntimeEvent::ToolCallFinished { execution, result });
-                    continue;
-                }
-
-                if requires_tool_approval(self.autonomy, &call) {
-                    let approval = ApprovalRequest {
-                        id: Uuid::new_v4().to_string(),
-                        tool_name,
-                        summary: execution.summary.clone(),
-                        risk,
-                        status: ApprovalStatus::Pending,
-                        created_at: Utc::now(),
-                        tool_arguments: Some(serialize_tool_call(&call)?),
-                        tool_call_id: Some(id),
-                    };
-                    self.snapshot.approvals.push(approval.clone());
-                    self.refresh_counts();
-                    events.push(RuntimeEvent::ApprovalRequested { approval });
-                    return Ok(events);
-                }
-
-                if let Some(warn) = self.yolo_bypass_event(&tool_name, &risk) {
-                    events.push(warn);
-                }
-
-                events.push(RuntimeEvent::ToolCallStarted {
-                    execution: execution.clone(),
-                });
-                let result = self.execute_tool_with_gates(&call, &tool_name).await;
-                self.record_tool_result(&call, &tool_name, &result).await?;
-
-                if result
-                    .metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get("running"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    let command_id = result
-                        .metadata
-                        .as_ref()
-                        .and_then(|meta| meta.get("command_id"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("command")
-                        .to_string();
-                    let job = crate::runtime::types::BackgroundJob {
-                        id: command_id.clone(),
-                        title: format!("Command {}", command_id),
-                        status: crate::runtime::types::BackgroundJobStatus::Running,
-                        detail: result.output.clone(),
-                        kind: crate::runtime::types::BackgroundJobKind::Command,
-                        progress: None,
-                        metadata: None,
-                    };
-                    self.snapshot.background_jobs.push(job.clone());
-                    self.refresh_counts();
-                    events.push(RuntimeEvent::BackgroundJobUpdated { job });
-                }
-
-                self.snapshot.messages.push(Message {
-                    role: "tool".to_string(),
-                    content: Some(serde_json::to_string(&result)?),
-                    tool_calls: None,
-                    tool_call_id: Some(id),
-                    reasoning: None,
-                    reasoning_details: None,
-                });
-                self.append_transcript("tool", transcript_preview(&tool_name, &result));
-                events.push(RuntimeEvent::ToolCallFinished { execution, result });
+            let prepared = parsed_calls
+                .into_iter()
+                .map(PreparedToolCall::from_parsed)
+                .collect::<Vec<_>>();
+            if matches!(
+                self.process_prepared_tool_calls(prepared, |event| events.push(event))
+                    .await?,
+                ToolCallFlow::AwaitingApproval
+            ) {
+                return Ok(events);
             }
         }
 
@@ -1281,92 +1405,18 @@ impl SessionRuntime {
                 break;
             }
 
-            for parsed in parsed_calls {
-                let id = parsed.id;
-                let call = parsed.call;
-                let tool_name = tool_name(&call).to_string();
-                let risk = tool_risk(&call);
-                let execution = ToolExecution {
-                    tool_name: tool_name.clone(),
-                    summary: serde_json::to_string(&call).unwrap_or_else(|_| tool_name.clone()),
-                    result_preview: None,
-                };
-
-                if let Some(result) = self.scope_guard_result(&call, &tool_name) {
-                    let _ = event_tx.send(RuntimeEvent::ToolCallStarted {
-                        execution: execution.clone(),
-                    });
-                    self.store_tool_result_message(&call, &tool_name, id, &result)
-                        .await?;
-                    let _ = event_tx.send(RuntimeEvent::ToolCallFinished { execution, result });
-                    continue;
-                }
-
-                if requires_tool_approval(self.autonomy, &call) {
-                    let approval = ApprovalRequest {
-                        id: Uuid::new_v4().to_string(),
-                        tool_name,
-                        summary: execution.summary.clone(),
-                        risk,
-                        status: ApprovalStatus::Pending,
-                        created_at: Utc::now(),
-                        tool_arguments: Some(serialize_tool_call(&call)?),
-                        tool_call_id: Some(id),
-                    };
-                    self.snapshot.approvals.push(approval.clone());
-                    self.refresh_counts();
-                    let _ = event_tx.send(RuntimeEvent::ApprovalRequested { approval });
-                    return Ok(());
-                }
-
-                if let Some(warn) = self.yolo_bypass_event(&tool_name, &risk) {
-                    let _ = event_tx.send(warn);
-                }
-
-                let _ = event_tx.send(RuntimeEvent::ToolCallStarted {
-                    execution: execution.clone(),
-                });
-                let result = self.execute_tool_with_gates(&call, &tool_name).await;
-                self.record_tool_result(&call, &tool_name, &result).await?;
-
-                if result
-                    .metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get("running"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    let command_id = result
-                        .metadata
-                        .as_ref()
-                        .and_then(|meta| meta.get("command_id"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("command")
-                        .to_string();
-                    let job = crate::runtime::types::BackgroundJob {
-                        id: command_id.clone(),
-                        title: format!("Command {}", command_id),
-                        status: crate::runtime::types::BackgroundJobStatus::Running,
-                        detail: result.output.clone(),
-                        kind: crate::runtime::types::BackgroundJobKind::Command,
-                        progress: None,
-                        metadata: None,
-                    };
-                    self.snapshot.background_jobs.push(job.clone());
-                    self.refresh_counts();
-                    let _ = event_tx.send(RuntimeEvent::BackgroundJobUpdated { job });
-                }
-
-                self.snapshot.messages.push(Message {
-                    role: "tool".to_string(),
-                    content: Some(serde_json::to_string(&result)?),
-                    tool_calls: None,
-                    tool_call_id: Some(id),
-                    reasoning: None,
-                    reasoning_details: None,
-                });
-                self.append_transcript("tool", transcript_preview(&tool_name, &result));
-                let _ = event_tx.send(RuntimeEvent::ToolCallFinished { execution, result });
+            let prepared = parsed_calls
+                .into_iter()
+                .map(PreparedToolCall::from_parsed)
+                .collect::<Vec<_>>();
+            if matches!(
+                self.process_prepared_tool_calls(prepared, |event| {
+                    let _ = event_tx.send(event);
+                })
+                .await?,
+                ToolCallFlow::AwaitingApproval
+            ) {
+                return Ok(());
             }
         }
 
@@ -1457,65 +1507,19 @@ impl SessionRuntime {
         }
 
         if !parsed_calls.is_empty() {
-            for parsed in parsed_calls {
-                let id = parsed.id;
-                let call = parsed.call;
-                let tool_name = tool_name(&call).to_string();
-                let risk = tool_risk(&call);
-                let execution = ToolExecution {
-                    tool_name: tool_name.clone(),
-                    summary: serde_json::to_string(&call).unwrap_or_else(|_| tool_name.clone()),
-                    result_preview: None,
-                };
-
-                if let Some(result) = self.scope_guard_result(&call, &tool_name) {
-                    let _ = event_tx.send(RuntimeEvent::ToolCallStarted {
-                        execution: execution.clone(),
-                    });
-                    self.store_tool_result_message(&call, &tool_name, id, &result)
-                        .await?;
-                    let _ = event_tx.send(RuntimeEvent::ToolCallFinished { execution, result });
-                    continue;
-                }
-
-                if requires_tool_approval(self.autonomy, &call) {
-                    let approval = ApprovalRequest {
-                        id: Uuid::new_v4().to_string(),
-                        tool_name,
-                        summary: execution.summary.clone(),
-                        risk,
-                        status: ApprovalStatus::Pending,
-                        created_at: Utc::now(),
-                        tool_arguments: Some(serialize_tool_call(&call)?),
-                        tool_call_id: Some(id),
-                    };
-                    self.snapshot.approvals.push(approval.clone());
-                    self.refresh_counts();
-                    let _ = event_tx.send(RuntimeEvent::ApprovalRequested { approval });
-                    let _ = event_tx.send(RuntimeEvent::StreamDone { model: None });
-                    return Ok(());
-                }
-
-                if let Some(warn) = self.yolo_bypass_event(&tool_name, &risk) {
-                    let _ = event_tx.send(warn);
-                }
-
-                let _ = event_tx.send(RuntimeEvent::ToolCallStarted {
-                    execution: execution.clone(),
-                });
-                let result = self.execute_tool_with_gates(&call, &tool_name).await;
-                self.record_tool_result(&call, &tool_name, &result).await?;
-
-                self.snapshot.messages.push(Message {
-                    role: "tool".to_string(),
-                    content: Some(serde_json::to_string(&result)?),
-                    tool_calls: None,
-                    tool_call_id: Some(id),
-                    reasoning: None,
-                    reasoning_details: None,
-                });
-                self.append_transcript("tool", transcript_preview(&tool_name, &result));
-                let _ = event_tx.send(RuntimeEvent::ToolCallFinished { execution, result });
+            let prepared = parsed_calls
+                .into_iter()
+                .map(PreparedToolCall::from_parsed)
+                .collect::<Vec<_>>();
+            if matches!(
+                self.process_prepared_tool_calls(prepared, |event| {
+                    let _ = event_tx.send(event);
+                })
+                .await?,
+                ToolCallFlow::AwaitingApproval
+            ) {
+                let _ = event_tx.send(RuntimeEvent::StreamDone { model: None });
+                return Ok(());
             }
         }
 
@@ -2984,6 +2988,19 @@ fn tool_provides_repo_evidence(call: &ToolCall) -> bool {
     )
 }
 
+fn tool_can_run_in_parallel_batch(call: &ToolCall) -> bool {
+    matches!(
+        call,
+        ToolCall::ReadRange { .. }
+            | ToolCall::ReadSymbol { .. }
+            | ToolCall::GrepSearch { .. }
+            | ToolCall::GlobSearch { .. }
+            | ToolCall::ListDir { .. }
+            | ToolCall::SemanticSearch { .. }
+            | ToolCall::ParallelSearch { .. }
+    )
+}
+
 fn evidence_queries_for_message(message: &str) -> Vec<String> {
     let mut queries = Vec::new();
     let trimmed = message.trim();
@@ -4249,6 +4266,106 @@ tokio = "1.44"
                     .iter()
                     .any(|caveat| caveat.contains("Answered discussion matched"))
         }));
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_calls_run_as_parallel_batch_with_ordered_results() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src").join("a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("src").join("b.rs"), "pub fn b() {}\n").unwrap();
+        let model = fake_model(vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some("Inspecting both files".to_string()),
+                tool_calls: Some(vec![
+                    ToolCallBlock {
+                        id: "call-a".to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "read_range".to_string(),
+                            arguments: serde_json::json!({
+                                "file_path": "src/a.rs",
+                                "offset": 0,
+                                "limit": 10
+                            })
+                            .to_string(),
+                        },
+                    },
+                    ToolCallBlock {
+                        id: "call-b".to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "read_range".to_string(),
+                            arguments: serde_json::json!({
+                                "file_path": "src/b.rs",
+                                "offset": 0,
+                                "limit": 10
+                            })
+                            .to_string(),
+                        },
+                    },
+                ]),
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Some("Done".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+            },
+        ]);
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+        let session_id = runtime.snapshot().metadata.session_id.clone();
+
+        let events = runtime.submit_input("Read both files").await.unwrap();
+
+        let tool_event_order = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::ToolCallStarted { .. } => Some("started"),
+                RuntimeEvent::ToolCallFinished { .. } => Some("finished"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_event_order,
+            vec!["started", "started", "finished", "finished"]
+        );
+        let tool_call_ids = runtime
+            .snapshot()
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(tool_call_ids, vec!["call-a", "call-b"]);
+
+        let trace_path = dir
+            .path()
+            .join(".charm")
+            .join("traces")
+            .join(format!("{session_id}.jsonl"));
+        let trace = std::fs::read_to_string(trace_path).expect("trace jsonl");
+        assert!(trace.contains("\"event\":\"parallel_tool_batch\""));
+        assert!(trace.contains("\"tool_count\":2"));
     }
 
     #[tokio::test]
@@ -5816,6 +5933,101 @@ tokio = "1.44"
                 |e| matches!(e, RuntimeEvent::MessageDelta { role, .. } if role == "assistant")
             )
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_fallback_read_only_tools_run_as_parallel_batch() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src").join("a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("src").join("b.rs"), "pub fn b() {}\n").unwrap();
+        let fallback = Message {
+            role: "assistant".to_string(),
+            content: Some("Inspecting both files".to_string()),
+            tool_calls: Some(vec![
+                ToolCallBlock {
+                    id: "call-stream-a".to_string(),
+                    r#type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read_range".to_string(),
+                        arguments: serde_json::json!({
+                            "file_path": "src/a.rs",
+                            "offset": 0,
+                            "limit": 10
+                        })
+                        .to_string(),
+                    },
+                },
+                ToolCallBlock {
+                    id: "call-stream-b".to_string(),
+                    r#type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read_range".to_string(),
+                        arguments: serde_json::json!({
+                            "file_path": "src/b.rs",
+                            "offset": 0,
+                            "limit": 10
+                        })
+                        .to_string(),
+                    },
+                },
+            ]),
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_details: None,
+        };
+
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: Some("Test fallback batch".to_string()),
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model_no_stream(fallback),
+        )
+        .await
+        .unwrap();
+        let session_id = runtime.snapshot().metadata.session_id.clone();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime
+            .submit_input_streaming("Read both files", tx)
+            .await
+            .unwrap();
+
+        let events: Vec<RuntimeEvent> = rx.try_iter().collect();
+        let tool_event_order = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::ToolCallStarted { .. } => Some("started"),
+                RuntimeEvent::ToolCallFinished { .. } => Some("finished"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_event_order,
+            vec!["started", "started", "finished", "finished"]
+        );
+        let tool_call_ids = runtime
+            .snapshot()
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(tool_call_ids, vec!["call-stream-a", "call-stream-b"]);
+
+        let trace_path = dir
+            .path()
+            .join(".charm")
+            .join("traces")
+            .join(format!("{session_id}.jsonl"));
+        let trace = std::fs::read_to_string(trace_path).expect("trace jsonl");
+        assert!(trace.contains("\"event\":\"parallel_tool_batch\""));
     }
 
     #[tokio::test]
