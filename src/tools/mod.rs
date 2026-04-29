@@ -36,7 +36,10 @@ impl ToolRegistry {
         Self {
             cwd: cwd.to_path_buf(),
             cache: ToolCache::new(50),
-            file_cache: fast_executor::FileCache::new(10),
+            file_cache: fast_executor::FileCache::with_persistence(
+                10,
+                cwd.join(".charm").join("cache").join("file-cache.json"),
+            ),
         }
     }
 
@@ -320,6 +323,30 @@ mod tests {
         assert_eq!(first.metadata.unwrap()["cache_hit"], false);
         assert_eq!(second.metadata.unwrap()["cache_hit"], true);
         assert!(second.output.contains("1: one"));
+    }
+
+    #[tokio::test]
+    async fn read_range_file_cache_persists_between_registries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.txt");
+        tokio::fs::write(&path, "one\ntwo\nthree\n").await.unwrap();
+        let args = serde_json::json!({
+            "file_path": "sample.txt",
+            "offset": 1,
+            "limit": 2
+        });
+
+        let mut first_registry = ToolRegistry::new(dir.path());
+        let first = first_registry
+            .execute("read_range", args.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.metadata.unwrap()["cache_hit"], false);
+
+        let mut second_registry = ToolRegistry::new(dir.path());
+        let second = second_registry.execute("read_range", args).await.unwrap();
+        assert_eq!(second.metadata.unwrap()["cache_hit"], true);
+        assert!(dir.path().join(".charm/cache/file-cache.json").exists());
     }
 
     /// Test that poll_command schema has correct parameters

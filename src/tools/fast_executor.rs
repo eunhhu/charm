@@ -1,6 +1,8 @@
 use crate::core::{ToolCall, ToolResult};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 
 /// Windsurf-style parallel tool executor
@@ -222,6 +224,20 @@ pub struct FileCache {
     cache: HashMap<String, CachedFile>,
     max_size: usize,
     current_size: usize,
+    persist_path: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedFileCache {
+    entries: HashMap<String, PersistedCachedFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedCachedFile {
+    content: String,
+    modified_unix_nanos: u128,
+    len: u64,
+    access_count: u32,
 }
 
 struct CachedFile {
@@ -237,12 +253,25 @@ pub struct CachedRead {
 }
 
 impl FileCache {
+    #[cfg(test)]
     pub fn new(max_mb: usize) -> Self {
         Self {
             cache: HashMap::new(),
             max_size: max_mb * 1024 * 1024,
             current_size: 0,
+            persist_path: None,
         }
+    }
+
+    pub fn with_persistence(max_mb: usize, persist_path: PathBuf) -> Self {
+        let mut cache = Self {
+            cache: HashMap::new(),
+            max_size: max_mb * 1024 * 1024,
+            current_size: 0,
+            persist_path: Some(persist_path),
+        };
+        cache.load_persisted();
+        cache
     }
 
     pub async fn read(&mut self, path: &Path) -> anyhow::Result<CachedRead> {
@@ -278,6 +307,7 @@ impl FileCache {
             );
             self.current_size += content.len();
             self.evict_if_needed();
+            self.persist();
         }
 
         Ok(CachedRead {
@@ -290,6 +320,7 @@ impl FileCache {
         let key = path.to_string_lossy().to_string();
         if let Some(file) = self.cache.remove(&key) {
             self.current_size = self.current_size.saturating_sub(file.content.len());
+            self.persist();
         }
     }
 
@@ -304,12 +335,82 @@ impl FileCache {
             {
                 if let Some(file) = self.cache.remove(&oldest) {
                     self.current_size -= file.content.len();
+                    self.persist();
                 }
             } else {
                 break;
             }
         }
     }
+
+    fn load_persisted(&mut self) {
+        let Some(path) = self.persist_path.as_ref() else {
+            return;
+        };
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(persisted) = serde_json::from_str::<PersistedFileCache>(&raw) else {
+            return;
+        };
+        for (key, file) in persisted.entries {
+            if file.content.len() > self.max_size {
+                continue;
+            }
+            self.current_size += file.content.len();
+            self.cache.insert(
+                key,
+                CachedFile {
+                    content: file.content,
+                    modified: system_time_from_unix_nanos(file.modified_unix_nanos),
+                    len: file.len,
+                    access_count: file.access_count,
+                },
+            );
+        }
+        self.evict_if_needed();
+    }
+
+    fn persist(&self) {
+        let Some(path) = self.persist_path.as_ref() else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let entries = self
+            .cache
+            .iter()
+            .map(|(key, file)| {
+                (
+                    key.clone(),
+                    PersistedCachedFile {
+                        content: file.content.clone(),
+                        modified_unix_nanos: unix_nanos(file.modified),
+                        len: file.len,
+                        access_count: file.access_count,
+                    },
+                )
+            })
+            .collect();
+        let payload = PersistedFileCache { entries };
+        if let Ok(raw) = serde_json::to_string(&payload) {
+            let _ = std::fs::write(path, raw);
+        }
+    }
+}
+
+fn unix_nanos(time: SystemTime) -> u128 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn system_time_from_unix_nanos(nanos: u128) -> SystemTime {
+    UNIX_EPOCH + Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
 }
 
 /// Streaming tool result - don't wait for completion
@@ -376,6 +477,27 @@ mod tests {
         cache.invalidate(&path);
         assert!(cache.cache.is_empty());
         assert_eq!(cache.current_size, 0);
+    }
+
+    #[tokio::test]
+    async fn file_cache_persists_unchanged_file_across_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.txt");
+        let cache_path = dir
+            .path()
+            .join(".charm")
+            .join("cache")
+            .join("file-cache.json");
+        tokio::fs::write(&path, "alpha\nbeta\n").await.unwrap();
+
+        let mut first_cache = FileCache::with_persistence(1, cache_path.clone());
+        let first = first_cache.read(&path).await.unwrap();
+        assert!(!first.cache_hit);
+
+        let mut second_cache = FileCache::with_persistence(1, cache_path);
+        let second = second_cache.read(&path).await.unwrap();
+        assert!(second.cache_hit);
+        assert_eq!(second.content, "alpha\nbeta\n");
     }
 
     #[test]

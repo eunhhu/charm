@@ -46,9 +46,9 @@ TaskContract
 
 ## 현재 진행 요약
 
-- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, repeated-failure precedent gate, GitHub issue/discussion precedent provider, source-aware write/command-target scope guard, command cancel, read-range FileCache, TokenSaver-backed `/compact`, slash audit/replay UI.
+- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, repeated-failure precedent gate, GitHub issue/discussion precedent provider, source-aware write/command-target scope guard, command cancel, persistent read-range FileCache, TokenSaver-backed `/compact`, slash audit/replay UI.
 - **부분/Wired**: Context7/local package/registry/web reference provider, FastExecutor read-only batch path, trace linkage, side-effect scope inference.
-- **남음**: persistent cache, full TUI parallel tool execution.
+- **남음**: full TUI parallel tool execution.
 
 ## 제품 레이어 로드맵
 
@@ -243,7 +243,7 @@ pub struct CachedToolSchemas {
 - [x] registry-local `FileCache`를 `read_range` 경로에 연결
 - [x] 파일 수정 시간 기반 stale 검사
 - [x] `write_file` 성공 시 해당 path cache invalidate
-- [ ] session 간 persistent file cache
+- [x] session 간 persistent file cache
 
 #### 2.2 임베딩 기반 시맨틱 검색
 - [ ] `fastembed-rs` 통합 (로컬 임베딩)
