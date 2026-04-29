@@ -25,7 +25,7 @@ use crate::harness::session::{
     SessionMetadata, SessionSelection, SessionSnapshot, SessionStatus, SessionStore,
     TranscriptEntry,
 };
-use crate::harness::trace::AgentTraceStore;
+use crate::harness::trace::{AgentTraceStore, TraceEntry};
 use crate::providers::client::ProviderClient;
 use crate::providers::sse::{StreamChunk, accumulate_stream_to_response};
 use crate::providers::types::{ChatRequest, Message, ToolSchema, Usage};
@@ -35,7 +35,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -1631,6 +1631,18 @@ impl SessionRuntime {
             ["/yolo"] => Ok(Some(self.set_autonomy(AutonomyLevel::Yolo, "slash"))),
             ["/safe"] => Ok(Some(self.set_autonomy(AutonomyLevel::Conservative, "slash"))),
             ["/compact"] => Ok(Some(self.compact_context())),
+            ["/audit"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
+                role: "assistant".to_string(),
+                content: self.render_audit_summary(50),
+            }])),
+            ["/audit", "replay"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
+                role: "assistant".to_string(),
+                content: self.render_audit_replay(20),
+            }])),
+            ["/audit", "replay", limit] => Ok(Some(vec![RuntimeEvent::MessageDelta {
+                role: "assistant".to_string(),
+                content: self.render_audit_replay(parse_audit_limit(limit, 20)),
+            }])),
             ["/clear"] => Ok(Some(self.clear_transcript())),
             ["/new"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
                 role: "assistant".to_string(),
@@ -1854,6 +1866,72 @@ impl SessionRuntime {
                 self.mcp.tools.join(", ")
             }
         )
+    }
+
+    fn render_audit_summary(&self, limit: usize) -> String {
+        let entries = match self.trace_store.read_recent(limit) {
+            Ok(entries) => entries,
+            Err(err) => return format!("Audit unavailable: {err}"),
+        };
+        if entries.is_empty() {
+            return "Audit: no trace entries for this session yet.".to_string();
+        }
+
+        let mut counts = BTreeMap::new();
+        let mut blocked = 0usize;
+        let mut failed_tools = 0usize;
+        let mut turn_ids = BTreeSet::new();
+        for entry in &entries {
+            *counts.entry(entry.event.clone()).or_insert(0usize) += 1;
+            if entry.event == "tool_policy_blocked" {
+                blocked += 1;
+            }
+            if entry.event == "tool_result"
+                && !entry
+                    .payload
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+            {
+                failed_tools += 1;
+            }
+            if let Some(turn_id) = entry.turn_id.as_deref() {
+                turn_ids.insert(turn_id.to_string());
+            }
+        }
+
+        let mut lines = vec![
+            format!(
+                "Audit: {} recent trace entries, {} turns",
+                entries.len(),
+                turn_ids.len()
+            ),
+            format!("Trace file: {}", self.trace_store.trace_path().display()),
+            format!("Policy blocks: {blocked}"),
+            format!("Failed tool results: {failed_tools}"),
+            "Events:".to_string(),
+        ];
+        for (event, count) in counts {
+            lines.push(format!("  {event}: {count}"));
+        }
+        lines.push("Use /audit replay [n] for timeline replay.".to_string());
+        lines.join("\n")
+    }
+
+    fn render_audit_replay(&self, limit: usize) -> String {
+        let entries = match self.trace_store.read_recent(limit) {
+            Ok(entries) => entries,
+            Err(err) => return format!("Trace Replay unavailable: {err}"),
+        };
+        if entries.is_empty() {
+            return "Trace Replay: no trace entries for this session yet.".to_string();
+        }
+
+        let mut lines = vec![format!("Trace Replay: last {} entries", entries.len())];
+        for entry in entries {
+            lines.push(format_trace_entry(&entry));
+        }
+        lines.join("\n")
     }
 
     fn append_transcript(&mut self, role: &str, content: String) {
@@ -2660,6 +2738,49 @@ fn parsed_completion_claim_without_verification(content: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+fn parse_audit_limit(raw: &str, default: usize) -> usize {
+    raw.parse::<usize>()
+        .ok()
+        .filter(|limit| *limit > 0)
+        .map(|limit| limit.min(100))
+        .unwrap_or(default)
+}
+
+fn format_trace_entry(entry: &TraceEntry) -> String {
+    let turn = entry
+        .turn_id
+        .as_deref()
+        .map(short_trace_id)
+        .unwrap_or("no-turn");
+    format!(
+        "  {} {} [{}] {}",
+        entry.timestamp.format("%H:%M:%S"),
+        entry.event,
+        turn,
+        summarize_trace_payload(&entry.payload)
+    )
+}
+
+fn short_trace_id(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
+
+fn summarize_trace_payload(payload: &Value) -> String {
+    if let Some(tool) = payload.get("tool_name").and_then(Value::as_str) {
+        if let Some(success) = payload.get("success").and_then(Value::as_bool) {
+            return format!("tool={tool} success={success}");
+        }
+        return format!("tool={tool}");
+    }
+    if let Some(reason) = payload.get("reason").and_then(Value::as_str) {
+        return format!("reason={}", truncate_for_prompt(reason, 120));
+    }
+    if let Some(command) = payload.get("command").and_then(Value::as_str) {
+        return format!("command={}", truncate_for_prompt(command, 120));
+    }
+    truncate_for_prompt(&serde_json::to_string(payload).unwrap_or_default(), 160)
+}
+
 fn source_kind_for_tool(call: &ToolCall) -> SourceKind {
     match call {
         ToolCall::RunCommand { command, .. } if command.contains("cargo test") => {
@@ -3015,6 +3136,8 @@ Slash commands
   /yolo                  Shortcut: /autonomy yolo (loud destructive trace)
   /safe                  Shortcut: /autonomy conservative
   /compact               Roll old turns into a TokenSaver-backed summary
+  /audit                 Show trace counts, policy blocks, and failures
+  /audit replay [n]      Replay recent trace events
   /clear                 Clear transcript (keep system prompt)
   /model <id>            Pin a model for this session
   /session [next|prev|<id>]  Rotate between sessions
@@ -3064,7 +3187,7 @@ Autonomy levels (see docs/charm-strategy.md § Autonomy Profiles)
 
 Coming soon
   • Auto model routing via `charm delegate` (Planner/Worker).
-  • Trace replay/audit UI and persistent evidence browser.
+  • Persistent evidence browser.
   • Sub-agent result PR/export workflow.
 "#
     .to_string()
@@ -4575,6 +4698,93 @@ tokio = "1.44"
             .unwrap_or_default();
         assert!(summary.contains("TokenSaver evidence"));
         assert!(summary.contains("12: let important_0 = value;"));
+    }
+
+    #[tokio::test]
+    async fn audit_command_renders_recent_trace_summary() {
+        let dir = tempdir().unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+        runtime
+            .trace(
+                Some("turn-audit"),
+                "tool_result",
+                serde_json::json!({
+                    "tool_name": "run_command",
+                    "success": true
+                }),
+            )
+            .unwrap();
+        runtime
+            .trace(
+                Some("turn-audit"),
+                "tool_policy_blocked",
+                serde_json::json!({
+                    "reason": "scope guard"
+                }),
+            )
+            .unwrap();
+
+        let events = runtime.submit_input("/audit").await.unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta { content, .. }
+                if content.contains("Audit") && content.contains("tool_result: 1") && content.contains("tool_policy_blocked: 1")
+        )));
+    }
+
+    #[tokio::test]
+    async fn audit_replay_command_renders_recent_trace_timeline() {
+        let dir = tempdir().unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+        runtime
+            .trace(
+                Some("turn-replay"),
+                "task_contract",
+                serde_json::json!({"objective": "audit"}),
+            )
+            .unwrap();
+        runtime
+            .trace(
+                Some("turn-replay"),
+                "verification_gap",
+                serde_json::json!({"claim": "done"}),
+            )
+            .unwrap();
+
+        let events = runtime.submit_input("/audit replay 2").await.unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta { content, .. }
+                if content.contains("Trace Replay") && content.contains("task_contract") && content.contains("verification_gap")
+        )));
     }
 
     #[tokio::test]

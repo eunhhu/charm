@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::BufRead;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -61,6 +62,24 @@ impl AgentTraceStore {
         writeln!(file, "{}", serde_json::to_string(&entry)?)?;
         Ok(())
     }
+
+    pub fn read_recent(&self, limit: usize) -> anyhow::Result<Vec<TraceEntry>> {
+        if limit == 0 || !self.trace_path().exists() {
+            return Ok(Vec::new());
+        }
+        let file = std::fs::File::open(self.trace_path())?;
+        let mut entries = Vec::new();
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry: TraceEntry = serde_json::from_str(&line)?;
+            entries.push(entry);
+        }
+        let start = entries.len().saturating_sub(limit);
+        Ok(entries.split_off(start))
+    }
 }
 
 #[cfg(test)]
@@ -85,5 +104,26 @@ mod tests {
         assert!(raw.contains("\"session_id\":\"session-1\""));
         assert!(raw.contains("\"turn_id\":\"turn-1\""));
         assert!(raw.contains("\"event\":\"task_contract\""));
+    }
+
+    #[test]
+    fn read_recent_returns_recent_trace_entries_in_chronological_order() {
+        let dir = tempdir().unwrap();
+        let store = AgentTraceStore::new(dir.path(), "session-1");
+
+        store
+            .append(None, "first", serde_json::json!({"idx": 1}))
+            .unwrap();
+        store
+            .append(None, "second", serde_json::json!({"idx": 2}))
+            .unwrap();
+        store
+            .append(None, "third", serde_json::json!({"idx": 3}))
+            .unwrap();
+
+        let entries = store.read_recent(2).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].event, "second");
+        assert_eq!(entries[1].event, "third");
     }
 }
