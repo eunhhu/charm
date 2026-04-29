@@ -1,5 +1,5 @@
 use crate::core::{ToolCall, ToolResult};
-use crate::tools::ToolRegistry;
+use crate::tools::{FastExecutor, ToolRegistry};
 
 pub struct AgentLoop {
     registry: ToolRegistry,
@@ -17,49 +17,37 @@ impl AgentLoop {
     }
 
     pub async fn run_tool_calls(&mut self, calls: Vec<ToolCall>) -> Vec<ToolResult> {
-        let mut results = Vec::new();
+        let remaining = self.remaining_budget();
+        if remaining == 0 {
+            return vec![ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Tool budget exhausted".to_string()),
+                metadata: None,
+            }];
+        }
 
-        for call in calls {
-            if self.tool_count >= self.tool_budget {
-                results.push(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some("Tool budget exhausted".to_string()),
-                    metadata: None,
-                });
-                break;
-            }
-            self.tool_count += 1;
+        let overflow = calls.len().saturating_sub(remaining);
+        let allowed: Vec<ToolCall> = calls.into_iter().take(remaining).collect();
+        self.tool_count += allowed.len();
 
-            let tool_name = match &call {
-                ToolCall::ReadRange { .. } => "read_range",
-                ToolCall::ReadSymbol { .. } => "read_symbol",
-                ToolCall::GrepSearch { .. } => "grep_search",
-                ToolCall::GlobSearch { .. } => "glob_search",
-                ToolCall::ListDir { .. } => "list_dir",
-                ToolCall::SemanticSearch { .. } => "semantic_search",
-                ToolCall::ParallelSearch { .. } => "parallel_search",
-                ToolCall::EditPatch { .. } => "edit_patch",
-                ToolCall::WriteFile { .. } => "write_file",
-                ToolCall::RunCommand { .. } => "run_command",
-                ToolCall::PollCommand { .. } => "poll_command",
-                ToolCall::PlanUpdate { .. } => "plan_update",
-                ToolCall::CheckpointCreate { .. } => "checkpoint_create",
-                ToolCall::CheckpointRestore { .. } => "checkpoint_restore",
-                ToolCall::MemoryStage { .. } => "memory_stage",
-                ToolCall::MemoryCommit { .. } => "memory_commit",
-            };
+        let mut results = match FastExecutor::execute_batch(allowed, &mut self.registry).await {
+            Ok(results) => results,
+            Err(e) => vec![ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e.to_string()),
+                metadata: None,
+            }],
+        };
 
-            let args = serde_json::to_value(&call).unwrap_or_default();
-            match self.registry.execute(tool_name, args).await {
-                Ok(result) => results.push(result),
-                Err(e) => results.push(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(e.to_string()),
-                    metadata: None,
-                }),
-            }
+        for _ in 0..overflow {
+            results.push(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Tool budget exhausted".to_string()),
+                metadata: None,
+            });
         }
 
         results

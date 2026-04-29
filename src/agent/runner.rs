@@ -203,6 +203,8 @@ impl AgentRunner {
                     ToolCall::EditPatch { .. } => "edit_patch",
                     ToolCall::WriteFile { .. } => "write_file",
                     ToolCall::RunCommand { .. } => "run_command",
+                    ToolCall::PollCommand { .. } => "poll_command",
+                    ToolCall::CancelCommand { .. } => "cancel_command",
                     ToolCall::CheckpointCreate { .. } => "checkpoint_create",
                     ToolCall::CheckpointRestore { .. } => "checkpoint_restore",
                     ToolCall::PlanUpdate { .. } => "plan_update",

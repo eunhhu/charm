@@ -2303,7 +2303,9 @@ fn source_kind_for_tool(call: &ToolCall) -> SourceKind {
         {
             SourceKind::CargoOutput
         }
-        ToolCall::RunCommand { .. } | ToolCall::PollCommand { .. } => SourceKind::CommandOutput,
+        ToolCall::RunCommand { .. }
+        | ToolCall::PollCommand { .. }
+        | ToolCall::CancelCommand { .. } => SourceKind::CommandOutput,
         ToolCall::GrepSearch { .. }
         | ToolCall::GlobSearch { .. }
         | ToolCall::ParallelSearch { .. } => SourceKind::SearchResults,
@@ -2794,6 +2796,7 @@ fn tool_name(call: &ToolCall) -> &'static str {
         ToolCall::WriteFile { .. } => "write_file",
         ToolCall::RunCommand { .. } => "run_command",
         ToolCall::PollCommand { .. } => "poll_command",
+        ToolCall::CancelCommand { .. } => "cancel_command",
         ToolCall::PlanUpdate { .. } => "plan_update",
         ToolCall::CheckpointCreate { .. } => "checkpoint_create",
         ToolCall::CheckpointRestore { .. } => "checkpoint_restore",
@@ -3758,6 +3761,102 @@ mod tests {
         let first_events = runtime.poll_background_events().unwrap();
         assert_eq!(first_events.len(), 1);
         assert_eq!(runtime.snapshot().background_jobs[0].id, "job-a");
+    }
+
+    #[tokio::test]
+    async fn runtime_soak_keeps_repl_state_across_streaming_approval_background_and_switch() {
+        let dir = tempdir().unwrap();
+        let dangerous = Message {
+            role: "assistant".to_string(),
+            content: Some("Need approval".to_string()),
+            tool_calls: Some(vec![ToolCallBlock {
+                id: "call-soak".to_string(),
+                r#type: "function".to_string(),
+                function: FunctionCall {
+                    name: "run_command".to_string(),
+                    arguments: serde_json::json!({
+                        "command": "rm -rf /tmp/charm-soak",
+                        "risk_class": "destructive"
+                    })
+                    .to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_details: None,
+        };
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(vec![dangerous]),
+        )
+        .await
+        .unwrap();
+        let first_session = runtime.snapshot().metadata.session_id.clone();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.submit_input_streaming("/help", tx).await.unwrap();
+        let streaming_events = rx.try_iter().collect::<Vec<_>>();
+        assert!(
+            streaming_events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::StreamDone { .. }))
+        );
+
+        let approval_events = runtime.submit_input("dangerous cleanup").await.unwrap();
+        let approval_id = approval_events
+            .iter()
+            .find_map(|event| match event {
+                RuntimeEvent::ApprovalRequested { approval } => Some(approval.id.clone()),
+                _ => None,
+            })
+            .expect("approval requested");
+        assert_eq!(runtime.snapshot().metadata.pending_approvals, 1);
+
+        let denial_events = runtime.resolve_approval(&approval_id, false).await.unwrap();
+        assert!(denial_events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ApprovalResolved { approval }
+                if approval.status == ApprovalStatus::Denied
+        )));
+        assert_eq!(runtime.snapshot().metadata.pending_approvals, 0);
+
+        runtime.subagent_bus.publish_for_session(
+            &first_session,
+            BackgroundJob {
+                id: "soak-job".to_string(),
+                title: "soak background".to_string(),
+                status: BackgroundJobStatus::Completed,
+                detail: "persisted from soak".to_string(),
+                kind: BackgroundJobKind::SubAgent,
+                progress: Some(100),
+                metadata: None,
+            },
+        );
+        let background_events = runtime.poll_background_events().unwrap();
+        assert!(background_events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::BackgroundJobUpdated { job } if job.id == "soak-job"
+        )));
+
+        runtime.set_model("custom/soak".to_string());
+        let mut unpinned = new_session_snapshot(dir.path(), Some("unpinned".to_string()));
+        unpinned.metadata.session_id = "soak-unpinned".to_string();
+        unpinned.metadata.pinned_model = None;
+        runtime.store.save_snapshot(&unpinned).unwrap();
+        runtime.switch_session_by_id("soak-unpinned").await.unwrap();
+
+        assert_eq!(runtime.model_display(), "demo-model");
+        assert!(runtime.snapshot().metadata.pinned_model.is_none());
+        assert!(runtime.snapshot().approvals.is_empty());
+        assert!(runtime.snapshot().background_jobs.is_empty());
     }
 
     #[tokio::test]

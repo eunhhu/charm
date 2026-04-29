@@ -72,6 +72,9 @@ pub enum ToolCall {
         #[serde(default)]
         max_lines: Option<usize>,
     },
+    CancelCommand {
+        command_id: String,
+    },
     PlanUpdate {
         #[serde(default)]
         objective: Option<String>,

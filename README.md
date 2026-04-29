@@ -284,6 +284,16 @@ User task
 
 ## 현재 상태
 
+### 최근 구현된 핵심 경로
+
+- **Task contract 기본 경로**: 세션 입력이 `TaskConcretizer`를 거쳐 목표, 수용 조건, 검증 조건을 가진 contract로 낮아집니다.
+- **Reference-first 경로**: `ReferenceBroker`가 Context7, local package source, registry, web fallback 순서로 `ReferencePack`을 준비합니다. outbound HTTP는 URL guard와 DNS pinning을 통과해야 합니다.
+- **Prompt compiler 경로**: `PromptAssembler`가 task contract, reference pack, verification gate, autonomy policy를 typed prompt section으로 렌더링합니다.
+- **Trace/minification 경로**: 도구 raw output은 trace에 남기고, 모델-facing view는 `TokenSaver`로 줄여 저장합니다.
+- **Runtime gates**: 파일 편집 전 repo evidence gate, completion claim 전 verification gate, 위험도 기반 approval gate가 세션 런타임에서 동작합니다.
+- **Command lifecycle**: non-blocking command는 `poll_command`로 조회하고 `cancel_command`로 취소할 수 있습니다.
+- **Read path cache**: `ToolRegistry`의 `read_range`는 registry-local `FileCache`를 사용해 반복 파일 읽기 비용을 줄입니다.
+
 ### 빌드 상태 확인
 ```bash
 # 컴파일 체크
@@ -297,16 +307,15 @@ rtk cargo test
 
 - **Rust 심볼 인덱싱**: 함수, 구조체, enum, impl 메서드 지원 (매크로, const/static, 고급 trait/generic 처리는 제한적)
 - **컴파일 워닝**: 다수의 unused variable/function 경고 존재
-- **Fast Executor**: 일부 코드 미연결 가능성
-- **캐시 시스템**: 부분적 구현 상태
+- **Fast Executor**: `AgentLoop`의 독립 read-only batch 경로에 연결됨. TUI 세션 경로는 approval/event ordering 때문에 아직 순차 실행 중심입니다.
+- **캐시 시스템**: `ToolCache`는 검색류 결과, `FileCache`는 registry-local 파일 읽기에 적용됩니다. cross-session persistent cache는 아직 없습니다.
 - **Delegate 모드**: 실험적 기능
 
 ### 개발 중인 기능
-- Context7/docs MCP 기반 reference-first 작업 흐름
-- TaskConcretizer와 abstraction scoring
-- TokenSaver 기반 tool log/context minification
-- PromptCompiler 기반 typed prompt section
-- AgentTraceStore 기반 audit/replay
+- Reference-first 정책 고도화: 실패 반복 시 external precedent search 강제
+- TaskConcretizer side-effect scan과 더 정교한 ask/assume/execute 분기
+- TokenSaver-backed `/compact`와 code-span 보존 압축
+- AgentTraceStore 기반 audit/replay UI
 - 컨텍스트 압축 최적화
 - 멀티모달 입력 지원
 - MCP 서버 통합 확장

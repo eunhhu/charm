@@ -5,7 +5,7 @@ use std::path::Path;
 mod browser;
 mod cache;
 mod command;
-mod fast_executor;
+pub(crate) mod fast_executor;
 mod file;
 mod github_cli;
 mod memory_tools;
@@ -18,15 +18,17 @@ mod semantic;
 mod test_runner;
 mod todo;
 mod trajectory;
-mod url_guard;
+pub(crate) mod url_guard;
 mod web;
 mod web_search;
 
 use cache::ToolCache;
+pub(crate) use fast_executor::FastExecutor;
 
 pub struct ToolRegistry {
     cwd: std::path::PathBuf,
     cache: ToolCache,
+    file_cache: fast_executor::FileCache,
 }
 
 impl ToolRegistry {
@@ -34,7 +36,12 @@ impl ToolRegistry {
         Self {
             cwd: cwd.to_path_buf(),
             cache: ToolCache::new(50),
+            file_cache: fast_executor::FileCache::new(10),
         }
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
     }
 
     pub fn list_tools(&self) -> Vec<&'static str> {
@@ -49,6 +56,7 @@ impl ToolRegistry {
             "parallel_search",
             "run_command",
             "poll_command",
+            "cancel_command",
             "fetch_url",
             "http_request",
             "browser_navigate",
@@ -100,15 +108,30 @@ impl ToolRegistry {
         self.execute_uncached(tool, args).await
     }
 
-    async fn execute_uncached(&self, tool: &str, args: Value) -> anyhow::Result<ToolResult> {
+    async fn execute_uncached(&mut self, tool: &str, args: Value) -> anyhow::Result<ToolResult> {
         let hint = args
             .get("command")
             .and_then(|v| v.as_str())
             .unwrap_or(tool)
             .to_string();
         let mut result = match tool {
-            "read_range" => file::read_range(args, &self.cwd).await,
-            "write_file" => file::write_file(args, &self.cwd).await,
+            "read_range" => {
+                file::read_range_with_cache(args, &self.cwd, &mut self.file_cache).await
+            }
+            "write_file" => {
+                let result = file::write_file(args, &self.cwd).await?;
+                if result.success {
+                    if let Some(path) = result
+                        .metadata
+                        .as_ref()
+                        .and_then(|meta| meta.get("resolved_path"))
+                        .and_then(|path| path.as_str())
+                    {
+                        self.file_cache.invalidate(Path::new(path));
+                    }
+                }
+                Ok(result)
+            }
             "grep_search" => search::grep_search(args, &self.cwd).await,
             "glob_search" => search::glob_search(args, &self.cwd).await,
             "list_dir" => search::list_dir(args, &self.cwd).await,
@@ -117,6 +140,7 @@ impl ToolRegistry {
             "parallel_search" => retrieval::parallel_search(args, &self.cwd).await,
             "run_command" => command::run_command(args, &self.cwd).await,
             "poll_command" => command::poll_command(args).await,
+            "cancel_command" => command::cancel_command(args).await,
             "fetch_url" => web::fetch_url(args).await,
             "http_request" => web::http_request(args).await,
             "browser_navigate" => browser::browser_navigate(args).await,
@@ -171,7 +195,7 @@ impl ToolRegistry {
         }?;
 
         match tool {
-            "run_command" | "poll_command" => {
+            "run_command" | "poll_command" | "cancel_command" => {
                 let filtered = rtk_filter::filter_with_rtk(&result.output, &hint).await;
                 if filtered.len() < result.output.len() {
                     result.output = filtered;
@@ -223,6 +247,7 @@ mod tests {
         "write_file",
         "run_command",
         "poll_command",
+        "cancel_command",
         "checkpoint_create",
         "checkpoint_restore",
         "plan_update",
@@ -274,6 +299,27 @@ mod tests {
         assert!(!result.success);
         assert!(result.error.is_some());
         assert!(result.error.unwrap().contains("Unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn read_range_uses_registry_file_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.txt");
+        tokio::fs::write(&path, "one\ntwo\nthree\n").await.unwrap();
+
+        let mut registry = ToolRegistry::new(dir.path());
+        let args = serde_json::json!({
+            "file_path": "sample.txt",
+            "offset": 1,
+            "limit": 2
+        });
+
+        let first = registry.execute("read_range", args.clone()).await.unwrap();
+        let second = registry.execute("read_range", args).await.unwrap();
+
+        assert_eq!(first.metadata.unwrap()["cache_hit"], false);
+        assert_eq!(second.metadata.unwrap()["cache_hit"], true);
+        assert!(second.output.contains("1: one"));
     }
 
     /// Test that poll_command schema has correct parameters

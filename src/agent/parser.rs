@@ -171,6 +171,9 @@ impl ToolParser {
                 output_priority: parse_output_priority(args["output_priority"].as_str()),
                 max_lines: args["max_lines"].as_u64().map(|v| v as usize),
             }),
+            "cancel_command" => Some(ToolCall::CancelCommand {
+                command_id: args["command_id"].as_str()?.to_string(),
+            }),
             _ => None,
         }
     }

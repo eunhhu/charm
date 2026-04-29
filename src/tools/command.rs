@@ -24,6 +24,8 @@ struct CommandEntry {
     stdout: String,
     stderr: String,
     timed_out: bool,
+    cancelled: bool,
+    process_id: Option<u32>,
     spawned_at: Instant,
 }
 
@@ -122,6 +124,8 @@ pub async fn run_command(args: Value, default_cwd: &std::path::Path) -> anyhow::
                 stdout: String::new(),
                 stderr: String::new(),
                 timed_out: false,
+                cancelled: false,
+                process_id: None,
                 spawned_at: Instant::now(),
             },
         );
@@ -134,7 +138,17 @@ pub async fn run_command(args: Value, default_cwd: &std::path::Path) -> anyhow::
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
     let child = cmd.spawn()?;
+    {
+        let mut store = COMMAND_STORE.lock().unwrap();
+        if let Some(entry) = store.get_mut(&command_id) {
+            entry.process_id = child.id();
+        }
+    }
 
     let cid = command_id.clone();
     let wall_timeout = tokio::time::Duration::from_millis(DEFAULT_NONBLOCKING_WALL_MS);
@@ -145,9 +159,16 @@ pub async fn run_command(args: Value, default_cwd: &std::path::Path) -> anyhow::
             entry.running = false;
             match result {
                 Ok(Ok(out)) => {
-                    entry.exit_code = out.status.code();
+                    entry.exit_code = out
+                        .status
+                        .code()
+                        .or(entry.exit_code)
+                        .or_else(|| if entry.cancelled { Some(130) } else { None });
                     entry.stdout = String::from_utf8_lossy(&out.stdout).to_string();
                     entry.stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    if entry.cancelled && entry.stderr.is_empty() {
+                        entry.stderr.push_str("[command cancelled]");
+                    }
                 }
                 Ok(Err(_)) => {
                     entry.stderr.push_str("\n[subprocess error]");
@@ -212,6 +233,7 @@ pub async fn poll_command(args: Value) -> anyhow::Result<ToolResult> {
             };
             let exit_code = entry.exit_code;
             let timed_out = entry.timed_out;
+            let cancelled = entry.cancelled;
             drop(store);
             COMMAND_STORE.lock().unwrap().remove(command_id);
             return Ok(ToolResult {
@@ -222,6 +244,7 @@ pub async fn poll_command(args: Value) -> anyhow::Result<ToolResult> {
                     "running": false,
                     "exit_code": exit_code,
                     "timed_out": timed_out,
+                    "cancelled": cancelled,
                     "evicted": true,
                 })),
             });
@@ -261,9 +284,87 @@ pub async fn poll_command(args: Value) -> anyhow::Result<ToolResult> {
         output,
         error: None,
         metadata: Some(
-            serde_json::json!({ "running": entry.running, "exit_code": entry.exit_code, "timed_out": entry.timed_out }),
+            serde_json::json!({ "running": entry.running, "exit_code": entry.exit_code, "timed_out": entry.timed_out, "cancelled": entry.cancelled }),
         ),
     })
+}
+
+pub async fn cancel_command(args: Value) -> anyhow::Result<ToolResult> {
+    let command_id = args["command_id"].as_str().unwrap_or("");
+    let process_id = {
+        let store = COMMAND_STORE.lock().unwrap();
+        let entry = store
+            .get(command_id)
+            .ok_or_else(|| anyhow::anyhow!("Command not found: {}", command_id))?;
+        if !entry.running {
+            return Ok(ToolResult {
+                success: true,
+                output: format!("Command already stopped: {}", command_id),
+                error: None,
+                metadata: Some(serde_json::json!({
+                    "command_id": command_id,
+                    "running": false,
+                    "exit_code": entry.exit_code,
+                    "timed_out": entry.timed_out,
+                    "cancelled": entry.cancelled,
+                })),
+            });
+        }
+        entry.process_id
+    };
+
+    let kill_result = process_id.map(terminate_process).unwrap_or(false);
+
+    let mut store = COMMAND_STORE.lock().unwrap();
+    let entry = store
+        .get_mut(command_id)
+        .ok_or_else(|| anyhow::anyhow!("Command not found: {}", command_id))?;
+    entry.running = false;
+    entry.cancelled = true;
+    if entry.exit_code.is_none() {
+        entry.exit_code = Some(130);
+    }
+    if entry.stderr.is_empty() {
+        entry.stderr.push_str("[command cancelled]");
+    }
+
+    Ok(ToolResult {
+        success: kill_result || process_id.is_none(),
+        output: format!("Command cancelled: {}", command_id),
+        error: if kill_result || process_id.is_none() {
+            None
+        } else {
+            Some("Failed to signal command process".to_string())
+        },
+        metadata: Some(serde_json::json!({
+            "command_id": command_id,
+            "running": false,
+            "exit_code": entry.exit_code,
+            "timed_out": entry.timed_out,
+            "cancelled": true,
+            "process_id": process_id,
+        })),
+    })
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32) -> bool {
+    let process_group = format!("-{}", pid);
+    signal_term(&process_group) || signal_term(&pid.to_string())
+}
+
+#[cfg(not(unix))]
+fn terminate_process(pid: u32) -> bool {
+    signal_term(&pid.to_string())
+}
+
+fn signal_term(target: &str) -> bool {
+    std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(target)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -460,6 +561,49 @@ mod tests {
         let poll_result = poll_command(poll_args).await.unwrap();
         let poll_meta = poll_result.metadata.unwrap();
         assert_eq!(poll_meta["timed_out"], false);
+    }
+
+    #[tokio::test]
+    async fn cancel_command_marks_nonblocking_command_cancelled() {
+        let args = serde_json::json!({
+            "command": "sleep 30",
+            "blocking": false
+        });
+        let cwd = std::env::current_dir().unwrap();
+
+        let result = run_command(args, &cwd).await.unwrap();
+        let command_id = result.metadata.unwrap()["command_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let cancel_result = cancel_command(serde_json::json!({
+            "command_id": command_id
+        }))
+        .await
+        .unwrap();
+        assert!(cancel_result.success);
+        assert!(cancel_result.output.contains("cancelled"));
+
+        let poll_result = poll_command(serde_json::json!({
+            "command_id": command_id
+        }))
+        .await
+        .unwrap();
+        let poll_meta = poll_result.metadata.unwrap();
+        assert_eq!(poll_meta["running"], false);
+        assert_eq!(poll_meta["cancelled"], true);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let settled = poll_command(serde_json::json!({
+            "command_id": command_id
+        }))
+        .await
+        .unwrap();
+        let settled_meta = settled.metadata.unwrap();
+        assert_eq!(settled_meta["running"], false);
+        assert_eq!(settled_meta["cancelled"], true);
+        assert_eq!(settled_meta["exit_code"].as_i64(), Some(130));
     }
 
     #[tokio::test]

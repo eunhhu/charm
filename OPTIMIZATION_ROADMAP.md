@@ -44,16 +44,22 @@ TaskContract
 - **Wired**: 일반 사용자 세션에서 자동 적용됨.
 - **Enforced**: 모델이 생략하려 해도 gate가 막음.
 
+## 현재 진행 요약
+
+- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, command cancel, read-range FileCache.
+- **부분/Wired**: Context7/local package/registry/web reference provider, FastExecutor read-only batch path, trace linkage.
+- **남음**: 반복 실패 기반 external precedent search, side-effect scan, `/compact`의 TokenSaver 연결, replay/audit UI, persistent cache, full TUI parallel tool execution.
+
 ## 제품 레이어 로드맵
 
 ### Phase 0: 하네스 철학 정착
 
 - [x] Evidence-first / Reference-first / Tool-first 원칙 문서화
 - [x] Devin/Windsurf harness research 문서화
-- [ ] 현재 `PromptAssembler`와 runtime prompt에 철학 반영
-  - Status: Designed. 현재 프롬프트에는 아직 tool-first와 충돌할 수 있는 표현이 남아 있음.
-- [ ] tool skip 기준과 reference-required 기준을 정책으로 분리
-  - Status: Designed. `AutonomyLevel`은 승인 정책을 다루지만 evidence requirement gate와는 별도여야 함.
+- [x] 현재 `PromptAssembler`와 runtime prompt에 철학 반영
+  - Status: Wired. task contract, repo evidence, reference pack, verification gate가 session system prompt에 들어감.
+- [x] tool skip 기준과 reference-required 기준을 정책으로 분리
+  - Status: Enforced for repo evidence/edit, reference-required prompt packs, verification claim, approval risk. 더 정교한 skip classifier는 남음.
 
 ### Phase 1: Task Concretization Layer
 
@@ -73,22 +79,26 @@ pub struct TaskContract {
 }
 ```
 
-- [ ] abstraction score 계산
-  - Status: Scaffolded. `TaskConcretizer`에 초기 score 함수가 있음.
-- [ ] missing contract fields 추출
-- [ ] ask / inspect / auto-assume / execute 결정
-  - Status: Scaffolded. 초기 action 분기는 있으나 repo evidence 기반 보강 전.
+- [x] abstraction score 계산
+  - Status: Wired. `TaskConcretizer::concretize_for_auto`가 세션 턴 준비 경로에서 호출됨.
+- [x] missing contract fields 추출
+  - Status: Wired. objective/scope/acceptance/verification/assumptions/open questions 기본 추출.
+- [x] ask / inspect / auto-assume / execute 결정
+  - Status: Partially Wired. 현재 자동 세션은 conservative assumption + evidence collection 중심. 사용자 질의 interrupt 정책은 추가 필요.
 - [ ] side-effect scan 추가
 
 ### Phase 2: Reference-First Layer
 
 목표: 모델 pretraining이 아니라 최신 레퍼런스와 실제 예제를 우선한다.
 
-- [ ] Context7 MCP 연결을 first-class reference provider로 지원
-- [ ] local package source/type definitions 조회
-- [ ] GitHub issue/discussion/web search fallback 정책
-- [ ] `ReferencePack` 구조 도입
-  - Status: Scaffolded. 구조체와 compile 함수는 있으나 provider fetch는 아직 skeleton.
+- [x] Context7 MCP 연결을 first-class reference provider로 지원
+  - Status: Wired. Context7 endpoint 사용 시 HTTPS + URL/DNS guard를 통과한 POST만 허용.
+- [x] local package source/type definitions 조회
+  - Status: Wired. vendored/local package source roots 우선 조회.
+- [x] registry/web search fallback 정책
+  - Status: Partially Wired. npm/PyPI/crates.io + web search fallback 존재. GitHub issue/discussion 전용 precedent search는 남음.
+- [x] `ReferencePack` 구조 도입
+  - Status: Wired. `ReferenceBroker`가 provider 결과를 `ReferencePack`으로 컴파일하고 session prompt에 주입.
 - [ ] 두 번 이상 local debugging 실패 시 external precedent search 강제
 
 ```rust
@@ -110,17 +120,18 @@ pub struct ReferencePack {
 
 목표: 10 수준의 내부 조사와 3-6 수준의 prompt footprint를 동시에 달성한다.
 
-- [ ] raw output store와 minified prompt view 분리
-- [ ] command/test/rustc/cargo output minifier
-  - Status: Scaffolded. 초기 minifier는 있으나 tool runtime 전체에 아직 연결되지 않음.
-- [ ] grep/search result dedupe and ranking
-  - Status: Scaffolded. 파일 단위 dedupe 시작점 있음. relevance ranking 필요.
-- [ ] docs/reference snippet distiller
-  - Status: Scaffolded. code block 추출 중심. 공식 규칙/caveat 추출 강화 필요.
-- [ ] code span minifier with line number preservation
-  - Status: Scaffolded. line number 보존 시작점 있음. 실제 file span provenance 필요.
-- [ ] prompt section budget enforcement
-  - Status: Scaffolded in `PromptCompiler`, not wired into `PromptAssembler`.
+- [x] raw output store와 minified prompt view 분리
+  - Status: Wired. `SessionRuntime::record_tool_result`가 raw output과 minified output을 함께 trace.
+- [x] command/test/rustc/cargo output minifier
+  - Status: Wired for command/cargo/test source kinds. coverage 확대 필요.
+- [x] grep/search result dedupe and ranking
+  - Status: Partially Wired. repo evidence 수집에서 rank sort와 path/line dedupe 적용.
+- [x] docs/reference snippet distiller
+  - Status: Partially Wired. ReferencePack compile 단계에서 rules/examples/caveats/source refs 추출.
+- [x] code span minifier with line number preservation
+  - Status: Partially Wired. line/span 중심 minification 존재. provenance 정밀도 개선 필요.
+- [x] prompt section budget enforcement
+  - Status: Wired. `PromptCompiler`가 section budget과 전체 budget을 적용.
 
 ```rust
 pub struct MinifyRequest {
@@ -144,13 +155,14 @@ pub struct MinifiedView {
 
 목표: prompt를 문자열 조립이 아니라 typed artifact로 만든다.
 
-- [ ] `PromptSection` 도입
-  - Status: Scaffolded. section type, activation, budget, provenance 모델 존재.
-- [ ] priority, activation, token budget, provenance 관리
-  - Status: Scaffolded. 실제 session prompt 생성 경로 연결 필요.
-- [ ] provider-specific rendering
+- [x] `PromptSection` 도입
+  - Status: Wired.
+- [x] priority, activation, token budget, provenance 관리
+  - Status: Wired in session system prompt.
+- [x] provider-specific rendering
   - Status: Scaffolded. provider hint 기반 rendering 시작점 있음.
-- [ ] section snapshot tests
+- [x] section snapshot tests
+  - Status: Basic tests present. provider별 golden snapshot 확대 필요.
 
 ```rust
 pub struct PromptSection {
@@ -167,8 +179,9 @@ pub struct PromptSection {
 
 목표: 모든 판단과 편집을 설명 가능하게 만든다.
 
-- [ ] `.charm/traces` raw event store
-- [ ] evidence -> tool call -> edit -> verification linkage
+- [x] `.charm/traces` raw event store
+- [x] evidence -> tool call -> edit -> verification linkage
+  - Status: Partially Wired. turn_id 기반 trace와 verification update 존재. edit diff 단위 linkage 강화 필요.
 - [ ] command output hash and full log ref
 - [ ] repeated failure / missed context / missing reference 분석
 - [ ] candidate rules, workflows, memories 제안
@@ -222,6 +235,12 @@ pub struct CachedToolSchemas {
 }
 ```
 
+#### 2.1b 파일 읽기 캐싱
+- [x] registry-local `FileCache`를 `read_range` 경로에 연결
+- [x] 파일 수정 시간 기반 stale 검사
+- [x] `write_file` 성공 시 해당 path cache invalidate
+- [ ] session 간 persistent file cache
+
 #### 2.2 임베딩 기반 시맨틱 검색
 - [ ] `fastembed-rs` 통합 (로컬 임베딩)
 - [ ] FAISS 인덱스 빌드
@@ -257,6 +276,11 @@ let futures = tool_calls.iter().map(|call| {
 });
 let results = join_all(futures).await;
 ```
+
+- [x] `FastExecutor`를 `AgentLoop` read-only batch 경로에 연결
+- [x] mutating/shell tools는 ordered tail로 분리
+- [ ] TUI `SessionRuntime` 병렬 실행 연결
+  - Note: approval, trace event order, tool_call_id alignment 보존 설계가 먼저 필요.
 
 ### Phase D: RTK (Retrieval Toolkit) 고도화
 
@@ -301,17 +325,17 @@ pub struct HierarchicalMemory {
 ## 구현 우선순위
 
 ### 즉시 구현 (High Impact, Low Effort)
-1. `PromptAssembler`의 tool policy를 strategy와 맞춤
-2. `TaskConcretizer`를 세션 입력 경로에 연결
-3. `TokenSaver`를 command/search/test tool result 경로에 연결
-4. `PromptCompiler`를 session system prompt 생성 경로에 연결
-5. tool skip/reference/verification gate를 runtime policy로 분리
+1. ~~`PromptAssembler`의 tool policy를 strategy와 맞춤~~
+2. ~~`TaskConcretizer`를 세션 입력 경로에 연결~~
+3. ~~`TokenSaver`를 command/search/test tool result 경로에 연결~~
+4. ~~`PromptCompiler`를 session system prompt 생성 경로에 연결~~
+5. ~~tool skip/reference/verification gate를 runtime policy로 분리~~
 
 ### 단기 구현 (1-2주)
-6. ReferencePack provider fetch 구현(Context7/local package source 우선)
+6. ~~ReferencePack provider fetch 구현(Context7/local package source 우선)~~
 7. FastContextWorker evidence format
-8. AgentTraceStore raw/minified 분리
-9. VerificationGate와 완료 선언 정책
+8. ~~AgentTraceStore raw/minified 분리~~
+9. ~~VerificationGate와 완료 선언 정책~~
 10. 컨텍스트 압축 개선(TokenSaver-backed `/compact`)
 
 ### 중기 구현 (2-4주)

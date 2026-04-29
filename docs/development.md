@@ -72,7 +72,13 @@ src/
 3. raw output과 model-facing summary가 분리되어 있는가?
 4. 완료 선언을 뒷받침할 검증 경로가 있는가?
 
-현재 가장 중요한 방향은 `TaskConcretizer`, `ReferenceBroker`, `TokenSaver`, `PromptCompiler`를 세션 런타임의 필수 경로에 연결하는 것입니다.
+현재 가장 중요한 방향은 이미 세션 런타임에 연결된 `TaskConcretizer`, `ReferenceBroker`, `TokenSaver`, `PromptCompiler`를 더 엄격한 gate와 더 좋은 UX로 다듬는 것입니다. 새 추상화를 늘리기보다 다음을 우선합니다.
+
+- 반복 실패 감지 후 external precedent search 강제
+- side-effect scan과 scope guard 고도화
+- TokenSaver-backed `/compact`
+- trace replay/audit UI
+- TUI 세션의 병렬 도구 실행 안전 연결
 
 ## 의존성
 
@@ -119,7 +125,7 @@ RUST_LOG=debug charm ...
 - 제한사항: 매크로, const/static, 고급 trait/generic 처리
 
 ### Fast Executor
-`tools/fast_executor.rs`의 일부 기능이 미연결 상태일 수 있습니다.
+`tools/fast_executor.rs`는 `AgentLoop`의 read-only batch 경로에 연결되어 있습니다. TUI `SessionRuntime`은 approval, trace event order, tool_call_id alignment를 보존해야 하므로 아직 순차 실행 중심입니다.
 
 ## 기여 가이드라인
 

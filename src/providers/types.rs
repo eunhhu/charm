@@ -243,6 +243,17 @@ pub fn default_tool_schemas() -> Vec<ToolSchema> {
             }),
         ),
         tool(
+            "cancel_command",
+            "Cancel a previously started non-blocking command",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command_id": { "type": "string" }
+                },
+                "required": ["command_id"]
+            }),
+        ),
+        tool(
             "checkpoint_create",
             "Create a git checkpoint before risky operations",
             serde_json::json!({

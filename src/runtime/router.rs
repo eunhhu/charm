@@ -96,6 +96,7 @@ pub fn tool_risk(call: &ToolCall) -> RiskClass {
         | ToolCall::SemanticSearch { .. }
         | ToolCall::ParallelSearch { .. }
         | ToolCall::PollCommand { .. } => RiskClass::SafeRead,
+        ToolCall::CancelCommand { .. } => RiskClass::SafeExec,
         ToolCall::RunCommand { risk_class, .. } => risk_class.clone(),
         ToolCall::EditPatch { .. }
         | ToolCall::WriteFile { .. }

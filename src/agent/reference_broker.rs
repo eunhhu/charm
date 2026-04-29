@@ -6,6 +6,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::tools::url_guard;
+
 type HttpGetFuture = Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>;
 type HttpGet = Arc<dyn Fn(String) -> HttpGetFuture + Send + Sync>;
 type HttpPostFuture = Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>;
@@ -444,6 +446,7 @@ impl ReferenceBroker {
         package: &PackageId,
         endpoint: &str,
     ) -> anyhow::Result<ReferencePack> {
+        validate_context7_endpoint(endpoint)?;
         let resolve_payload = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -682,9 +685,14 @@ impl ReferenceBroker {
 fn default_http_get() -> HttpGet {
     Arc::new(|url| {
         Box::pin(async move {
-            let client = reqwest::Client::builder()
-                .user_agent("charm-reference-broker/0.1")
-                .timeout(Duration::from_secs(12))
+            let validated_url = url_guard::validate_url(&url)?;
+            let client = validated_url
+                .pin_dns(
+                    reqwest::Client::builder()
+                        .user_agent("charm-reference-broker/0.1")
+                        .timeout(Duration::from_secs(12))
+                        .redirect(reqwest::redirect::Policy::none()),
+                )
                 .build()?;
             let response = client.get(&url).send().await?;
             let status = response.status();
@@ -699,9 +707,14 @@ fn default_http_get() -> HttpGet {
 fn default_http_post() -> HttpPost {
     Arc::new(|url, body| {
         Box::pin(async move {
-            let client = reqwest::Client::builder()
-                .user_agent("charm-reference-broker/0.1")
-                .timeout(Duration::from_secs(12))
+            let validated_url = url_guard::validate_url(&url)?;
+            let client = validated_url
+                .pin_dns(
+                    reqwest::Client::builder()
+                        .user_agent("charm-reference-broker/0.1")
+                        .timeout(Duration::from_secs(12))
+                        .redirect(reqwest::redirect::Policy::none()),
+                )
                 .build()?;
             let mut request = client
                 .post(&url)
@@ -842,6 +855,16 @@ fn pypi_package_page(name: &str, version: Option<&str>) -> String {
         Some(version) => format!("https://pypi.org/project/{name}/{version}/"),
         None => format!("https://pypi.org/project/{name}/"),
     }
+}
+
+fn validate_context7_endpoint(endpoint: &str) -> anyhow::Result<()> {
+    let parsed = reqwest::Url::parse(endpoint)
+        .map_err(|err| anyhow::anyhow!("Invalid Context7 endpoint: {err}"))?;
+    if parsed.scheme() != "https" {
+        anyhow::bail!("Context7 endpoint must use https");
+    }
+    url_guard::validate_url(endpoint)?;
+    Ok(())
 }
 
 fn extract_mcp_text(body: &str) -> anyhow::Result<String> {
@@ -1322,6 +1345,40 @@ pandas
         assert_eq!(calls.len(), 2);
         assert!(calls[0].1.contains("resolve-library-id"));
         assert!(calls[1].1.contains("get-library-docs"));
+    }
+
+    #[tokio::test]
+    async fn test_default_reference_http_blocks_localhost_get_and_post() {
+        let get_err = default_http_get()("http://127.0.0.1:9/private".to_string())
+            .await
+            .unwrap_err();
+        assert!(get_err.to_string().contains("Blocked"));
+
+        let post_err = default_http_post()("http://localhost:9/mcp".to_string(), "{}".to_string())
+            .await
+            .unwrap_err();
+        assert!(post_err.to_string().contains("Blocked"));
+    }
+
+    #[tokio::test]
+    async fn test_context7_endpoint_requires_https_before_transport() {
+        let broker = ReferenceBroker::new().with_http_post(|_, _| async {
+            panic!("transport must not be called for an insecure endpoint")
+        });
+
+        let err = broker
+            .fetch_from_context7(
+                &PackageId {
+                    name: "serde".to_string(),
+                    version: None,
+                    registry: Some("crates.io".to_string()),
+                },
+                "http://context7.example/mcp",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("https"));
     }
 
     #[test]
