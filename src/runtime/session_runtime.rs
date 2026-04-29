@@ -712,6 +712,26 @@ impl SessionRuntime {
         Ok(path_to_slash(relative))
     }
 
+    async fn store_tool_result_message(
+        &mut self,
+        call: &ToolCall,
+        tool_name: &str,
+        tool_call_id: String,
+        result: &ToolResult,
+    ) -> anyhow::Result<()> {
+        self.record_tool_result(call, tool_name, result).await?;
+        self.snapshot.messages.push(Message {
+            role: "tool".to_string(),
+            content: Some(serde_json::to_string(result)?),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id),
+            reasoning: None,
+            reasoning_details: None,
+        });
+        self.append_transcript("tool", transcript_preview(tool_name, result));
+        Ok(())
+    }
+
     fn observe_verification(&mut self, call: &ToolCall, result: &ToolResult) {
         let Some(command) = verification_command(call, result) else {
             return;
@@ -1010,6 +1030,16 @@ impl SessionRuntime {
                     result_preview: None,
                 };
 
+                if let Some(result) = self.scope_guard_result(&call, &tool_name) {
+                    events.push(RuntimeEvent::ToolCallStarted {
+                        execution: execution.clone(),
+                    });
+                    self.store_tool_result_message(&call, &tool_name, id, &result)
+                        .await?;
+                    events.push(RuntimeEvent::ToolCallFinished { execution, result });
+                    continue;
+                }
+
                 if requires_tool_approval(self.autonomy, &call) {
                     let approval = ApprovalRequest {
                         id: Uuid::new_v4().to_string(),
@@ -1243,6 +1273,16 @@ impl SessionRuntime {
                     result_preview: None,
                 };
 
+                if let Some(result) = self.scope_guard_result(&call, &tool_name) {
+                    let _ = event_tx.send(RuntimeEvent::ToolCallStarted {
+                        execution: execution.clone(),
+                    });
+                    self.store_tool_result_message(&call, &tool_name, id, &result)
+                        .await?;
+                    let _ = event_tx.send(RuntimeEvent::ToolCallFinished { execution, result });
+                    continue;
+                }
+
                 if requires_tool_approval(self.autonomy, &call) {
                     let approval = ApprovalRequest {
                         id: Uuid::new_v4().to_string(),
@@ -1408,6 +1448,16 @@ impl SessionRuntime {
                     summary: serde_json::to_string(&call).unwrap_or_else(|_| tool_name.clone()),
                     result_preview: None,
                 };
+
+                if let Some(result) = self.scope_guard_result(&call, &tool_name) {
+                    let _ = event_tx.send(RuntimeEvent::ToolCallStarted {
+                        execution: execution.clone(),
+                    });
+                    self.store_tool_result_message(&call, &tool_name, id, &result)
+                        .await?;
+                    let _ = event_tx.send(RuntimeEvent::ToolCallFinished { execution, result });
+                    continue;
+                }
 
                 if requires_tool_approval(self.autonomy, &call) {
                     let approval = ApprovalRequest {
@@ -4431,6 +4481,80 @@ tokio = "1.44"
                 .any(|event| matches!(event, RuntimeEvent::ApprovalRequested { .. }))
         );
         assert_eq!(runtime.snapshot().metadata.pending_approvals, 1);
+    }
+
+    #[tokio::test]
+    async fn out_of_scope_write_is_blocked_before_approval_queue() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/tui")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/core")).unwrap();
+        std::fs::write(dir.path().join("src/tui/app.rs"), "fn tui() {}\n").unwrap();
+        let model = fake_model(vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some("Attempting edit".to_string()),
+                tool_calls: Some(vec![ToolCallBlock {
+                    id: "call-scope".to_string(),
+                    r#type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "write_file".to_string(),
+                        arguments: serde_json::json!({
+                            "file_path": "src/core/mod.rs",
+                            "content": "pub fn outside() {}\n"
+                        })
+                        .to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Some("Stopped after scope guard".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+            },
+        ]);
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+        runtime.set_autonomy(AutonomyLevel::Balanced, "test");
+
+        let events = runtime
+            .submit_input("Fix Mac shortcuts in the TUI")
+            .await
+            .unwrap();
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::ApprovalRequested { .. }))
+        );
+        assert_eq!(runtime.snapshot().metadata.pending_approvals, 0);
+        assert!(!dir.path().join("src/core/mod.rs").exists());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallFinished { result, .. }
+                if result.metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("blocked_by"))
+                    .and_then(Value::as_str)
+                    == Some("scope_guard")
+        )));
     }
 
     #[tokio::test]
