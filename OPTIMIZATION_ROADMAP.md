@@ -46,9 +46,9 @@ TaskContract
 
 ## 현재 진행 요약
 
-- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, repeated-failure precedent gate, GitHub issue/discussion precedent provider, source-aware write/command-target scope guard, command cancel, persistent read-range FileCache, TokenSaver-backed `/compact`, slash audit/replay UI, TUI read-only parallel tool execution, mixed tool-call read-prefix scheduling.
+- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, repeated-failure precedent gate, GitHub issue/discussion precedent provider, source-aware write/command-target scope guard, command cancel, persistent read-range FileCache, TokenSaver-backed `/compact`, slash audit/replay UI, `/evidence` persistent evidence browser, TUI read-only parallel tool execution, mixed tool-call read-prefix scheduling.
 - **부분/Wired**: Context7/local package/registry/web reference provider, trace linkage, side-effect scope inference.
-- **남음**: mutating tool scheduling 고도화, persistent evidence browser, sub-agent result PR/export workflow.
+- **남음**: mutating tool scheduling 고도화, sub-agent result PR/export workflow.
 
 ## 제품 레이어 로드맵
 

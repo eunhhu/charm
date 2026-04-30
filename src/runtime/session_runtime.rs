@@ -83,6 +83,13 @@ enum ToolCallFlow {
     AwaitingApproval,
 }
 
+#[derive(Clone, Copy)]
+enum EvidenceBrowserView {
+    All,
+    Repo,
+    References,
+}
+
 #[async_trait]
 pub trait RuntimeModel: Send + Sync {
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<(Message, Option<Usage>)>;
@@ -1664,6 +1671,20 @@ impl SessionRuntime {
                 role: "assistant".to_string(),
                 content: self.render_audit_replay(parse_audit_limit(limit, 20)),
             }])),
+            ["/evidence"] | ["/evidence", "all"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
+                role: "assistant".to_string(),
+                content: self.render_evidence_browser(EvidenceBrowserView::All),
+            }])),
+            ["/evidence", "repo"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
+                role: "assistant".to_string(),
+                content: self.render_evidence_browser(EvidenceBrowserView::Repo),
+            }])),
+            ["/evidence", "refs"] | ["/evidence", "references"] => {
+                Ok(Some(vec![RuntimeEvent::MessageDelta {
+                    role: "assistant".to_string(),
+                    content: self.render_evidence_browser(EvidenceBrowserView::References),
+                }]))
+            }
             ["/clear"] => Ok(Some(self.clear_transcript())),
             ["/new"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
                 role: "assistant".to_string(),
@@ -1952,6 +1973,98 @@ impl SessionRuntime {
         for entry in entries {
             lines.push(format_trace_entry(&entry));
         }
+        lines.join("\n")
+    }
+
+    fn render_evidence_browser(&self, view: EvidenceBrowserView) -> String {
+        let session_id = self.snapshot.metadata.session_id.clone();
+        let (snapshot, source) = match self.store.load_snapshot(&session_id) {
+            Ok(Some(snapshot)) => (snapshot, "persisted"),
+            _ => (self.snapshot.clone(), "memory"),
+        };
+        let short_id = &session_id[..session_id.len().min(8)];
+        let mut lines = vec![
+            format!(
+                "Evidence Browser: session {short_id} ({source}; repo={} refs={})",
+                snapshot.repo_evidence.len(),
+                snapshot.reference_packs.len()
+            ),
+            format!(
+                "Files: {}",
+                self.workspace_root
+                    .join(".charm")
+                    .join("sessions")
+                    .join(&session_id)
+                    .display()
+            ),
+        ];
+
+        if matches!(view, EvidenceBrowserView::All | EvidenceBrowserView::Repo) {
+            lines.push("Repo evidence:".to_string());
+            if snapshot.repo_evidence.is_empty() {
+                lines.push("  (none)".to_string());
+            } else {
+                for evidence in snapshot.repo_evidence.iter().take(8) {
+                    let snippet = truncate_for_prompt(&evidence.snippet.replace('\n', " "), 120);
+                    lines.push(format!(
+                        "  [{:.2}] {}:{} {} ({})",
+                        evidence.rank, evidence.file_path, evidence.line, snippet, evidence.source
+                    ));
+                }
+                if snapshot.repo_evidence.len() > 8 {
+                    lines.push(format!("  ... {} more", snapshot.repo_evidence.len() - 8));
+                }
+            }
+        }
+
+        if matches!(
+            view,
+            EvidenceBrowserView::All | EvidenceBrowserView::References
+        ) {
+            lines.push("Reference packs:".to_string());
+            if snapshot.reference_packs.is_empty() {
+                lines.push("  (none)".to_string());
+            } else {
+                for pack in snapshot.reference_packs.iter().take(8) {
+                    let label = pack
+                        .library
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or(&pack.query);
+                    let version = pack
+                        .version
+                        .as_ref()
+                        .map(|version| format!("@{version}"))
+                        .unwrap_or_default();
+                    lines.push(format!(
+                        "  {:?} {}{} confidence={:?} rules={} examples={} refs={}",
+                        pack.source_kind,
+                        label,
+                        version,
+                        pack.confidence,
+                        pack.relevant_rules.len(),
+                        pack.minimal_examples.len(),
+                        pack.source_refs.len()
+                    ));
+                    if let Some(source) = pack.source_refs.first() {
+                        let title = source
+                            .title
+                            .as_deref()
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or("source");
+                        lines.push(format!("    - {title}: {}", source.url));
+                    }
+                }
+                if snapshot.reference_packs.len() > 8 {
+                    lines.push(format!("  ... {} more", snapshot.reference_packs.len() - 8));
+                }
+            }
+        }
+
+        if snapshot.repo_evidence.is_empty() && snapshot.reference_packs.is_empty() {
+            lines.push("No persisted evidence yet. Run a normal turn that inspects files or resolves references.".to_string());
+        }
+
         lines.join("\n")
     }
 
@@ -3172,6 +3285,7 @@ Slash commands
   /compact               Roll old turns into a TokenSaver-backed summary
   /audit                 Show trace counts, policy blocks, and failures
   /audit replay [n]      Replay recent trace events
+  /evidence [repo|refs]  Browse persisted repo evidence and reference packs
   /clear                 Clear transcript (keep system prompt)
   /model <id>            Pin a model for this session
   /session [next|prev|<id>]  Rotate between sessions
@@ -3221,7 +3335,6 @@ Autonomy levels (see docs/charm-strategy.md § Autonomy Profiles)
 
 Coming soon
   • Auto model routing via `charm delegate` (Planner/Worker).
-  • Persistent evidence browser.
   • Sub-agent result PR/export workflow.
 "#
     .to_string()
@@ -5029,6 +5142,66 @@ tokio = "1.44"
             event,
             RuntimeEvent::MessageDelta { content, .. }
                 if content.contains("Trace Replay") && content.contains("task_contract") && content.contains("verification_gap")
+        )));
+    }
+
+    #[tokio::test]
+    async fn evidence_command_reads_persisted_session_evidence() {
+        let dir = tempdir().unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+
+        runtime.snapshot.repo_evidence = vec![crate::retrieval::types::Evidence {
+            source: "grep".to_string(),
+            rank: 0.91,
+            file_path: "src/lib.rs".to_string(),
+            line: 12,
+            snippet: "pub fn persisted_evidence() {}".to_string(),
+            context: None,
+        }];
+        runtime.snapshot.reference_packs = vec![ReferencePack {
+            source_kind: ReferenceSourceKind::OfficialDocs,
+            library: Some("reqwest".to_string()),
+            version: Some("0.12".to_string()),
+            query: "reqwest client".to_string(),
+            relevant_rules: vec!["Use Client::new".to_string()],
+            minimal_examples: Vec::new(),
+            caveats: Vec::new(),
+            anti_patterns: Vec::new(),
+            source_refs: vec![crate::agent::reference_broker::SourceRef {
+                url: "https://docs.rs/reqwest".to_string(),
+                title: Some("reqwest docs".to_string()),
+                accessed_at: Utc::now(),
+                hash: None,
+            }],
+            confidence: ReferenceConfidence::Official,
+            fetched_at: Some(Utc::now()),
+        }];
+        runtime.store.save_snapshot(&runtime.snapshot).unwrap();
+        runtime.snapshot.repo_evidence.clear();
+        runtime.snapshot.reference_packs.clear();
+
+        let events = runtime.submit_input("/evidence").await.unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta { content, .. }
+                if content.contains("Evidence Browser")
+                    && content.contains("src/lib.rs:12")
+                    && content.contains("reqwest")
+                    && content.contains("https://docs.rs/reqwest")
         )));
     }
 

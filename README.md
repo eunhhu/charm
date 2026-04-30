@@ -293,6 +293,7 @@ User task
 - **Runtime gates**: 파일 편집 전 repo evidence gate, completion claim 전 verification gate, 위험도 기반 approval gate가 세션 런타임에서 동작합니다.
 - **Command lifecycle**: non-blocking command는 `poll_command`로 조회하고 `cancel_command`로 취소할 수 있습니다.
 - **Read path cache**: `ToolRegistry`의 `read_range`는 `.charm/cache/file-cache.json` backed `FileCache`를 사용해 세션 간 반복 파일 읽기 비용을 줄입니다.
+- **Evidence browser**: `/evidence`, `/evidence repo`, `/evidence refs`가 저장된 세션 evidence/reference pack을 `.charm/sessions/<id>/`에서 읽어 요약합니다.
 
 ### 빌드 상태 확인
 ```bash
