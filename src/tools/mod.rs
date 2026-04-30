@@ -202,6 +202,7 @@ impl ToolRegistry {
                 let filtered = rtk_filter::filter_with_rtk(&result.output, &hint).await;
                 if filtered.len() < result.output.len() {
                     result.output = filtered;
+                    mark_output_truncated(&mut result);
                 }
             }
             "grep_search" | "glob_search" | "semantic_search" | "parallel_search" => {
@@ -214,6 +215,17 @@ impl ToolRegistry {
         }
 
         Ok(result)
+    }
+}
+
+fn mark_output_truncated(result: &mut ToolResult) {
+    let metadata = result.metadata.get_or_insert_with(|| serde_json::json!({}));
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert("output_truncated".to_string(), serde_json::json!(true));
+        obj.insert(
+            "rendered_output_bytes".to_string(),
+            serde_json::json!(result.output.len()),
+        );
     }
 }
 
@@ -347,6 +359,33 @@ mod tests {
         let second = second_registry.execute("read_range", args).await.unwrap();
         assert_eq!(second.metadata.unwrap()["cache_hit"], true);
         assert!(dir.path().join(".charm/cache/file-cache.json").exists());
+    }
+
+    #[tokio::test]
+    async fn command_filter_marks_output_truncated_but_preserves_full_log_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::new(dir.path());
+
+        let result = registry
+            .execute(
+                "run_command",
+                serde_json::json!({
+                    "command": "for i in $(seq 1 300); do echo line-$i; done",
+                    "blocking": true
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.len() < 3000, "output should be filtered");
+        let meta = result.metadata.unwrap();
+        assert_eq!(meta["output_truncated"], true);
+        let log_ref = meta["log_ref"].as_str().expect("log_ref");
+        let raw_log = std::fs::read_to_string(dir.path().join(log_ref)).unwrap();
+        assert!(raw_log.contains("line-1"));
+        assert!(raw_log.contains("line-300"));
+        assert!(raw_log.len() > result.output.len());
     }
 
     /// Test that poll_command schema has correct parameters

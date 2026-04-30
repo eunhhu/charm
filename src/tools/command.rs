@@ -1,6 +1,7 @@
 use crate::core::{ToolResult, resolve_workspace_path};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -27,9 +28,10 @@ struct CommandEntry {
     cancelled: bool,
     process_id: Option<u32>,
     spawned_at: Instant,
+    workspace_root: PathBuf,
 }
 
-pub async fn run_command(args: Value, default_cwd: &std::path::Path) -> anyhow::Result<ToolResult> {
+pub async fn run_command(args: Value, default_cwd: &Path) -> anyhow::Result<ToolResult> {
     let command_str = args["command"].as_str().unwrap_or("");
     let cwd = if let Some(cwd_arg) = args["cwd"].as_str() {
         match resolve_workspace_path(cwd_arg, default_cwd) {
@@ -72,21 +74,23 @@ pub async fn run_command(args: Value, default_cwd: &std::path::Path) -> anyhow::
             Ok(Ok(out)) => out,
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => {
+                let output = format!("Command timed out after {}ms", effective_timeout_ms);
+                let log_meta = persist_command_output(default_cwd, &command_id, &output, false)?;
                 return Ok(ToolResult {
                     success: false,
-                    output: format!("Command timed out after {}ms", effective_timeout_ms),
-                    error: Some(format!(
-                        "Command timed out after {}ms",
-                        effective_timeout_ms
+                    output: output.clone(),
+                    error: Some(output),
+                    metadata: Some(merge_metadata(
+                        serde_json::json!({
+                            "command_id": command_id,
+                            "command": command_str,
+                            "executed": effective_command,
+                            "cwd": cwd_str,
+                            "timed_out": true,
+                            "timeout_ms": effective_timeout_ms,
+                        }),
+                        log_meta,
                     )),
-                    metadata: Some(serde_json::json!({
-                        "command_id": command_id,
-                        "command": command_str,
-                        "executed": effective_command,
-                        "cwd": cwd_str,
-                        "timed_out": true,
-                        "timeout_ms": effective_timeout_ms,
-                    })),
                 });
             }
         };
@@ -94,22 +98,27 @@ pub async fn run_command(args: Value, default_cwd: &std::path::Path) -> anyhow::
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let success = output.status.success();
+        let combined = if stderr.is_empty() {
+            stdout.clone()
+        } else {
+            format!("{}\n---stderr---\n{}", stdout, stderr)
+        };
+        let log_meta = persist_command_output(default_cwd, &command_id, &combined, false)?;
 
         return Ok(ToolResult {
             success,
-            output: if stderr.is_empty() {
-                stdout.clone()
-            } else {
-                format!("{}\n---stderr---\n{}", stdout, stderr)
-            },
+            output: combined,
             error: if success { None } else { Some(stderr) },
-            metadata: Some(serde_json::json!({
-                "command_id": command_id,
-                "command": command_str,
-                "executed": effective_command,
-                "cwd": cwd_str,
-                "exit_code": output.status.code()
-            })),
+            metadata: Some(merge_metadata(
+                serde_json::json!({
+                    "command_id": command_id,
+                    "command": command_str,
+                    "executed": effective_command,
+                    "cwd": cwd_str,
+                    "exit_code": output.status.code()
+                }),
+                log_meta,
+            )),
         });
     }
 
@@ -127,6 +136,7 @@ pub async fn run_command(args: Value, default_cwd: &std::path::Path) -> anyhow::
                 cancelled: false,
                 process_id: None,
                 spawned_at: Instant::now(),
+                workspace_root: default_cwd.to_path_buf(),
             },
         );
     }
@@ -195,6 +205,7 @@ pub async fn run_command(args: Value, default_cwd: &std::path::Path) -> anyhow::
             "cwd": cwd_str,
             "running": true,
             "wall_timeout_ms": DEFAULT_NONBLOCKING_WALL_MS,
+            "log_ref": command_log_ref(&command_id),
         })),
     })
 }
@@ -234,19 +245,24 @@ pub async fn poll_command(args: Value) -> anyhow::Result<ToolResult> {
             let exit_code = entry.exit_code;
             let timed_out = entry.timed_out;
             let cancelled = entry.cancelled;
+            let log_meta =
+                persist_command_output(&entry.workspace_root, command_id, &combined, false)?;
             drop(store);
             COMMAND_STORE.lock().unwrap().remove(command_id);
             return Ok(ToolResult {
                 success: false,
                 output: combined,
                 error: Some("Command entry evicted (completed >30m ago)".to_string()),
-                metadata: Some(serde_json::json!({
-                    "running": false,
-                    "exit_code": exit_code,
-                    "timed_out": timed_out,
-                    "cancelled": cancelled,
-                    "evicted": true,
-                })),
+                metadata: Some(merge_metadata(
+                    serde_json::json!({
+                        "running": false,
+                        "exit_code": exit_code,
+                        "timed_out": timed_out,
+                        "cancelled": cancelled,
+                        "evicted": true,
+                    }),
+                    log_meta,
+                )),
             });
         }
     }
@@ -257,6 +273,7 @@ pub async fn poll_command(args: Value) -> anyhow::Result<ToolResult> {
         format!("{}\n---stderr---\n{}", entry.stdout, entry.stderr)
     };
 
+    let combined_len = combined.len();
     let output = if let Some(max) = max_lines {
         let lines: Vec<&str> = combined.lines().collect();
         if lines.len() > max {
@@ -273,19 +290,39 @@ pub async fn poll_command(args: Value) -> anyhow::Result<ToolResult> {
                 }
             }
         } else {
-            combined
+            combined.clone()
         }
     } else {
-        combined
+        combined.clone()
+    };
+    let output_truncated = output.len() != combined_len;
+    let log_meta = if entry.running {
+        serde_json::json!({
+            "log_ref": command_log_ref(command_id),
+            "output_truncated": output_truncated,
+        })
+    } else {
+        persist_command_output(
+            &entry.workspace_root,
+            command_id,
+            &combined,
+            output_truncated,
+        )?
     };
 
     Ok(ToolResult {
         success: true,
         output,
         error: None,
-        metadata: Some(
-            serde_json::json!({ "running": entry.running, "exit_code": entry.exit_code, "timed_out": entry.timed_out, "cancelled": entry.cancelled }),
-        ),
+        metadata: Some(merge_metadata(
+            serde_json::json!({
+                "running": entry.running,
+                "exit_code": entry.exit_code,
+                "timed_out": entry.timed_out,
+                "cancelled": entry.cancelled
+            }),
+            log_meta,
+        )),
     })
 }
 
@@ -367,6 +404,48 @@ fn signal_term(target: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn command_log_ref(command_id: &str) -> String {
+    format!(".charm/logs/commands/{command_id}.log")
+}
+
+fn persist_command_output(
+    workspace_root: &Path,
+    command_id: &str,
+    output: &str,
+    output_truncated: bool,
+) -> anyhow::Result<Value> {
+    let log_ref = command_log_ref(command_id);
+    let log_path = workspace_root.join(&log_ref);
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&log_path, output)?;
+    Ok(serde_json::json!({
+        "log_ref": log_ref,
+        "output_hash": stable_output_hash(output),
+        "output_bytes": output.len(),
+        "output_truncated": output_truncated,
+    }))
+}
+
+fn stable_output_hash(output: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in output.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn merge_metadata(mut base: Value, extra: Value) -> Value {
+    if let (Some(base), Some(extra)) = (base.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    base
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,6 +499,49 @@ mod tests {
         assert!(!poll_meta["running"].as_bool().unwrap());
         assert_eq!(poll_meta["exit_code"].as_i64(), Some(0));
         assert!(poll_result.output.contains("hello world"));
+    }
+
+    #[tokio::test]
+    async fn completed_nonblocking_poll_persists_full_output_log_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "command": "printf 'first\\nsecond\\n'",
+            "blocking": false
+        });
+
+        let result = run_command(args, dir.path()).await.unwrap();
+        let command_id = result.metadata.unwrap()["command_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let poll_result = poll_command(serde_json::json!({
+            "command_id": command_id,
+            "max_lines": 1,
+            "output_priority": "bottom"
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(poll_result.output.trim(), "second");
+        let poll_meta = poll_result.metadata.unwrap();
+        let log_ref = poll_meta["log_ref"].as_str().expect("log_ref");
+        assert!(
+            poll_meta["output_hash"]
+                .as_str()
+                .unwrap()
+                .starts_with("fnv1a64:")
+        );
+        assert_eq!(
+            poll_meta["output_bytes"].as_u64(),
+            Some("first\nsecond\n".len() as u64)
+        );
+        assert_eq!(poll_meta["output_truncated"], true);
+
+        let raw_log = std::fs::read_to_string(dir.path().join(log_ref)).unwrap();
+        assert_eq!(raw_log, "first\nsecond\n");
     }
 
     #[tokio::test]
@@ -490,6 +612,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocking_command_persists_full_output_log_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "command": "printf 'alpha\\nbeta\\n'",
+            "blocking": true
+        });
+
+        let result = run_command(args, dir.path()).await.unwrap();
+
+        assert!(result.success);
+        let meta = result.metadata.unwrap();
+        let log_ref = meta["log_ref"].as_str().expect("log_ref");
+        assert!(log_ref.starts_with(".charm/logs/commands/"));
+        assert!(log_ref.ends_with(".log"));
+        assert!(
+            meta["output_hash"]
+                .as_str()
+                .unwrap()
+                .starts_with("fnv1a64:")
+        );
+        assert_eq!(
+            meta["output_bytes"].as_u64(),
+            Some(result.output.len() as u64)
+        );
+        assert_eq!(meta["output_truncated"], false);
+
+        let raw_log = std::fs::read_to_string(dir.path().join(log_ref)).unwrap();
+        assert_eq!(raw_log, result.output);
+    }
+
+    #[tokio::test]
     async fn poll_command_returns_error_for_invalid_id() {
         let args = serde_json::json!({"command_id": "invalid-id-does-not-exist"});
         let result = poll_command(args).await;
@@ -513,6 +666,35 @@ mod tests {
         let meta = result.metadata.unwrap();
         assert_eq!(meta["timed_out"], true);
         assert_eq!(meta["timeout_ms"], 100);
+    }
+
+    #[tokio::test]
+    async fn blocking_timeout_persists_timeout_log_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "command": "sleep 300",
+            "blocking": true,
+            "timeout_ms": 100
+        });
+
+        let result = run_command(args, dir.path()).await.unwrap();
+
+        assert!(!result.success);
+        let meta = result.metadata.unwrap();
+        let log_ref = meta["log_ref"].as_str().expect("log_ref");
+        assert!(
+            meta["output_hash"]
+                .as_str()
+                .unwrap()
+                .starts_with("fnv1a64:")
+        );
+        assert_eq!(
+            meta["output_bytes"].as_u64(),
+            Some(result.output.len() as u64)
+        );
+        assert_eq!(meta["output_truncated"], false);
+        let raw_log = std::fs::read_to_string(dir.path().join(log_ref)).unwrap();
+        assert_eq!(raw_log, result.output);
     }
 
     #[tokio::test]

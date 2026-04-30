@@ -289,7 +289,7 @@ User task
 - **Task contract 기본 경로**: 세션 입력이 `TaskConcretizer`를 거쳐 목표, 수용 조건, 검증 조건을 가진 contract로 낮아집니다.
 - **Reference-first 경로**: `ReferenceBroker`가 Context7, local package source, registry, web fallback 순서로 `ReferencePack`을 준비합니다. outbound HTTP는 URL guard와 DNS pinning을 통과해야 합니다.
 - **Prompt compiler 경로**: `PromptAssembler`가 task contract, reference pack, verification gate, autonomy policy를 typed prompt section으로 렌더링합니다.
-- **Trace/minification 경로**: 도구 raw output은 trace에 남기고, 모델-facing view는 `TokenSaver`로 줄여 저장합니다.
+- **Trace/minification 경로**: command full output은 `.charm/logs/commands/<command_id>.log`에 저장하고 `log_ref`/`output_hash`/byte count를 tool metadata와 trace에 남깁니다. 모델-facing view는 `TokenSaver`/RTK filter로 줄이되 full log reference는 유지합니다.
 - **Runtime gates**: 파일 편집 전 repo evidence gate, completion claim 전 verification gate, 위험도 기반 approval gate가 세션 런타임에서 동작합니다.
 - **Command lifecycle**: non-blocking command는 `poll_command`로 조회하고 `cancel_command`로 취소할 수 있습니다.
 - **Read path cache**: `ToolRegistry`의 `read_range`는 `.charm/cache/file-cache.json` backed `FileCache`를 사용해 세션 간 반복 파일 읽기 비용을 줄입니다.

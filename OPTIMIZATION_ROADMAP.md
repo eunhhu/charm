@@ -186,7 +186,8 @@ pub struct PromptSection {
 - [x] `.charm/traces` raw event store
 - [x] evidence -> tool call -> edit -> verification linkage
   - Status: Partially Wired. turn_id 기반 trace와 verification update 존재. edit diff 단위 linkage 강화 필요.
-- [ ] command output hash and full log ref
+- [x] command output hash and full log ref
+  - Status: Wired. blocking command, completed poll output, timeout output은 `.charm/logs/commands/<command_id>.log`에 full output을 저장하고 `ToolResult.metadata`에 `log_ref`, `output_hash`, `output_bytes`, `output_truncated`를 남김. 모델-facing output이 RTK/filter로 줄면 full log ref는 보존하고 `rendered_output_bytes`를 추가.
 - [ ] repeated failure / missed context / missing reference 분석
 - [ ] candidate rules, workflows, memories 제안
 
