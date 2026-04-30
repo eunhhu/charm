@@ -684,6 +684,7 @@ impl SessionRuntime {
         }
 
         let mut index = 0usize;
+        let mut mutating_barrier: Option<String> = None;
         while index < prepared.len() {
             let batch_len = self.parallel_tool_batch_len(&prepared[index..]);
             if batch_len > 1 {
@@ -713,6 +714,29 @@ impl SessionRuntime {
             }
 
             let item = &prepared[index];
+            if let Some(reason) = mutating_barrier
+                .as_deref()
+                .filter(|_| tool_is_ordered_mutation(&item.call))
+            {
+                emit(RuntimeEvent::ToolCallStarted {
+                    execution: item.execution.clone(),
+                });
+                let result = self.mutating_scheduler_block_result(item, reason);
+                self.store_tool_result_message(
+                    &item.call,
+                    &item.tool_name,
+                    item.id.clone(),
+                    &result,
+                )
+                .await?;
+                emit(RuntimeEvent::ToolCallFinished {
+                    execution: item.execution.clone(),
+                    result,
+                });
+                index += 1;
+                continue;
+            }
+
             if let Some(result) = self.scope_guard_result(&item.call, &item.tool_name) {
                 emit(RuntimeEvent::ToolCallStarted {
                     execution: item.execution.clone(),
@@ -724,6 +748,10 @@ impl SessionRuntime {
                     &result,
                 )
                 .await?;
+                if let Some(reason) = mutation_barrier_reason(&item.call, &item.tool_name, &result)
+                {
+                    mutating_barrier = Some(reason);
+                }
                 emit(RuntimeEvent::ToolCallFinished {
                     execution: item.execution.clone(),
                     result,
@@ -764,6 +792,9 @@ impl SessionRuntime {
             }
             self.store_tool_result_message(&item.call, &item.tool_name, item.id.clone(), &result)
                 .await?;
+            if let Some(reason) = mutation_barrier_reason(&item.call, &item.tool_name, &result) {
+                mutating_barrier = Some(reason);
+            }
             emit(RuntimeEvent::ToolCallFinished {
                 execution: item.execution.clone(),
                 result,
@@ -772,6 +803,36 @@ impl SessionRuntime {
         }
 
         Ok(ToolCallFlow::Continue)
+    }
+
+    fn mutating_scheduler_block_result(
+        &self,
+        item: &PreparedToolCall,
+        prior_barrier: &str,
+    ) -> ToolResult {
+        let result = ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!(
+                "Tool scheduler: skipped mutating tool after prior mutation barrier: {prior_barrier}"
+            )),
+            metadata: Some(serde_json::json!({
+                "blocked_by": "mutating_scheduler",
+                "tool_name": item.tool_name,
+                "prior_barrier": prior_barrier,
+            })),
+        };
+        let _ = self.trace_current_turn(
+            "tool_policy_blocked",
+            serde_json::json!({
+                "tool_name": item.tool_name,
+                "call": item.call,
+                "reason": "mutating scheduler blocked later mutation after prior barrier",
+                "prior_barrier": prior_barrier,
+                "result": result,
+            }),
+        );
+        result
     }
 
     fn parallel_tool_batch_len(&self, prepared: &[PreparedToolCall]) -> usize {
@@ -3338,6 +3399,52 @@ fn tool_can_run_in_parallel_batch(call: &ToolCall) -> bool {
     )
 }
 
+fn tool_is_ordered_mutation(call: &ToolCall) -> bool {
+    matches!(
+        call,
+        ToolCall::EditPatch { .. }
+            | ToolCall::WriteFile { .. }
+            | ToolCall::PlanUpdate { .. }
+            | ToolCall::CheckpointCreate { .. }
+            | ToolCall::CheckpointRestore { .. }
+            | ToolCall::MemoryStage { .. }
+            | ToolCall::MemoryCommit { .. }
+            | ToolCall::RunCommand {
+                risk_class: RiskClass::StatefulExec
+                    | RiskClass::Destructive
+                    | RiskClass::ExternalSideEffect,
+                ..
+            }
+    )
+}
+
+fn mutation_barrier_reason(
+    call: &ToolCall,
+    tool_name: &str,
+    result: &ToolResult,
+) -> Option<String> {
+    if !tool_is_ordered_mutation(call) {
+        return None;
+    }
+    if result
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("running"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Some(format!(
+            "previous mutating tool is still running: {tool_name}"
+        ));
+    }
+    if !result.success {
+        return Some(format!(
+            "previous mutating tool failed or was blocked: {tool_name}"
+        ));
+    }
+    None
+}
+
 fn evidence_queries_for_message(message: &str) -> Vec<String> {
     let mut queries = Vec::new();
     let trimmed = message.trim();
@@ -5524,14 +5631,203 @@ tokio = "1.44"
         assert_eq!(runtime.snapshot().metadata.pending_approvals, 0);
         assert!(!dir.path().join("src/core/mod.rs").exists());
         assert!(events.iter().any(|event| matches!(
-            event,
-            RuntimeEvent::ToolCallFinished { result, .. }
-                if result.metadata
-                    .as_ref()
-                    .and_then(|meta| meta.get("blocked_by"))
-                    .and_then(Value::as_str)
-                    == Some("scope_guard")
+        event,
+        RuntimeEvent::ToolCallFinished { result, .. }
+            if result.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("blocked_by"))
+                .and_then(Value::as_str)
+                == Some("scope_guard")
         )));
+    }
+
+    #[tokio::test]
+    async fn mutating_scheduler_blocks_later_mutations_after_policy_failure() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/tui")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/core")).unwrap();
+        std::fs::write(dir.path().join("src/tui/app.rs"), "fn tui() {}\n").unwrap();
+        let model = fake_model(vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some("Inspecting then attempting edits".to_string()),
+                tool_calls: Some(vec![
+                    ToolCallBlock {
+                        id: "call-read".to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "read_range".to_string(),
+                            arguments: serde_json::json!({
+                                "file_path": "src/tui/app.rs",
+                                "offset": 0,
+                                "limit": 10
+                            })
+                            .to_string(),
+                        },
+                    },
+                    ToolCallBlock {
+                        id: "call-outside".to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "write_file".to_string(),
+                            arguments: serde_json::json!({
+                                "file_path": "src/core/mod.rs",
+                                "content": "pub fn outside() {}\n"
+                            })
+                            .to_string(),
+                        },
+                    },
+                    ToolCallBlock {
+                        id: "call-read-after".to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "read_range".to_string(),
+                            arguments: serde_json::json!({
+                                "file_path": "src/tui/app.rs",
+                                "offset": 0,
+                                "limit": 10
+                            })
+                            .to_string(),
+                        },
+                    },
+                    ToolCallBlock {
+                        id: "call-inside".to_string(),
+                        r#type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "write_file".to_string(),
+                            arguments: serde_json::json!({
+                                "file_path": "src/tui/app.rs",
+                                "content": "fn changed() {}\n"
+                            })
+                            .to_string(),
+                        },
+                    },
+                ]),
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Some("Stopped after mutation failure".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+            },
+        ]);
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+
+        runtime
+            .submit_input("Fix Mac shortcuts in the TUI")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/tui/app.rs")).unwrap(),
+            "fn tui() {}\n"
+        );
+        assert!(!dir.path().join("src/core/mod.rs").exists());
+        let blocked_inside = runtime
+            .snapshot()
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-inside"))
+            .and_then(|message| message.content.as_deref())
+            .and_then(|content| serde_json::from_str::<ToolResult>(content).ok())
+            .expect("inside write result");
+        assert!(!blocked_inside.success);
+        assert_eq!(
+            blocked_inside
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("blocked_by"))
+                .and_then(Value::as_str),
+            Some("mutating_scheduler")
+        );
+        let read_after = runtime
+            .snapshot()
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-read-after"))
+            .and_then(|message| message.content.as_deref())
+            .and_then(|content| serde_json::from_str::<ToolResult>(content).ok())
+            .expect("read after barrier result");
+        assert!(read_after.success, "{read_after:?}");
+    }
+
+    #[test]
+    fn mutation_barrier_detects_failed_and_running_mutating_tools() {
+        let running = ToolResult {
+            success: true,
+            output: String::new(),
+            error: None,
+            metadata: Some(serde_json::json!({ "running": true })),
+        };
+        let stateful_command = ToolCall::RunCommand {
+            command: "make generate".to_string(),
+            cwd: None,
+            blocking: false,
+            timeout_ms: None,
+            risk_class: RiskClass::StatefulExec,
+        };
+        assert!(
+            mutation_barrier_reason(&stateful_command, "run_command", &running)
+                .is_some_and(|reason| reason.contains("still running"))
+        );
+
+        let safe_command = ToolCall::RunCommand {
+            command: "git status --short".to_string(),
+            cwd: None,
+            blocking: true,
+            timeout_ms: None,
+            risk_class: RiskClass::SafeExec,
+        };
+        assert!(mutation_barrier_reason(&safe_command, "run_command", &running).is_none());
+
+        let failed_write = ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some("failed".to_string()),
+            metadata: None,
+        };
+        assert!(
+            mutation_barrier_reason(
+                &ToolCall::WriteFile {
+                    file_path: "src/lib.rs".to_string(),
+                    content: String::new(),
+                },
+                "write_file",
+                &failed_write,
+            )
+            .is_some_and(|reason| reason.contains("failed or was blocked"))
+        );
+
+        assert!(
+            mutation_barrier_reason(
+                &ToolCall::ReadRange {
+                    file_path: "src/lib.rs".to_string(),
+                    offset: None,
+                    limit: None,
+                },
+                "read_range",
+                &failed_write,
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]

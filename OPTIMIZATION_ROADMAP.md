@@ -46,9 +46,9 @@ TaskContract
 
 ## 현재 진행 요약
 
-- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, repeated-failure precedent gate, GitHub issue/discussion precedent provider, source-aware write/command-target scope guard, command cancel, persistent read-range FileCache, TokenSaver-backed `/compact`, slash audit/replay UI, `/evidence` persistent evidence browser, `/agent export` sub-agent review artifact, `/agent pr` local PR draft, TUI read-only parallel tool execution, mixed tool-call read-prefix scheduling.
+- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, repeated-failure precedent gate, GitHub issue/discussion precedent provider, source-aware write/command-target scope guard, command cancel, persistent read-range FileCache, TokenSaver-backed `/compact`, slash audit/replay UI, `/evidence` persistent evidence browser, `/agent export` sub-agent review artifact, `/agent pr` local PR draft, TUI read-only parallel tool execution, mixed tool-call read-prefix scheduling, mutating tool scheduling barrier.
 - **부분/Wired**: Context7/local package/registry/web reference provider, trace linkage, side-effect scope inference.
-- **남음**: mutating tool scheduling 고도화, optional remote GitHub PR publish.
+- **남음**: optional remote GitHub PR publish, compile warning cleanup, provider별 prompt golden snapshot 확대.
 
 ## 제품 레이어 로드맵
 
@@ -285,6 +285,8 @@ let results = join_all(futures).await;
 - [x] mutating/shell tools는 ordered tail로 분리
 - [x] TUI `SessionRuntime` 병렬 실행 연결
   - Status: Wired for safe read/search batches, including mixed responses where consecutive read chunks precede ordered writes/approvals. `SessionRuntime` emits all starts before batch execution, records ordered tool results with original `tool_call_id`s, traces `parallel_tool_batch`, and keeps mutating/approval-gated tools ordered.
+- [x] mutating scheduler barrier
+  - Status: Wired. A failed, policy-blocked, or still-running mutating tool creates a per-response barrier. Later mutating tools in the same model response are skipped with synthetic `tool` results tagged `blocked_by=mutating_scheduler`, preserving `tool_call_id` alignment while still allowing safe read/search calls to inspect state.
 
 ### Phase D: RTK (Retrieval Toolkit) 고도화
 
