@@ -1726,6 +1726,9 @@ impl SessionRuntime {
             ["/agent", "diff", id] | ["/agents", "diff", id] => {
                 Ok(Some(self.diff_subagent_result(id)))
             }
+            ["/agent", "export", id] | ["/agents", "export", id] => {
+                Ok(Some(self.export_subagent_result(id)?))
+            }
             ["/agent", "merge", id] | ["/agents", "merge", id] => {
                 Ok(Some(self.merge_subagent_result(id)?))
             }
@@ -2372,7 +2375,7 @@ impl SessionRuntime {
             ));
         }
         lines.push(
-            "Use /agent diff <id>, /agent merge <id>, /agent cleanup <id>, or /agent kill <id>."
+            "Use /agent diff <id>, /agent export <id>, /agent merge <id>, /agent cleanup <id>, or /agent kill <id>."
                 .to_string(),
         );
         lines.join("\n")
@@ -2488,6 +2491,113 @@ impl SessionRuntime {
                 diff
             ),
         }]
+    }
+
+    pub fn export_subagent_result(&mut self, id_prefix: &str) -> anyhow::Result<Vec<RuntimeEvent>> {
+        let Some(index) = self.find_subagent_job(id_prefix) else {
+            return Ok(vec![RuntimeEvent::MessageDelta {
+                role: "system".to_string(),
+                content: format!("No sub-agent matches '{id_prefix}'."),
+            }]);
+        };
+        let job = self.snapshot.background_jobs[index].clone();
+        let (worktree_path, changed_files) = self.subagent_worktree_details(&job)?;
+
+        let status = std::process::Command::new("git")
+            .args(["status", "--short"])
+            .current_dir(&worktree_path)
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "(no git status output)".to_string());
+        let diff = std::process::Command::new("git")
+            .arg("diff")
+            .arg("--")
+            .args(&changed_files)
+            .current_dir(&worktree_path)
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "(no tracked diff; files may be new/untracked)".to_string());
+
+        let mut export = String::new();
+        export.push_str(&format!("# Sub-agent Export: {}\n\n", job.title));
+        export.push_str(&format!("- Job: {}\n", job.id));
+        export.push_str(&format!("- Status: {:?}\n", job.status));
+        export.push_str(&format!("- Worktree: {}\n", worktree_path.display()));
+        export.push_str(&format!("- Detail: {}\n", job.detail));
+        export.push_str(&format!(
+            "- Changed files: {}\n\n",
+            if changed_files.is_empty() {
+                "(none)".to_string()
+            } else {
+                changed_files.join(", ")
+            }
+        ));
+        export.push_str("## Git Status\n\n```text\n");
+        export.push_str(&status);
+        export.push_str("\n```\n\n## Diff\n\n```diff\n");
+        export.push_str(&diff);
+        export.push_str("\n```\n\n");
+
+        if !changed_files.is_empty() {
+            let canonical_worktree = worktree_path.canonicalize()?;
+            export.push_str("## File Snapshots\n\n");
+            for rel in &changed_files {
+                validate_agent_relative_path(rel)?;
+                let path = canonical_worktree.join(rel);
+                let Ok(canonical_path) = path.canonicalize() else {
+                    export.push_str(&format!("### {rel}\n\n(missing file)\n\n"));
+                    continue;
+                };
+                anyhow::ensure!(
+                    canonical_path.starts_with(&canonical_worktree),
+                    "sub-agent export source escapes worktree: {}",
+                    rel
+                );
+                if !canonical_path.is_file() {
+                    export.push_str(&format!("### {rel}\n\n(not a file)\n\n"));
+                    continue;
+                }
+                let content = std::fs::read_to_string(&canonical_path)
+                    .map(|raw| truncate_for_prompt(&raw, 20_000))
+                    .unwrap_or_else(|_| "(binary or unreadable file)".to_string());
+                export.push_str(&format!("### {rel}\n\n```text\n{content}\n```\n\n"));
+            }
+        }
+
+        let export_dir = self.workspace_root.join(".charm").join("exports");
+        std::fs::create_dir_all(&export_dir)?;
+        let export_path =
+            export_dir.join(format!("subagent-{}.md", sanitize_export_filename(&job.id)));
+        std::fs::write(&export_path, export)?;
+
+        if let Some(metadata) = self.snapshot.background_jobs[index].metadata.as_mut()
+            && let Some(obj) = metadata.as_object_mut()
+        {
+            obj.insert(
+                "export_path".to_string(),
+                Value::String(export_path.display().to_string()),
+            );
+            obj.insert(
+                "exported_at".to_string(),
+                Value::String(Utc::now().to_rfc3339()),
+            );
+        }
+        let job = self.snapshot.background_jobs[index].clone();
+        Ok(vec![
+            RuntimeEvent::BackgroundJobUpdated { job },
+            RuntimeEvent::MessageDelta {
+                role: "system".to_string(),
+                content: format!(
+                    "Exported sub-agent {} review artifact to {}.",
+                    short_id(&self.snapshot.background_jobs[index]),
+                    export_path.display()
+                ),
+            },
+        ])
     }
 
     pub fn merge_subagent_result(&mut self, id_prefix: &str) -> anyhow::Result<Vec<RuntimeEvent>> {
@@ -3105,6 +3215,24 @@ fn path_to_slash(path: &Path) -> String {
         .join("/")
 }
 
+fn sanitize_export_filename(input: &str) -> String {
+    let sanitized = input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "export".to_string()
+    } else {
+        sanitized
+    }
+}
+
 fn tool_provides_repo_evidence(call: &ToolCall) -> bool {
     matches!(
         call,
@@ -3291,6 +3419,7 @@ Slash commands
   /session [next|prev|<id>]  Rotate between sessions
   /agent spawn <task>    Start a background sub-agent
   /agent list|diff <id>  Inspect sub-agent output
+  /agent export <id>     Export sub-agent review artifact
   /agent merge|cleanup <id>  Apply or remove sub-agent worktree
   /agent kill <id>      Cancel a sub-agent
   /approvals             Show pending approvals
@@ -3335,7 +3464,7 @@ Autonomy levels (see docs/charm-strategy.md § Autonomy Profiles)
 
 Coming soon
   • Auto model routing via `charm delegate` (Planner/Worker).
-  • Sub-agent result PR/export workflow.
+  • Sub-agent result PR workflow.
 "#
     .to_string()
 }
@@ -5891,6 +6020,65 @@ tokio = "1.44"
             .as_ref()
             .unwrap();
         assert_eq!(metadata.get("merged").and_then(Value::as_bool), Some(true));
+    }
+
+    #[tokio::test]
+    async fn agent_export_writes_review_artifact_for_subagent_result() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+        let model = fake_model(Vec::new());
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+
+        let worktree = create_test_worktree(dir.path(), "export-job");
+        std::fs::write(worktree.join("subagent-output.txt"), "ready to export").unwrap();
+        runtime.snapshot.background_jobs.push(BackgroundJob {
+            id: "export-job-1234".to_string(),
+            title: "export test".to_string(),
+            status: BackgroundJobStatus::Completed,
+            detail: "ready".to_string(),
+            kind: BackgroundJobKind::SubAgent,
+            progress: Some(100),
+            metadata: Some(serde_json::json!({
+                "worktree_path": worktree,
+                "changed_files": ["subagent-output.txt"],
+                "turns": 2
+            })),
+        });
+
+        let events = runtime
+            .submit_input("/agent export export-job")
+            .await
+            .unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta { content, .. } if content.contains("Exported sub-agent")
+        )));
+        let metadata = runtime.snapshot.background_jobs[0]
+            .metadata
+            .as_ref()
+            .unwrap();
+        let export_path = metadata
+            .get("export_path")
+            .and_then(Value::as_str)
+            .expect("export_path");
+        let export = std::fs::read_to_string(export_path).unwrap();
+        assert!(export.contains("export test"));
+        assert!(export.contains("subagent-output.txt"));
+        assert!(export.contains("ready to export"));
     }
 
     #[tokio::test]

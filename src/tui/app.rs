@@ -475,6 +475,11 @@ pub fn command_catalog() -> Vec<CommandItem> {
             category: CommandCategory::Agent,
         },
         CommandItem {
+            command: "/agent export <id>",
+            description: "Export sub-agent review artifact",
+            category: CommandCategory::Agent,
+        },
+        CommandItem {
             command: "/agent merge <id>",
             description: "Copy reviewed sub-agent files into workspace",
             category: CommandCategory::Agent,

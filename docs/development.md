@@ -110,6 +110,7 @@ RUST_LOG=debug charm ...
 ### 세션 디버깅
 세션 파일은 `.charm/sessions/`에 저장됩니다.
 저장된 repo evidence와 reference pack은 TUI에서 `/evidence`, `/evidence repo`, `/evidence refs`로 확인할 수 있습니다.
+Sub-agent 결과 리뷰 artifact는 `/agent export <id>`로 `.charm/exports/`에 저장할 수 있습니다.
 
 ## 알려진 이슈
 
