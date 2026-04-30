@@ -183,6 +183,7 @@ export OLLAMA_API_KEY="ollama"  # 선택사항
 ```
 
 TUI에서는 `Ctrl+Shift+P` 또는 `/provider`로 provider 연결 상태를 확인합니다.
+mac/terminal이 `Ctrl+Shift+letter`를 앱까지 전달하지 못하면 `Ctrl+O` 또는 `Ctrl+Option+P`를 사용하세요.
 연결된 provider를 선택하면 해당 provider 모델 목록으로 바로 이동하고, 미연결 provider를 선택하면 설정 안내 modal이 열립니다.
 
 ### 모델 지정 방식

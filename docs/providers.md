@@ -91,6 +91,7 @@ charm --model ollama/qwen3-coder:30b
 ## TUI Provider 연결
 
 - `Ctrl+Shift+P` 또는 `/provider`로 provider 연결 상태를 확인합니다.
+- mac/terminal이 `Ctrl+Shift+letter`를 전달하지 못하면 `Ctrl+O` 또는 `Ctrl+Option+P`를 사용합니다.
 - 연결된 provider를 선택하면 해당 provider로 필터링된 model switcher가 열립니다.
 - 미연결 provider를 선택하거나 `/provider connect <provider>`를 실행하면 설정 안내 modal이 열립니다.
 - 세션 중 `/model provider/model-id`를 실행하면 pinned model metadata뿐 아니라 실제 provider client도 새 provider로 재바인딩됩니다.

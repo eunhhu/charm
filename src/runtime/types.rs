@@ -43,7 +43,7 @@ impl AutonomyLevel {
         match raw.trim().to_lowercase().as_str() {
             "conservative" | "safe" | "strict" => Some(AutonomyLevel::Conservative),
             "balanced" | "default" | "normal" => Some(AutonomyLevel::Balanced),
-            "aggressive" | "auto" | "aggr" => Some(AutonomyLevel::Aggressive),
+            "aggressive" | "auto" | "aggr" | "fast" => Some(AutonomyLevel::Aggressive),
             "yolo" | "wild" | "auto-all" | "yeet" => Some(AutonomyLevel::Yolo),
             _ => None,
         }
@@ -297,4 +297,21 @@ pub enum RuntimeEvent {
         completion_tokens: u32,
         total_tokens: u32,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autonomy_parser_accepts_display_short_names() {
+        assert_eq!(
+            AutonomyLevel::parse("fast"),
+            Some(AutonomyLevel::Aggressive)
+        );
+        assert_eq!(
+            AutonomyLevel::parse("safe"),
+            Some(AutonomyLevel::Conservative)
+        );
+    }
 }

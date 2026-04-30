@@ -111,7 +111,7 @@ RUST_LOG=debug charm ...
 세션 파일은 `.charm/sessions/`에 저장됩니다.
 저장된 repo evidence와 reference pack은 TUI에서 `/evidence`, `/evidence repo`, `/evidence refs`로 확인할 수 있습니다.
 긴 inspection 출력은 transcript 대신 `RuntimeEvent::Modal`로 전달되어 TUI의 scrollable modal에 표시됩니다.
-Provider 상태는 `/provider` 또는 `Ctrl+Shift+P`에서 확인하고, `/model provider/model-id`는 런타임 provider client까지 교체합니다.
+Provider 상태는 `/provider`, `Ctrl+Shift+P`, `Ctrl+O`, `Ctrl+Option+P`에서 확인하고, `/model provider/model-id`는 런타임 provider client까지 교체합니다.
 Sub-agent 결과 리뷰 artifact는 `/agent export <id>`로 `.charm/exports/`에 저장할 수 있습니다.
 Sub-agent PR 초안은 `/agent pr <id>`로 같은 export 디렉터리에 생성됩니다.
 

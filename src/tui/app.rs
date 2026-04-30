@@ -1662,6 +1662,28 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
         }
     }
 
+    if ctrl && option_like {
+        match key.code {
+            _ if key_char_eq(&key, 'p') => {
+                open_overlay(app, Overlay::Providers);
+                return Ok(false);
+            }
+            _ if key_char_eq(&key, 'm') => {
+                open_overlay(app, Overlay::Mcp);
+                return Ok(false);
+            }
+            _ if key_char_eq(&key, 'a') => {
+                open_overlay(app, Overlay::Approvals);
+                return Ok(false);
+            }
+            _ if key_char_eq(&key, 'y') => {
+                cycle_autonomy_from_tui(app);
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+
     if option_like {
         match key.code {
             KeyCode::Left | KeyCode::Char('b') | KeyCode::Char('B') => {
@@ -1749,12 +1771,23 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
                 return Ok(false);
             }
             _ if key_char_eq(&key, 'y') => {
-                let next = app.autonomy.cycle();
-                send_slash(app, &format!("/autonomy {}", next.short()));
+                cycle_autonomy_from_tui(app);
                 return Ok(false);
             }
             _ if key_char_eq(&key, 'a') => {
                 open_overlay(app, Overlay::Agents);
+                return Ok(false);
+            }
+            _ if key_char_eq(&key, 'o') => {
+                open_overlay(app, Overlay::Providers);
+                return Ok(false);
+            }
+            _ if key_char_eq(&key, 'g') => {
+                open_overlay(app, Overlay::Mcp);
+                return Ok(false);
+            }
+            _ if key_char_eq(&key, 'r') => {
+                open_overlay(app, Overlay::Approvals);
                 return Ok(false);
             }
             KeyCode::Tab => {
@@ -1892,6 +1925,17 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
         }
         _ => Ok(false),
     }
+}
+
+fn cycle_autonomy_from_tui(app: &mut SessionApp) {
+    let next = app.autonomy.cycle();
+    let level = match next {
+        AutonomyLevel::Conservative => "conservative",
+        AutonomyLevel::Balanced => "balanced",
+        AutonomyLevel::Aggressive => "aggressive",
+        AutonomyLevel::Yolo => "yolo",
+    };
+    send_slash(app, &format!("/autonomy {level}"));
 }
 
 fn key_char_eq(key: &KeyEvent, expected: char) -> bool {
@@ -2571,7 +2615,7 @@ fn submit_overlay_selection(app: &mut SessionApp) {
                 send_slash(app, &format!("/model {}", value));
             } else {
                 app.toast = Some((
-                    "Provider not connected. Press Ctrl+Shift+P to connect.".to_string(),
+                    "Provider not connected. Press Ctrl+O or Ctrl+Option+P to connect.".to_string(),
                     Instant::now(),
                 ));
             }
@@ -3499,10 +3543,7 @@ fn render_status(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp, area: Rec
         Style::default().fg(theme.dim),
     ));
     spans.push(Span::styled(" · ", Style::default().fg(theme.dim)));
-    spans.push(Span::styled(
-        "Ctrl+Y autonomy",
-        Style::default().fg(theme.dim),
-    ));
+    spans.push(Span::styled("Ctrl+Y mode", Style::default().fg(theme.dim)));
 
     let status_line = Line::from(spans);
     frame.render_widget(
@@ -3990,7 +4031,12 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
         ("Ctrl+N", "New session"),
         ("Ctrl+Y", "Cycle autonomy"),
         ("Ctrl+A", "Sub-agent queue"),
-        ("Ctrl+Shift+P / M / A", "Providers / MCP / approvals"),
+        (
+            "Ctrl+Shift+P/M/A",
+            "Providers / MCP / approvals when terminal supports enhanced keys",
+        ),
+        ("Ctrl+O / G / R", "Provider / MCP / approvals fallback"),
+        ("Ctrl+Option+P/M/A", "Provider / MCP / approvals fallback"),
         ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / previous session"),
         ("Ctrl+B / Ctrl+D", "Toggle left / right dock"),
         ("Tab", "Autocomplete slash command"),
@@ -4918,6 +4964,67 @@ mod tests {
         .unwrap();
 
         assert_eq!(rx.try_recv().unwrap(), "/autonomy balanced");
+    }
+
+    #[test]
+    fn control_y_sends_canonical_aggressive_level() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = SessionApp::default();
+        app.input_sender = Some(tx);
+        app.autonomy = AutonomyLevel::Balanced;
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .unwrap();
+
+        assert_eq!(rx.try_recv().unwrap(), "/autonomy aggressive");
+    }
+
+    #[test]
+    fn control_option_shortcuts_open_modal_overlays() {
+        let modifiers = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        let mut app = SessionApp::default();
+
+        handle_key_event(KeyEvent::new(KeyCode::Char('p'), modifiers), &mut app).unwrap();
+        assert_eq!(app.overlay, Overlay::Providers);
+
+        app.overlay = Overlay::None;
+        handle_key_event(KeyEvent::new(KeyCode::Char('m'), modifiers), &mut app).unwrap();
+        assert_eq!(app.overlay, Overlay::Mcp);
+
+        app.overlay = Overlay::None;
+        handle_key_event(KeyEvent::new(KeyCode::Char('a'), modifiers), &mut app).unwrap();
+        assert_eq!(app.overlay, Overlay::Approvals);
+    }
+
+    #[test]
+    fn control_fallback_shortcuts_open_modal_overlays() {
+        let mut app = SessionApp::default();
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .unwrap();
+        assert_eq!(app.overlay, Overlay::Providers);
+
+        app.overlay = Overlay::None;
+        handle_key_event(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .unwrap();
+        assert_eq!(app.overlay, Overlay::Mcp);
+
+        app.overlay = Overlay::None;
+        handle_key_event(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .unwrap();
+        assert_eq!(app.overlay, Overlay::Approvals);
     }
 
     #[test]
