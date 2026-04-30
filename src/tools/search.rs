@@ -140,7 +140,7 @@ fn fallback_grep_lines(
     let mut lines = Vec::new();
     for entry in walkdir::WalkDir::new(resolved)
         .into_iter()
-        .filter_entry(|entry| !is_skipped_search_dir(entry.path()))
+        .filter_entry(|entry| !is_skipped_search_entry(entry.path(), resolved))
         .filter_map(Result::ok)
     {
         if !entry.file_type().is_file() {
@@ -162,10 +162,14 @@ fn fallback_grep_lines(
     Ok(lines)
 }
 
-fn is_skipped_search_dir(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| matches!(name, ".git" | "target" | "node_modules"))
+fn is_skipped_search_entry(path: &Path, root: &Path) -> bool {
+    if path == root {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.starts_with('.') || matches!(name, "target" | "node_modules")
 }
 
 fn include_allows_path(path: &Path, root: &Path, include: Option<&str>) -> bool {
@@ -313,6 +317,42 @@ mod tests {
                 .and_then(|meta| meta.get("match_count"))
                 .and_then(Value::as_u64),
             Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_search_fallback_skips_hidden_session_state_like_rg() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".charm").join("sessions")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join(".charm")
+                .join("sessions")
+                .join("messages.json"),
+            "write_file delete scope guard",
+        )
+        .unwrap();
+
+        let result = grep_search_with_binary(
+            serde_json::json!({
+                "pattern": "write_file",
+                "output_mode": "content"
+            }),
+            dir.path(),
+            "__missing_rg_for_test__",
+        )
+        .await
+        .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.output, "(no matches)");
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("match_count"))
+                .and_then(Value::as_u64),
+            Some(0)
         );
     }
 }
