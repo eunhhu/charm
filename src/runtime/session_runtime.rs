@@ -1748,7 +1748,7 @@ impl SessionRuntime {
             ["/clear"] => Ok(Some(self.clear_transcript())),
             ["/new"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
                 role: "assistant".to_string(),
-                content: "Start a new session with `charm --new` or Ctrl+N. The TUI will spin up a fresh session in a moment.".to_string(),
+                content: "Start a new session with `charm new` or Ctrl+N. The TUI will spin up a fresh session in a moment.".to_string(),
             }])),
             ["/session"] | ["/sessions"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
                 role: "assistant".to_string(),
@@ -2156,7 +2156,7 @@ impl SessionRuntime {
             ));
         }
         lines.push(String::new());
-        lines.push("Use /provider connect <provider> for setup instructions.".to_string());
+        lines.push("Use /provider connect <provider> to open the REPL connector.".to_string());
         lines.push("Use /model <provider/model-id> to switch provider and model.".to_string());
         lines.join("\n")
     }
@@ -3338,22 +3338,22 @@ fn provider_display_name(provider: &str) -> &'static str {
 fn provider_connection_content(provider: &str) -> String {
     match provider {
         "openai" => {
-            "Set OPENAI_API_KEY in your shell, then restart Charm or launch the TUI from that shell.\n\nExample:\n  export OPENAI_API_KEY=\"sk-...\"\n\nSwitch with:\n  /model openai/gpt-4.1".to_string()
+            "Connect OpenAI inside the TUI with:\n  /provider connect openai\n\nPaste an OpenAI API key when prompted. Charm saves it to ~/.charm/auth.json.\n\nSwitch with:\n  /model openai/gpt-4.1".to_string()
         }
         "openai-codex" => {
-            "OpenAI Codex reuses Codex CLI auth.\n\nRun:\n  codex login\n\nSwitch with:\n  /model openai-codex/gpt-5.1-codex".to_string()
+            "Connect OpenAI Codex inside the TUI with:\n  /provider connect openai-codex\n\nPaste a Codex access token when prompted. Charm saves it to ~/.charm/auth.json. Existing Codex login is still reused when present.\n\nSwitch with:\n  /model openai-codex/gpt-5.1-codex".to_string()
         }
         "anthropic" => {
-            "Set ANTHROPIC_API_KEY in your shell, then restart Charm or launch the TUI from that shell.\n\nExample:\n  export ANTHROPIC_API_KEY=\"sk-ant-...\"\n\nSwitch with:\n  /model anthropic/claude-sonnet-4-20250514".to_string()
+            "Connect Anthropic inside the TUI with:\n  /provider connect anthropic\n\nPaste an Anthropic API key when prompted. Charm saves it to ~/.charm/auth.json.\n\nSwitch with:\n  /model anthropic/claude-sonnet-4-20250514".to_string()
         }
         "google" => {
-            "Set GEMINI_API_KEY or GOOGLE_API_KEY in your shell, then restart Charm or launch the TUI from that shell.\n\nExample:\n  export GEMINI_API_KEY=\"...\"\n\nSwitch with:\n  /model google/gemini-2.5-pro".to_string()
+            "Connect Google Gemini inside the TUI with:\n  /provider connect google\n\nPaste a Gemini API key when prompted. Charm saves it to ~/.charm/auth.json.\n\nSwitch with:\n  /model google/gemini-2.5-pro".to_string()
         }
         "ollama" => {
             "Run Ollama locally, then choose an installed model.\n\nExample:\n  ollama serve\n  ollama pull qwen3-coder:30b\n\nSwitch with:\n  /model ollama/qwen3-coder:30b".to_string()
         }
         "openrouter" => {
-            "Set OPENROUTER_API_KEY in your shell, then restart Charm or launch the TUI from that shell.\n\nExample:\n  export OPENROUTER_API_KEY=\"sk-or-...\"\n\nSwitch with:\n  /model openrouter/moonshotai/kimi-k2.6".to_string()
+            "Connect OpenRouter inside the TUI with:\n  /provider connect openrouter\n\nPaste an OpenRouter API key when prompted. Charm saves it to ~/.charm/auth.json.\n\nSwitch with:\n  /model openrouter/moonshotai/kimi-k2.6".to_string()
         }
         other => format!(
             "Unknown provider `{other}`.\n\nKnown providers: openrouter, openai, openai-codex, anthropic, google, ollama."
@@ -5866,7 +5866,7 @@ tokio = "1.44"
         assert!(events.iter().any(|event| matches!(
             event,
             RuntimeEvent::Modal { title, content }
-                if title.contains("OpenAI") && content.contains("OPENAI_API_KEY")
+                if title.contains("OpenAI") && content.contains("~/.charm/auth.json")
         )));
     }
 

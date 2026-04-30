@@ -103,17 +103,23 @@ charm
 charm "이 프로젝트 설명해줘"
 
 # 특정 모델 사용
-charm --model claude-sonnet-4-5 "리팩토링해줘"
-charm --model openai/gpt-4.1 "버그 수정해줘"
+charm model claude-sonnet-4-5 "리팩토링해줘"
+charm model openai/gpt-4.1 "버그 수정해줘"
 
 # 새 세션 시작
-charm --new
+charm new
 
 # 마지막 세션 이어하기
-charm --continue
+charm resume
 
 # 특정 세션 ID로 재개
-charm --session <session-id>
+charm session <session-id>
+
+# 다른 워크스페이스에서 시작
+charm workspace /path/to/project
+
+# 다른 워크스페이스에서 명령 실행
+charm workspace /path/to/project index
 ```
 
 ### 워크스페이스 초기화
@@ -184,21 +190,21 @@ export OLLAMA_API_KEY="ollama"  # 선택사항
 
 TUI에서는 `Ctrl+Shift+P` 또는 `/provider`로 provider 연결 상태를 확인합니다.
 mac/terminal이 `Ctrl+Shift+letter`를 앱까지 전달하지 못하면 `Ctrl+O` 또는 `Ctrl+Option+P`를 사용하세요.
-연결된 provider를 선택하면 해당 provider 모델 목록으로 바로 이동하고, 미연결 provider를 선택하면 설정 안내 modal이 열립니다.
+연결된 provider를 선택하면 해당 provider 모델 목록으로 바로 이동하고, 미연결 provider를 선택하면 REPL 안에서 auth wizard가 열립니다.
 
 ### 모델 지정 방식
 ```bash
 # provider/model 형식
-charm --model anthropic/claude-sonnet-4-5
-charm --model openai/gpt-4.1
-charm --model google/gemini-2.5-pro
-charm --model ollama/qwen3-coder:30b
+charm model anthropic/claude-sonnet-4-5
+charm model openai/gpt-4.1
+charm model google/gemini-2.5-pro
+charm model ollama/qwen3-coder:30b
 
 # 자동 provider 감지
-charm --model claude-...        # anthropic
-charm --model gpt-...           # openai
-charm --model gemini-...        # google
-charm --model <name>:<tag>      # ollama
+charm model claude-...        # anthropic
+charm model gpt-...           # openai
+charm model gemini-...        # google
+charm model <name>:<tag>      # ollama
 ```
 
 세션 중에는 `/model provider/model-id`로 provider client까지 재연결합니다.

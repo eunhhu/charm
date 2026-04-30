@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod auth_store;
 pub mod client;
 pub mod factory;
 pub mod google;

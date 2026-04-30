@@ -1,4 +1,5 @@
 use crate::providers::anthropic::AnthropicClient;
+use crate::providers::auth_store::{auth_file_path, load_provider_auth_from_path};
 use crate::providers::client::ProviderClient;
 use crate::providers::google::GoogleClient;
 use crate::providers::ollama::OllamaClient;
@@ -136,7 +137,7 @@ pub fn resolve_model_selection(
             && explicit != provider
         {
             anyhow::bail!(
-                "model `{}` implies provider `{}`, but `--provider {}` was requested",
+                "model `{}` implies provider `{}`, but explicit provider `{}` was requested",
                 trimmed,
                 provider.id(),
                 explicit.id()
@@ -175,8 +176,9 @@ pub fn resolve_provider_session(
 
 pub fn resolve_provider_auth(provider: &Provider) -> anyhow::Result<ProviderAuth> {
     let env = process_env();
+    let charm_auth = auth_file_path();
     let codex_home = codex_home_path();
-    resolve_provider_auth_inner(provider, &env, codex_home.as_deref())
+    resolve_provider_auth_inner(provider, &env, charm_auth.as_deref(), codex_home.as_deref())
 }
 
 pub fn resolve_api_key_with_provider(
@@ -203,6 +205,7 @@ fn split_provider_prefix(raw_model: &str) -> Option<(Provider, String)> {
 fn resolve_provider_auth_inner(
     provider: &Provider,
     env: &HashMap<String, String>,
+    charm_auth: Option<&Path>,
     codex_home: Option<&Path>,
 ) -> anyhow::Result<ProviderAuth> {
     match provider {
@@ -212,6 +215,10 @@ fn resolve_provider_auth_inner(
                     token,
                     account_id: None,
                 });
+            }
+
+            if let Some(auth) = load_charm_provider_auth(charm_auth, provider)? {
+                return Ok(auth);
             }
 
             if let Some(file) = load_codex_auth_file(codex_home)?
@@ -224,11 +231,17 @@ fn resolve_provider_auth_inner(
                 });
             }
 
-            anyhow::bail!("OPENAI_API_KEY must be set")
+            anyhow::bail!(
+                "OpenAI is not connected. Use `/provider connect openai` in Charm or set OPENAI_API_KEY."
+            )
         }
         Provider::OpenAiCodex => {
+            if let Some(auth) = load_charm_provider_auth(charm_auth, provider)? {
+                return Ok(auth);
+            }
+
             let file = load_codex_auth_file(codex_home)?
-                .context("OpenAI Codex auth not found. Sign into Codex first.")?;
+                .context("OpenAI Codex auth not found. Use `/provider connect openai-codex` in Charm or sign into Codex first.")?;
             let tokens = file
                 .tokens
                 .context("OpenAI Codex auth file is missing token data")?;
@@ -243,34 +256,73 @@ fn resolve_provider_auth_inner(
             })
         }
         Provider::Anthropic => {
-            let token =
-                first_env(env, &["ANTHROPIC_API_KEY"]).context("ANTHROPIC_API_KEY must be set")?;
-            Ok(ProviderAuth {
-                token,
-                account_id: None,
-            })
+            if let Some(token) = first_env(env, &["ANTHROPIC_API_KEY"]) {
+                return Ok(ProviderAuth {
+                    token,
+                    account_id: None,
+                });
+            }
+            if let Some(auth) = load_charm_provider_auth(charm_auth, provider)? {
+                return Ok(auth);
+            }
+            anyhow::bail!(
+                "Anthropic is not connected. Use `/provider connect anthropic` in Charm or set ANTHROPIC_API_KEY."
+            );
         }
         Provider::Google => {
-            let token = first_env(env, &["GEMINI_API_KEY", "GOOGLE_API_KEY"])
-                .context("GEMINI_API_KEY or GOOGLE_API_KEY must be set")?;
+            if let Some(token) = first_env(env, &["GEMINI_API_KEY", "GOOGLE_API_KEY"]) {
+                return Ok(ProviderAuth {
+                    token,
+                    account_id: None,
+                });
+            }
+            if let Some(auth) = load_charm_provider_auth(charm_auth, provider)? {
+                return Ok(auth);
+            }
+            anyhow::bail!(
+                "Google is not connected. Use `/provider connect google` in Charm or set GEMINI_API_KEY."
+            );
+        }
+        Provider::Ollama => {
+            if let Some(token) = first_env(env, &["OLLAMA_API_KEY"]) {
+                return Ok(ProviderAuth {
+                    token,
+                    account_id: None,
+                });
+            }
+            if let Some(auth) = load_charm_provider_auth(charm_auth, provider)? {
+                return Ok(auth);
+            }
             Ok(ProviderAuth {
-                token,
+                token: "ollama".to_string(),
                 account_id: None,
             })
         }
-        Provider::Ollama => Ok(ProviderAuth {
-            token: first_env(env, &["OLLAMA_API_KEY"]).unwrap_or_else(|| "ollama".to_string()),
-            account_id: None,
-        }),
         Provider::OpenRouter => {
-            let token = first_env(env, &["OPENROUTER_API_KEY"])
-                .context("OPENROUTER_API_KEY must be set")?;
-            Ok(ProviderAuth {
-                token,
-                account_id: None,
-            })
+            if let Some(token) = first_env(env, &["OPENROUTER_API_KEY"]) {
+                return Ok(ProviderAuth {
+                    token,
+                    account_id: None,
+                });
+            }
+            if let Some(auth) = load_charm_provider_auth(charm_auth, provider)? {
+                return Ok(auth);
+            }
+            anyhow::bail!(
+                "OpenRouter is not connected. Use `/provider connect openrouter` in Charm or set OPENROUTER_API_KEY."
+            );
         }
     }
+}
+
+fn load_charm_provider_auth(
+    charm_auth: Option<&Path>,
+    provider: &Provider,
+) -> anyhow::Result<Option<ProviderAuth>> {
+    let Some(path) = charm_auth else {
+        return Ok(None);
+    };
+    load_provider_auth_from_path(path, provider.id())
 }
 
 fn first_env(env: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
@@ -382,8 +434,9 @@ mod tests {
         .expect("write auth");
 
         let env = HashMap::new();
-        let auth = resolve_provider_auth_inner(&Provider::OpenAiCodex, &env, Some(temp.path()))
-            .expect("auth");
+        let auth =
+            resolve_provider_auth_inner(&Provider::OpenAiCodex, &env, None, Some(temp.path()))
+                .expect("auth");
         assert_eq!(
             auth,
             ProviderAuth {
@@ -406,8 +459,8 @@ mod tests {
         .expect("write auth");
 
         let env = HashMap::new();
-        let auth =
-            resolve_provider_auth_inner(&Provider::OpenAi, &env, Some(temp.path())).expect("auth");
+        let auth = resolve_provider_auth_inner(&Provider::OpenAi, &env, None, Some(temp.path()))
+            .expect("auth");
         assert_eq!(
             auth,
             ProviderAuth {
@@ -420,7 +473,64 @@ mod tests {
     #[test]
     fn google_accepts_both_common_env_vars() {
         let env = HashMap::from([("GOOGLE_API_KEY".to_string(), "google-key".to_string())]);
-        let auth = resolve_provider_auth_inner(&Provider::Google, &env, None).expect("auth");
+        let auth = resolve_provider_auth_inner(&Provider::Google, &env, None, None).expect("auth");
         assert_eq!(auth.token, "google-key");
+    }
+
+    #[test]
+    fn openrouter_key_falls_back_to_charm_auth_store() {
+        let temp = tempdir().expect("tempdir");
+        let charm_auth = temp.path().join("auth.json");
+        std::fs::write(
+            &charm_auth,
+            serde_json::json!({
+                "providers": {
+                    "openrouter": {
+                        "token": "sk-or-from-charm"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write auth");
+
+        let env = HashMap::new();
+        let auth =
+            resolve_provider_auth_inner(&Provider::OpenRouter, &env, Some(&charm_auth), None)
+                .expect("auth");
+        assert_eq!(
+            auth,
+            ProviderAuth {
+                token: "sk-or-from-charm".to_string(),
+                account_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn env_key_wins_over_charm_auth_store() {
+        let temp = tempdir().expect("tempdir");
+        let charm_auth = temp.path().join("auth.json");
+        std::fs::write(
+            &charm_auth,
+            serde_json::json!({
+                "providers": {
+                    "openrouter": {
+                        "token": "sk-or-from-charm"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write auth");
+
+        let env = HashMap::from([(
+            "OPENROUTER_API_KEY".to_string(),
+            "sk-or-from-env".to_string(),
+        )]);
+        let auth =
+            resolve_provider_auth_inner(&Provider::OpenRouter, &env, Some(&charm_auth), None)
+                .expect("auth");
+        assert_eq!(auth.token, "sk-or-from-env");
     }
 }

@@ -35,8 +35,8 @@ Charm은 모듈식 설계를 따르며, 각 컴포넌트는 명확한 책임을 
 - **주요 기능**:
   - 상위 명령 (init, index, tools, exec, delegate)
   - 대화형 모드 (prompt 인자 또는 인자 없음)
-  - 세션 관리 (--new, --continue, --session)
-  - 모델/Provider 선택 (--model, --provider)
+  - 세션 관리 subcommand (new, resume, session)
+  - 모델 선택 subcommand (model)
 
 ### `runtime` (`src/runtime/`)
 - **`session_runtime.rs`**: 세션 라이프사이클 관리, TUI-에이전트 브리지
@@ -179,4 +179,4 @@ Charm은 모듈식 설계를 따르며, 각 컴포넌트는 명확한 책임을 
 
 ### Session Management
 - 세션 ID 기반 상태 지속성
-- --continue로 이전 세션 복원 가능
+- `charm resume`으로 이전 세션 복원 가능

@@ -1,3 +1,5 @@
+use crate::providers::auth_store::{save_provider_auth, save_provider_auth_to_path};
+use crate::providers::factory::{Provider, ProviderAuth, resolve_provider_auth};
 use crate::runtime::session_runtime::SessionRuntime;
 use crate::runtime::types::{
     ApprovalRequest, ApprovalStatus, AutonomyLevel, BackgroundJob, BackgroundJobKind,
@@ -466,7 +468,7 @@ pub fn command_catalog() -> Vec<CommandItem> {
         },
         CommandItem {
             command: "/provider connect <id>",
-            description: "Show provider setup instructions",
+            description: "Connect provider in the REPL",
             category: CommandCategory::Session,
         },
         CommandItem {
@@ -629,6 +631,7 @@ pub enum Overlay {
     Mcp,
     Skills,
     TextModal,
+    ProviderAuth,
 }
 
 impl Overlay {
@@ -771,6 +774,9 @@ pub struct SessionApp {
     pub provider_filter: Option<String>,
     pub modal_title: String,
     pub modal_content: String,
+    pub provider_auth_provider: String,
+    pub provider_auth_input: InputState,
+    pub provider_auth_path_override: Option<std::path::PathBuf>,
     pub skills: Vec<SkillEntry>,
     /// Which role is currently streaming. `None` means no stream is
     /// in-flight, so the next `StreamDelta` must open a new transcript row
@@ -830,6 +836,9 @@ impl Default for SessionApp {
             provider_filter: None,
             modal_title: String::new(),
             modal_content: String::new(),
+            provider_auth_provider: String::new(),
+            provider_auth_input: InputState::default(),
+            provider_auth_path_override: None,
             skills: Vec::new(),
             active_stream_role: None,
         }
@@ -1460,7 +1469,11 @@ fn run_loop(
                 handle_mouse_event(mouse, app);
             }
             Event::Paste(text) => {
-                app.input.insert_str(&text);
+                if app.overlay == Overlay::ProviderAuth {
+                    app.provider_auth_input.insert_str(&text);
+                } else {
+                    app.input.insert_str(&text);
+                }
             }
             Event::Resize(_, _) => {
                 // Re-pin to bottom on resize so wrapping stays coherent.
@@ -1903,20 +1916,7 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
                 app.input.insert_newline();
                 return Ok(false);
             }
-            if app.processing {
-                app.toast = Some((
-                    "A turn is still running. Wait for it to finish before sending.".to_string(),
-                    Instant::now(),
-                ));
-                return Ok(false);
-            }
-            if let Some(input) = app.input.submit() {
-                app.processing = true;
-                app.scroll_pinned = true;
-                if let Some(sender) = &app.input_sender {
-                    let _ = sender.send(input);
-                }
-            }
+            submit_composer_input(app);
             Ok(false)
         }
         KeyCode::Char(ch) => {
@@ -1951,12 +1951,20 @@ fn key_char_is_uppercase(key: &KeyEvent) -> bool {
 fn handle_overlay_key(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool> {
     match key.code {
         KeyCode::Esc => {
+            if app.overlay == Overlay::ProviderAuth {
+                app.provider_auth_input.clear();
+                app.provider_auth_provider.clear();
+            }
             app.overlay = Overlay::None;
             app.provider_filter = None;
             app.dialog_state.reset();
             return Ok(false);
         }
         _ => {}
+    }
+
+    if app.overlay == Overlay::ProviderAuth {
+        return handle_provider_auth_key(key, app);
     }
 
     if matches!(app.overlay, Overlay::Help | Overlay::TextModal) {
@@ -2064,6 +2072,37 @@ fn handle_overlay_key(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<boo
     Ok(false)
 }
 
+fn handle_provider_auth_key(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool> {
+    match key.code {
+        KeyCode::Enter => {
+            submit_provider_auth(app);
+        }
+        KeyCode::Backspace => {
+            app.provider_auth_input.backspace();
+        }
+        KeyCode::Delete => {
+            app.provider_auth_input.delete();
+        }
+        KeyCode::Left => {
+            app.provider_auth_input.move_left();
+        }
+        KeyCode::Right => {
+            app.provider_auth_input.move_right();
+        }
+        KeyCode::Home => {
+            app.provider_auth_input.move_home();
+        }
+        KeyCode::End => {
+            app.provider_auth_input.move_end();
+        }
+        KeyCode::Char(ch) => {
+            app.provider_auth_input.insert(ch);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
 fn open_overlay(app: &mut SessionApp, next: Overlay) {
     if app.overlay == next {
         app.overlay = Overlay::None;
@@ -2073,6 +2112,30 @@ fn open_overlay(app: &mut SessionApp, next: Overlay) {
     app.overlay = next;
     app.dialog_state.reset();
     app.overlay_index = 0;
+}
+
+fn submit_composer_input(app: &mut SessionApp) {
+    if app.processing {
+        app.toast = Some((
+            "A turn is still running. Wait for it to finish before sending.".to_string(),
+            Instant::now(),
+        ));
+        return;
+    }
+    if let Some(input) = app.input.submit() {
+        if try_handle_local_command(app, &input) {
+            return;
+        }
+        queue_runtime_input(app, input);
+    }
+}
+
+fn queue_runtime_input(app: &mut SessionApp, input: String) {
+    app.processing = true;
+    app.scroll_pinned = true;
+    if let Some(sender) = &app.input_sender {
+        let _ = sender.send(input);
+    }
 }
 
 fn send_slash(app: &mut SessionApp, command: &str) {
@@ -2086,11 +2149,34 @@ fn send_slash(app: &mut SessionApp, command: &str) {
     app.input.buffer = command.to_string();
     app.input.cursor = app.input.buffer.len();
     if let Some(input) = app.input.submit() {
-        app.processing = true;
-        app.scroll_pinned = true;
-        if let Some(sender) = &app.input_sender {
-            let _ = sender.send(input);
+        if try_handle_local_command(app, &input) {
+            return;
         }
+        queue_runtime_input(app, input);
+    }
+}
+
+fn try_handle_local_command(app: &mut SessionApp, input: &str) -> bool {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    match parts.as_slice() {
+        ["/provider"] | ["/providers"] => {
+            open_overlay(app, Overlay::Providers);
+            true
+        }
+        ["/provider", "connect"] | ["/providers", "connect"] => {
+            open_overlay(app, Overlay::Providers);
+            app.toast = Some(("Choose a provider to connect.".to_string(), Instant::now()));
+            true
+        }
+        ["/provider", "connect", provider] | ["/providers", "connect", provider] => {
+            open_provider_auth(app, provider);
+            true
+        }
+        ["/auth", provider] | ["/connect", provider] => {
+            open_provider_auth(app, provider);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -2225,7 +2311,7 @@ fn current_overlay_options(app: &SessionApp) -> Vec<DialogOption> {
         Overlay::Providers => providers_options(app),
         Overlay::Mcp => mcp_options(app),
         Overlay::Skills => skills_options(app),
-        Overlay::Help | Overlay::TextModal | Overlay::None => Vec::new(),
+        Overlay::Help | Overlay::TextModal | Overlay::ProviderAuth | Overlay::None => Vec::new(),
     }
 }
 
@@ -2383,7 +2469,7 @@ fn autonomy_options(app: &SessionApp) -> Vec<DialogOption> {
 
 fn providers_options(app: &SessionApp) -> Vec<DialogOption> {
     // Static list of providers we know about, augmented with dynamic auth
-    // status via env-vars + ~/.codex/auth.json.
+    // status via env-vars + ~/.charm/auth.json + legacy Codex auth.
     const PROVIDERS: &[(&str, &str)] = &[
         ("openrouter", "OpenRouter"),
         ("openai", "OpenAI"),
@@ -2430,90 +2516,36 @@ fn provider_display_name(id: &str) -> String {
 }
 
 fn provider_has_auth(id: &str) -> bool {
-    match id {
-        "openai" => std::env::var("OPENAI_API_KEY").is_ok() || codex_auth_has_openai_key(),
-        "openai-codex" => codex_auth_has_access_token(),
-        "anthropic" => std::env::var("ANTHROPIC_API_KEY").is_ok(),
-        "google" => {
-            std::env::var("GEMINI_API_KEY").is_ok() || std::env::var("GOOGLE_API_KEY").is_ok()
-        }
-        "openrouter" => std::env::var("OPENROUTER_API_KEY").is_ok(),
-        "ollama" => true, // local — no auth needed.
-        _ => false,
-    }
-}
-
-fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
+    Provider::from_id(id)
+        .map(|provider| resolve_provider_auth(&provider).is_ok())
+        .unwrap_or(false)
 }
 
 fn provider_auth_hint(id: &str) -> String {
     match id {
-        "openai" => "Set OPENAI_API_KEY".to_string(),
-        "openai-codex" => "Run `codex login`".to_string(),
-        "anthropic" => "Set ANTHROPIC_API_KEY".to_string(),
-        "google" => "Set GEMINI_API_KEY or GOOGLE_API_KEY".to_string(),
-        "openrouter" => "Set OPENROUTER_API_KEY".to_string(),
+        "openai" => "Connect here or use OPENAI_API_KEY".to_string(),
+        "openai-codex" => "Connect here or reuse Codex login".to_string(),
+        "anthropic" => "Connect here or use ANTHROPIC_API_KEY".to_string(),
+        "google" => "Connect here or use GEMINI_API_KEY".to_string(),
+        "openrouter" => "Connect here or use OPENROUTER_API_KEY".to_string(),
         "ollama" => "Run `ollama serve` locally".to_string(),
         _ => String::new(),
     }
 }
 
-fn provider_connection_modal_content(id: &str) -> String {
+fn provider_auth_token_label(id: &str) -> &'static str {
     match id {
-        "openai" => {
-            "Set OPENAI_API_KEY in the shell that launches Charm.\n\nExample:\n  export OPENAI_API_KEY=\"sk-...\"\n\nThen switch with:\n  /model openai/gpt-4.1".to_string()
-        }
-        "openai-codex" => {
-            "OpenAI Codex reuses Codex CLI auth.\n\nRun:\n  codex login\n\nThen switch with:\n  /model openai-codex/gpt-5.1-codex".to_string()
-        }
-        "anthropic" => {
-            "Set ANTHROPIC_API_KEY in the shell that launches Charm.\n\nExample:\n  export ANTHROPIC_API_KEY=\"sk-ant-...\"\n\nThen switch with:\n  /model anthropic/claude-sonnet-4-20250514".to_string()
-        }
-        "google" => {
-            "Set GEMINI_API_KEY or GOOGLE_API_KEY in the shell that launches Charm.\n\nExample:\n  export GEMINI_API_KEY=\"...\"\n\nThen switch with:\n  /model google/gemini-2.5-pro".to_string()
-        }
-        "ollama" => {
-            "Run Ollama locally, then choose an installed model.\n\nExample:\n  ollama serve\n  ollama pull qwen3-coder:30b\n\nThen switch with:\n  /model ollama/qwen3-coder:30b".to_string()
-        }
-        "openrouter" => {
-            "Set OPENROUTER_API_KEY in the shell that launches Charm.\n\nExample:\n  export OPENROUTER_API_KEY=\"sk-or-...\"\n\nThen switch with:\n  /model openrouter/moonshotai/kimi-k2.6".to_string()
-        }
-        other => format!("Unknown provider `{other}`."),
+        "openai-codex" => "Codex access token",
+        "google" => "Gemini API key",
+        "anthropic" => "Anthropic API key",
+        "openrouter" => "OpenRouter API key",
+        "openai" => "OpenAI API key",
+        _ => "API key",
     }
 }
 
 fn canonical_model_value(provider: &str, model_id: &str) -> String {
     format!("{provider}/{model_id}")
-}
-
-fn codex_auth_has_openai_key() -> bool {
-    codex_auth_value()
-        .and_then(|value| {
-            value
-                .get("OPENAI_API_KEY")
-                .and_then(|key| key.as_str())
-                .map(|key| !key.trim().is_empty())
-        })
-        .unwrap_or(false)
-}
-
-fn codex_auth_has_access_token() -> bool {
-    codex_auth_value()
-        .and_then(|value| {
-            value
-                .get("tokens")
-                .and_then(|tokens| tokens.get("access_token"))
-                .and_then(|token| token.as_str())
-                .map(|token| !token.trim().is_empty())
-        })
-        .unwrap_or(false)
-}
-
-fn codex_auth_value() -> Option<serde_json::Value> {
-    let home = dirs_home()?;
-    let body = std::fs::read_to_string(home.join(".codex/auth.json")).ok()?;
-    serde_json::from_str(&body).ok()
 }
 
 fn mcp_options(app: &SessionApp) -> Vec<DialogOption> {
@@ -2613,6 +2645,9 @@ fn submit_overlay_selection(app: &mut SessionApp) {
         Overlay::ModelSwitcher => {
             if !disabled {
                 send_slash(app, &format!("/model {}", value));
+            } else if let Some(provider_id) = provider_id_from_model_value(&value) {
+                open_provider_auth(app, provider_id);
+                return;
             } else {
                 app.toast = Some((
                     "Provider not connected. Press Ctrl+O or Ctrl+Option+P to connect.".to_string(),
@@ -2648,11 +2683,7 @@ fn submit_overlay_selection(app: &mut SessionApp) {
                 app.dialog_state.reset();
                 return;
             }
-            open_text_modal(
-                app,
-                format!("{} Connection", provider_display_name(&value)),
-                provider_connection_modal_content(&value),
-            );
+            open_provider_auth(app, &value);
             return;
         }
         Overlay::Mcp => {
@@ -2664,7 +2695,7 @@ fn submit_overlay_selection(app: &mut SessionApp) {
             app.input.buffer = format!("/workflow {}", value);
             app.input.cursor = app.input.buffer.len();
         }
-        Overlay::Help | Overlay::TextModal | Overlay::None => {}
+        Overlay::Help | Overlay::TextModal | Overlay::ProviderAuth | Overlay::None => {}
     }
 
     app.overlay = Overlay::None;
@@ -2690,12 +2721,81 @@ fn palette_command_executes_immediately(command: &str) -> bool {
     )
 }
 
-fn open_text_modal(app: &mut SessionApp, title: impl Into<String>, content: impl Into<String>) {
-    app.modal_title = title.into();
-    app.modal_content = content.into();
-    app.overlay = Overlay::TextModal;
+fn provider_id_from_model_value(value: &str) -> Option<&str> {
+    value.split_once('/').map(|(provider, _)| provider)
+}
+
+fn open_provider_auth(app: &mut SessionApp, provider_id: &str) {
+    let provider_id = provider_id.trim();
+    if provider_id == "ollama" {
+        app.provider_filter = Some(provider_id.to_string());
+        app.overlay = Overlay::ModelSwitcher;
+        app.dialog_state.reset();
+        app.toast = Some((
+            "Ollama uses the local server; choose a model.".to_string(),
+            Instant::now(),
+        ));
+        return;
+    }
+    if Provider::from_id(provider_id).is_none() {
+        app.toast = Some((format!("Unknown provider: {provider_id}"), Instant::now()));
+        return;
+    }
+    app.provider_auth_provider = provider_id.to_string();
+    app.provider_auth_input.clear();
+    app.overlay = Overlay::ProviderAuth;
     app.provider_filter = None;
     app.dialog_state.reset();
+}
+
+fn submit_provider_auth(app: &mut SessionApp) {
+    let provider_id = app.provider_auth_provider.trim().to_string();
+    if provider_id.is_empty() {
+        app.toast = Some(("No provider selected.".to_string(), Instant::now()));
+        return;
+    }
+    let token = app.provider_auth_input.as_str().trim().to_string();
+    if token.is_empty() {
+        app.toast = Some((
+            format!("Enter {} first.", provider_auth_token_label(&provider_id)),
+            Instant::now(),
+        ));
+        return;
+    }
+
+    let auth = ProviderAuth {
+        token,
+        account_id: None,
+    };
+    let saved = match app.provider_auth_path_override.as_deref() {
+        Some(path) => {
+            save_provider_auth_to_path(path, &provider_id, auth).map(|_| path.to_path_buf())
+        }
+        None => save_provider_auth(&provider_id, auth),
+    };
+
+    match saved {
+        Ok(path) => {
+            app.provider_auth_input.clear();
+            app.provider_filter = Some(provider_id.clone());
+            app.overlay = Overlay::ModelSwitcher;
+            app.dialog_state.reset();
+            app.toast = Some((
+                format!(
+                    "{} connected. Saved to {}.",
+                    provider_display_name(&provider_id),
+                    path.display()
+                ),
+                Instant::now(),
+            ));
+        }
+        Err(err) => {
+            app.toast = Some((
+                format!("Failed to save provider auth: {err}"),
+                Instant::now(),
+            ));
+        }
+    }
 }
 
 fn submit_selected_agent_action(app: &mut SessionApp, action: &str) {
@@ -2799,6 +2899,8 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp) {
         render_help_overlay(frame, app);
     } else if app.overlay == Overlay::TextModal {
         render_text_modal(frame, app);
+    } else if app.overlay == Overlay::ProviderAuth {
+        render_provider_auth_overlay(frame, app);
     } else if app.overlay.is_dialog_select() {
         render_dialog_overlay(frame, app);
     }
@@ -2896,7 +2998,7 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp) {
             vec![KeybindHint::new("↵", "insert")],
             None,
         ),
-        Overlay::Help | Overlay::TextModal | Overlay::None => return,
+        Overlay::Help | Overlay::TextModal | Overlay::ProviderAuth | Overlay::None => return,
     };
 
     let props = DialogSelectProps {
@@ -4183,6 +4285,86 @@ fn render_text_modal(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
     );
 }
 
+fn render_provider_auth_overlay(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
+    let theme = &app.theme;
+    let area = centered_rect(68, 42, frame.area());
+    frame.render_widget(Clear, area);
+
+    let provider_id = app.provider_auth_provider.as_str();
+    let provider_name = provider_display_name(provider_id);
+    let masked = if app.provider_auth_input.is_empty() {
+        "<paste token>".to_string()
+    } else {
+        "*".repeat(app.provider_auth_input.as_str().chars().count())
+    };
+    let cursor = if app.cursor_visible { " " } else { "" };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Provider: ", Style::default().fg(theme.dim)),
+            Span::styled(
+                provider_name.clone(),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "Paste {}. Enter saves. Esc cancels.",
+                provider_auth_token_label(provider_id)
+            ),
+            Style::default().fg(theme.text_secondary),
+        )),
+        Line::from(Span::styled(
+            "Stored locally at ~/.charm/auth.json.",
+            Style::default().fg(theme.text_secondary),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                format!("{}: ", provider_auth_token_label(provider_id)),
+                Style::default().fg(theme.dock_title),
+            ),
+            Span::styled(
+                format!("{masked}{cursor}"),
+                Style::default()
+                    .fg(if app.provider_auth_input.is_empty() {
+                        theme.dim
+                    } else {
+                        theme.text_primary
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "No secret is sent to the transcript.",
+            Style::default().fg(theme.dim),
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        format!(" {} Connection ", provider_name),
+                        Style::default()
+                            .fg(theme.dock_title)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.border_focused))
+                    .style(Style::default().bg(theme.bg_secondary))
+                    .padding(Padding::new(1, 1, 1, 1)),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 #[allow(dead_code)] // replaced by render_dialog_overlay; kept for reference
 fn render_autonomy_overlay(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
     let theme = &app.theme;
@@ -5179,6 +5361,41 @@ mod tests {
 
         assert_eq!(app.overlay, Overlay::ModelSwitcher);
         assert_eq!(app.provider_filter.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn local_provider_connect_command_opens_auth_overlay_without_runtime_send() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = SessionApp::default();
+        app.input_sender = Some(tx);
+        app.input.insert_str("/provider connect openrouter");
+
+        handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app).unwrap();
+
+        assert_eq!(app.overlay, Overlay::ProviderAuth);
+        assert_eq!(app.provider_auth_provider, "openrouter");
+        assert!(rx.try_recv().is_err());
+        assert!(!app.processing);
+    }
+
+    #[test]
+    fn provider_auth_overlay_saves_token_and_opens_filtered_models() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp.path().join("auth.json");
+        let mut app = SessionApp::default();
+        app.provider_auth_path_override = Some(auth_path.clone());
+        open_provider_auth(&mut app, "openrouter");
+        app.provider_auth_input.insert_str("sk-or-test");
+
+        handle_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app).unwrap();
+
+        let loaded =
+            crate::providers::auth_store::load_provider_auth_from_path(&auth_path, "openrouter")
+                .expect("load auth")
+                .expect("auth exists");
+        assert_eq!(loaded.token, "sk-or-test");
+        assert_eq!(app.overlay, Overlay::ModelSwitcher);
+        assert_eq!(app.provider_filter.as_deref(), Some("openrouter"));
     }
 
     #[test]
