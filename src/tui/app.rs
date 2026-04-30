@@ -1370,6 +1370,7 @@ pub fn run_session_tui(
             PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
             )
         )?;
@@ -1636,6 +1637,8 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
     // ===== Global ctrl+shift combinations =====
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let shifted_char = key_char_is_uppercase(&key);
+    let effective_shift = shift || shifted_char;
     let option_like = key
         .modifiers
         .intersects(KeyModifiers::ALT | KeyModifiers::META);
@@ -1685,17 +1688,17 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
         }
     }
 
-    if ctrl && shift {
+    if ctrl && effective_shift {
         match key.code {
-            KeyCode::Char('P') | KeyCode::Char('p') => {
+            _ if key_char_eq(&key, 'p') => {
                 open_overlay(app, Overlay::Providers);
                 return Ok(false);
             }
-            KeyCode::Char('M') | KeyCode::Char('m') => {
+            _ if key_char_eq(&key, 'm') || matches!(key.code, KeyCode::Enter) => {
                 open_overlay(app, Overlay::Mcp);
                 return Ok(false);
             }
-            KeyCode::Char('A') | KeyCode::Char('a') => {
+            _ if key_char_eq(&key, 'a') => {
                 open_overlay(app, Overlay::Approvals);
                 return Ok(false);
             }
@@ -1711,46 +1714,46 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
         }
     }
 
-    if ctrl {
+    if ctrl && !shift {
         match key.code {
-            KeyCode::Char('c') => return Ok(true),
-            KeyCode::Char('b') => {
+            _ if key_char_eq(&key, 'c') => return Ok(true),
+            _ if key_char_eq(&key, 'b') => {
                 app.show_left_dock = !app.show_left_dock;
                 return Ok(false);
             }
-            KeyCode::Char('d') => {
+            _ if key_char_eq(&key, 'd') => {
                 app.show_right_dock = !app.show_right_dock;
                 return Ok(false);
             }
-            KeyCode::Char('p') => {
+            _ if key_char_eq(&key, 'p') => {
                 open_overlay(app, Overlay::Palette);
                 return Ok(false);
             }
-            KeyCode::Char('l') => {
+            _ if key_char_eq(&key, 'l') => {
                 app.refresh_sessions();
                 open_overlay(app, Overlay::Sessions);
                 return Ok(false);
             }
-            KeyCode::Char('m') => {
+            _ if key_char_eq(&key, 'm') => {
                 app.provider_filter = None;
                 open_overlay(app, Overlay::ModelSwitcher);
                 return Ok(false);
             }
-            KeyCode::Char('k') => {
+            _ if key_char_eq(&key, 'k') => {
                 app.refresh_skills();
                 open_overlay(app, Overlay::Skills);
                 return Ok(false);
             }
-            KeyCode::Char('n') => {
+            _ if key_char_eq(&key, 'n') => {
                 send_slash(app, "/new");
                 return Ok(false);
             }
-            KeyCode::Char('y') => {
+            _ if key_char_eq(&key, 'y') => {
                 let next = app.autonomy.cycle();
                 send_slash(app, &format!("/autonomy {}", next.short()));
                 return Ok(false);
             }
-            KeyCode::Char('a') => {
+            _ if key_char_eq(&key, 'a') => {
                 open_overlay(app, Overlay::Agents);
                 return Ok(false);
             }
@@ -1762,15 +1765,15 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
                 send_slash(app, "/session prev");
                 return Ok(false);
             }
-            KeyCode::Char('w') => {
+            _ if key_char_eq(&key, 'w') => {
                 app.input.delete_word();
                 return Ok(false);
             }
-            KeyCode::Char('u') => {
+            _ if key_char_eq(&key, 'u') => {
                 app.input.delete_to_line_start();
                 return Ok(false);
             }
-            KeyCode::Char('e') => {
+            _ if key_char_eq(&key, 'e') => {
                 app.input.move_line_end();
                 return Ok(false);
             }
@@ -1889,6 +1892,14 @@ fn handle_key_event(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool>
         }
         _ => Ok(false),
     }
+}
+
+fn key_char_eq(key: &KeyEvent, expected: char) -> bool {
+    matches!(key.code, KeyCode::Char(actual) if actual.eq_ignore_ascii_case(&expected))
+}
+
+fn key_char_is_uppercase(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(actual) if actual.is_ascii_uppercase())
 }
 
 /// Handle keystrokes while an overlay is active. Dialog overlays get a
@@ -4863,6 +4874,50 @@ mod tests {
 
         assert_eq!(app.input.as_str(), "line one\n");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn uppercase_control_provider_shortcuts_open_overlays() {
+        let mut app = SessionApp::default();
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .unwrap();
+        assert_eq!(app.overlay, Overlay::Providers);
+
+        app.overlay = Overlay::None;
+        handle_key_event(
+            KeyEvent::new(KeyCode::Char('M'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .unwrap();
+        assert_eq!(app.overlay, Overlay::Mcp);
+
+        app.overlay = Overlay::None;
+        handle_key_event(
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .unwrap();
+        assert_eq!(app.overlay, Overlay::Approvals);
+    }
+
+    #[test]
+    fn uppercase_control_y_cycles_autonomy() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = SessionApp::default();
+        app.input_sender = Some(tx);
+        app.autonomy = AutonomyLevel::Conservative;
+
+        handle_key_event(
+            KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::CONTROL),
+            &mut app,
+        )
+        .unwrap();
+
+        assert_eq!(rx.try_recv().unwrap(), "/autonomy balanced");
     }
 
     #[test]
