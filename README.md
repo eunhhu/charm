@@ -182,6 +182,9 @@ export OPENROUTER_API_KEY="sk-or-..."
 export OLLAMA_API_KEY="ollama"  # 선택사항
 ```
 
+TUI에서는 `Ctrl+Shift+P` 또는 `/provider`로 provider 연결 상태를 확인합니다.
+연결된 provider를 선택하면 해당 provider 모델 목록으로 바로 이동하고, 미연결 provider를 선택하면 설정 안내 modal이 열립니다.
+
 ### 모델 지정 방식
 ```bash
 # provider/model 형식
@@ -196,6 +199,9 @@ charm --model gpt-...           # openai
 charm --model gemini-...        # google
 charm --model <name>:<tag>      # ollama
 ```
+
+세션 중에는 `/model provider/model-id`로 provider client까지 재연결합니다.
+예: `/model ollama/qwen3-coder:30b`, `/model openai/gpt-4.1`.
 
 ---
 
@@ -293,6 +299,8 @@ User task
 - **Runtime gates**: 파일 편집 전 repo evidence gate, completion claim 전 verification gate, 위험도 기반 approval gate가 세션 런타임에서 동작합니다.
 - **Command lifecycle**: non-blocking command는 `poll_command`로 조회하고 `cancel_command`로 취소할 수 있습니다.
 - **Read path cache**: `ToolRegistry`의 `read_range`는 `.charm/cache/file-cache.json` backed `FileCache`를 사용해 세션 간 반복 파일 읽기 비용을 줄입니다.
+- **Slash command modal**: `/help`, `/audit`, `/audit insights`, `/audit replay`, `/evidence*`, `/mcp`, `/lsp*`, `/provider`처럼 긴 출력은 transcript를 오염시키지 않고 scrollable modal로 표시됩니다.
+- **Provider connector**: `/provider`와 provider overlay가 인증 상태를 보여주고, `/model provider/model-id`는 세션 pinned model뿐 아니라 실제 provider client도 교체합니다.
 - **Evidence browser**: `/evidence`, `/evidence repo`, `/evidence refs`가 저장된 세션 evidence/reference pack을 `.charm/sessions/<id>/`에서 읽어 요약합니다.
 - **Audit insights**: `/audit insights [n]`가 반복 실패, missed context, missing reference risk를 trace에서 분석하고 candidate workflow/rule/memory를 제안합니다.
 - **Sub-agent export**: `/agent export <id>`가 sub-agent worktree status/diff/file snapshot을 `.charm/exports/` markdown artifact로 저장합니다.

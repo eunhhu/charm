@@ -231,6 +231,10 @@ pub enum RuntimeEvent {
         role: String,
         content: String,
     },
+    Modal {
+        title: String,
+        content: String,
+    },
     StreamDelta {
         role: String,
         content: String,

@@ -27,6 +27,7 @@ use crate::harness::session::{
 };
 use crate::harness::trace::{AgentTraceStore, TraceEntry};
 use crate::providers::client::ProviderClient;
+use crate::providers::factory::{Provider, resolve_model_selection, resolve_provider_auth};
 use crate::providers::sse::{StreamChunk, accumulate_stream_to_response};
 use crate::providers::types::{ChatRequest, Message, ToolSchema, Usage};
 use crate::retrieval::worker::RetrievalWorker;
@@ -1642,10 +1643,9 @@ impl SessionRuntime {
         }
 
         match parts.as_slice() {
-            ["/help"] | ["/?"] | ["/h"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
-                role: "assistant".to_string(),
-                content: help_text(),
-            }])),
+            ["/help"] | ["/?"] | ["/h"] => {
+                Ok(Some(vec![modal_event("Help", help_text())]))
+            }
             ["/approvals"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
                 role: "assistant".to_string(),
                 content: format!(
@@ -1682,24 +1682,17 @@ impl SessionRuntime {
                     content: "Cleared context items.".to_string(),
                 }]))
             }
-            ["/mcp"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
-                role: "assistant".to_string(),
-                content: self.render_mcp_summary(),
-            }])),
+            ["/mcp"] => Ok(Some(vec![modal_event("MCP", self.render_mcp_summary())])),
             ["/mcp", "refresh"] => Ok(Some(self.handle_mcp_refresh().await?)),
-            ["/lsp"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
-                role: "assistant".to_string(),
-                content: self.render_lsp_summary(),
-            }])),
+            ["/lsp"] => Ok(Some(vec![modal_event("LSP", self.render_lsp_summary())])),
             ["/lsp", "refresh"] => Ok(Some(self.handle_lsp_refresh().await?)),
-            ["/lsp", "diagnostics"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
-                role: "assistant".to_string(),
-                content: self.render_lsp_diagnostics(),
-            }])),
-            ["/lsp", "symbols"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
-                role: "assistant".to_string(),
-                content: self.render_lsp_symbols(),
-            }])),
+            ["/lsp", "diagnostics"] => Ok(Some(vec![modal_event(
+                "LSP Diagnostics",
+                self.render_lsp_diagnostics(),
+            )])),
+            ["/lsp", "symbols"] => {
+                Ok(Some(vec![modal_event("LSP Symbols", self.render_lsp_symbols())]))
+            }
             ["/autonomy"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
                 role: "assistant".to_string(),
                 content: format!(
@@ -1720,40 +1713,38 @@ impl SessionRuntime {
             ["/yolo"] => Ok(Some(self.set_autonomy(AutonomyLevel::Yolo, "slash"))),
             ["/safe"] => Ok(Some(self.set_autonomy(AutonomyLevel::Conservative, "slash"))),
             ["/compact"] => Ok(Some(self.compact_context())),
-            ["/audit"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
-                role: "assistant".to_string(),
-                content: self.render_audit_summary(50),
-            }])),
-            ["/audit", "insights"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
-                role: "assistant".to_string(),
-                content: self.render_audit_insights(100),
-            }])),
-            ["/audit", "insights", limit] => Ok(Some(vec![RuntimeEvent::MessageDelta {
-                role: "assistant".to_string(),
-                content: self.render_audit_insights(parse_audit_limit(limit, 100)),
-            }])),
-            ["/audit", "replay"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
-                role: "assistant".to_string(),
-                content: self.render_audit_replay(20),
-            }])),
-            ["/audit", "replay", limit] => Ok(Some(vec![RuntimeEvent::MessageDelta {
-                role: "assistant".to_string(),
-                content: self.render_audit_replay(parse_audit_limit(limit, 20)),
-            }])),
-            ["/evidence"] | ["/evidence", "all"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
-                role: "assistant".to_string(),
-                content: self.render_evidence_browser(EvidenceBrowserView::All),
-            }])),
-            ["/evidence", "repo"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
-                role: "assistant".to_string(),
-                content: self.render_evidence_browser(EvidenceBrowserView::Repo),
-            }])),
-            ["/evidence", "refs"] | ["/evidence", "references"] => {
-                Ok(Some(vec![RuntimeEvent::MessageDelta {
-                    role: "assistant".to_string(),
-                    content: self.render_evidence_browser(EvidenceBrowserView::References),
-                }]))
-            }
+            ["/audit"] => Ok(Some(vec![modal_event(
+                "Audit",
+                self.render_audit_summary(50),
+            )])),
+            ["/audit", "insights"] => Ok(Some(vec![modal_event(
+                "Audit Insights",
+                self.render_audit_insights(100),
+            )])),
+            ["/audit", "insights", limit] => Ok(Some(vec![modal_event(
+                "Audit Insights",
+                self.render_audit_insights(parse_audit_limit(limit, 100)),
+            )])),
+            ["/audit", "replay"] => Ok(Some(vec![modal_event(
+                "Audit Replay",
+                self.render_audit_replay(20),
+            )])),
+            ["/audit", "replay", limit] => Ok(Some(vec![modal_event(
+                "Audit Replay",
+                self.render_audit_replay(parse_audit_limit(limit, 20)),
+            )])),
+            ["/evidence"] | ["/evidence", "all"] => Ok(Some(vec![modal_event(
+                "Evidence",
+                self.render_evidence_browser(EvidenceBrowserView::All),
+            )])),
+            ["/evidence", "repo"] => Ok(Some(vec![modal_event(
+                "Evidence",
+                self.render_evidence_browser(EvidenceBrowserView::Repo),
+            )])),
+            ["/evidence", "refs"] | ["/evidence", "references"] => Ok(Some(vec![modal_event(
+                "Evidence",
+                self.render_evidence_browser(EvidenceBrowserView::References),
+            )])),
             ["/clear"] => Ok(Some(self.clear_transcript())),
             ["/new"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
                 role: "assistant".to_string(),
@@ -1783,7 +1774,17 @@ impl SessionRuntime {
                     self.model_display, self.model_name
                 ),
             }])),
-            ["/model", target] => Ok(Some(self.set_model(target.to_string()))),
+            ["/model", target] => Ok(Some(self.set_model_connected(target.to_string()).await)),
+            ["/provider"] | ["/providers"] => Ok(Some(vec![modal_event(
+                "Providers",
+                self.render_provider_summary(),
+            )])),
+            ["/provider", "connect", provider] | ["/providers", "connect", provider] => {
+                Ok(Some(vec![modal_event(
+                    provider_modal_title(provider),
+                    provider_connection_content(provider),
+                )]))
+            }
             ["/agent"] | ["/agents"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
                 role: "assistant".to_string(),
                 content: self.render_agent_summary(),
@@ -2128,6 +2129,38 @@ impl SessionRuntime {
         lines.join("\n")
     }
 
+    fn render_provider_summary(&self) -> String {
+        let providers = [
+            Provider::OpenRouter,
+            Provider::OpenAi,
+            Provider::OpenAiCodex,
+            Provider::Anthropic,
+            Provider::Google,
+            Provider::Ollama,
+        ];
+        let mut lines = vec![
+            format!("Current model: {}", self.model_display),
+            String::new(),
+            "Providers:".to_string(),
+        ];
+        for provider in providers {
+            let status = if resolve_provider_auth(&provider).is_ok() {
+                "connected"
+            } else {
+                "not configured"
+            };
+            lines.push(format!(
+                "  - {:<14} {}",
+                provider_display_name(provider.id()),
+                status
+            ));
+        }
+        lines.push(String::new());
+        lines.push("Use /provider connect <provider> for setup instructions.".to_string());
+        lines.push("Use /model <provider/model-id> to switch provider and model.".to_string());
+        lines.join("\n")
+    }
+
     fn render_evidence_browser(&self, view: EvidenceBrowserView) -> String {
         let session_id = self.snapshot.metadata.session_id.clone();
         let (snapshot, source) = match self.store.load_snapshot(&session_id) {
@@ -2382,6 +2415,70 @@ impl SessionRuntime {
                 role: "system".to_string(),
                 content: format!(
                     "Model set to {target}. (Note: TUI provider binding reuses current provider client.)"
+                ),
+            },
+        ]
+    }
+
+    pub async fn set_model_connected(&mut self, target: String) -> Vec<RuntimeEvent> {
+        let target = target.trim();
+        if target.is_empty() {
+            return vec![RuntimeEvent::MessageDelta {
+                role: "system".to_string(),
+                content: "Usage: /model <provider/model-id>".to_string(),
+            }];
+        }
+
+        let selection = match resolve_model_selection(None, target) {
+            Ok(selection) => selection,
+            Err(err) => {
+                return vec![modal_event(
+                    "Model",
+                    format!("Could not resolve model `{target}`.\n\n{err}"),
+                )];
+            }
+        };
+        let auth = match resolve_provider_auth(&selection.provider) {
+            Ok(auth) => auth,
+            Err(err) => {
+                return vec![modal_event(
+                    provider_modal_title(selection.provider.id()),
+                    format!(
+                        "{}\n\nAttempted model: {}\n\n{}",
+                        provider_connection_content(selection.provider.id()),
+                        selection.display_model,
+                        err
+                    ),
+                )];
+            }
+        };
+
+        let provider_id = selection.provider.id().to_string();
+        self.model = Arc::new(selection.provider.create_client(auth));
+        self.model_name = selection.request_model.clone();
+        self.model_display = selection.display_model.clone();
+        self.snapshot.metadata.pinned_model = Some(selection.display_model.clone());
+        self.prompt_assembler =
+            PromptAssembler::new(&self.workspace_root).with_provider(&provider_id);
+        self.refresh_system_prompt();
+        self.append_transcript(
+            "system",
+            format!(
+                "Provider connected: {provider_id}; model pinned to {}",
+                selection.display_model
+            ),
+        );
+
+        vec![
+            RuntimeEvent::ModelChanged {
+                model: selection.request_model,
+                display: selection.display_model.clone(),
+            },
+            RuntimeEvent::MessageDelta {
+                role: "system".to_string(),
+                content: format!(
+                    "Provider connected: {provider_id}. Model set to {}.",
+                    selection.display_model
                 ),
             },
         ]
@@ -3213,6 +3310,55 @@ fn parse_audit_limit(raw: &str, default: usize) -> usize {
         .filter(|limit| *limit > 0)
         .map(|limit| limit.min(100))
         .unwrap_or(default)
+}
+
+fn modal_event(title: impl Into<String>, content: impl Into<String>) -> RuntimeEvent {
+    RuntimeEvent::Modal {
+        title: title.into(),
+        content: content.into(),
+    }
+}
+
+fn provider_modal_title(provider: &str) -> String {
+    format!("{} Connection", provider_display_name(provider))
+}
+
+fn provider_display_name(provider: &str) -> &'static str {
+    match provider {
+        "openai" => "OpenAI",
+        "openai-codex" => "OpenAI Codex",
+        "anthropic" => "Anthropic",
+        "google" => "Google Gemini",
+        "ollama" => "Ollama",
+        "openrouter" => "OpenRouter",
+        _ => "Provider",
+    }
+}
+
+fn provider_connection_content(provider: &str) -> String {
+    match provider {
+        "openai" => {
+            "Set OPENAI_API_KEY in your shell, then restart Charm or launch the TUI from that shell.\n\nExample:\n  export OPENAI_API_KEY=\"sk-...\"\n\nSwitch with:\n  /model openai/gpt-4.1".to_string()
+        }
+        "openai-codex" => {
+            "OpenAI Codex reuses Codex CLI auth.\n\nRun:\n  codex login\n\nSwitch with:\n  /model openai-codex/gpt-5.1-codex".to_string()
+        }
+        "anthropic" => {
+            "Set ANTHROPIC_API_KEY in your shell, then restart Charm or launch the TUI from that shell.\n\nExample:\n  export ANTHROPIC_API_KEY=\"sk-ant-...\"\n\nSwitch with:\n  /model anthropic/claude-sonnet-4-20250514".to_string()
+        }
+        "google" => {
+            "Set GEMINI_API_KEY or GOOGLE_API_KEY in your shell, then restart Charm or launch the TUI from that shell.\n\nExample:\n  export GEMINI_API_KEY=\"...\"\n\nSwitch with:\n  /model google/gemini-2.5-pro".to_string()
+        }
+        "ollama" => {
+            "Run Ollama locally, then choose an installed model.\n\nExample:\n  ollama serve\n  ollama pull qwen3-coder:30b\n\nSwitch with:\n  /model ollama/qwen3-coder:30b".to_string()
+        }
+        "openrouter" => {
+            "Set OPENROUTER_API_KEY in your shell, then restart Charm or launch the TUI from that shell.\n\nExample:\n  export OPENROUTER_API_KEY=\"sk-or-...\"\n\nSwitch with:\n  /model openrouter/moonshotai/kimi-k2.6".to_string()
+        }
+        other => format!(
+            "Unknown provider `{other}`.\n\nKnown providers: openrouter, openai, openai-codex, anthropic, google, ollama."
+        ),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5656,8 +5802,109 @@ tokio = "1.44"
 
         assert!(events.iter().any(|event| matches!(
             event,
-            RuntimeEvent::MessageDelta { content, .. }
+            RuntimeEvent::Modal { content, .. }
                 if content.contains("Audit") && content.contains("tool_result: 1") && content.contains("tool_policy_blocked: 1")
+        )));
+    }
+
+    #[tokio::test]
+    async fn help_and_evidence_commands_return_modal_events() {
+        let dir = tempdir().unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+
+        let help = runtime.submit_input("/help").await.unwrap();
+        assert!(help.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Modal { title, content }
+                if title == "Help" && content.contains("Slash commands")
+        )));
+
+        let evidence = runtime.submit_input("/evidence").await.unwrap();
+        assert!(evidence.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Modal { title, content }
+                if title == "Evidence" && content.contains("Evidence Browser")
+        )));
+    }
+
+    #[tokio::test]
+    async fn provider_connect_command_returns_connection_modal() {
+        let dir = tempdir().unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+
+        let events = runtime
+            .submit_input("/provider connect openai")
+            .await
+            .unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::Modal { title, content }
+                if title.contains("OpenAI") && content.contains("OPENAI_API_KEY")
+        )));
+    }
+
+    #[tokio::test]
+    async fn canonical_ollama_model_switch_rebinds_provider_without_warning() {
+        let dir = tempdir().unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+
+        let events = runtime
+            .submit_input("/model ollama/qwen3-coder:30b")
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.model_name, "qwen3-coder:30b");
+        assert_eq!(runtime.model_display(), "ollama/qwen3-coder:30b");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ModelChanged { model, display }
+                if model == "qwen3-coder:30b" && display == "ollama/qwen3-coder:30b"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta { content, .. }
+                if content.contains("Provider connected: ollama")
+                    && !content.contains("reuses current provider client")
         )));
     }
 
@@ -5697,7 +5944,7 @@ tokio = "1.44"
 
         assert!(events.iter().any(|event| matches!(
             event,
-            RuntimeEvent::MessageDelta { content, .. }
+            RuntimeEvent::Modal { content, .. }
                 if content.contains("Trace Replay") && content.contains("task_contract") && content.contains("verification_gap")
         )));
     }
@@ -5757,7 +6004,7 @@ tokio = "1.44"
 
         assert!(events.iter().any(|event| matches!(
             event,
-            RuntimeEvent::MessageDelta { content, .. }
+            RuntimeEvent::Modal { content, .. }
                 if content.contains("Audit Insights")
                     && content.contains("Repeated failures")
                     && content.contains("unresolved import")
@@ -5820,7 +6067,7 @@ tokio = "1.44"
 
         assert!(events.iter().any(|event| matches!(
             event,
-            RuntimeEvent::MessageDelta { content, .. }
+            RuntimeEvent::Modal { content, .. }
                 if content.contains("Evidence Browser")
                     && content.contains("src/lib.rs:12")
                     && content.contains("reqwest")
@@ -6186,13 +6433,13 @@ tokio = "1.44"
 
         let diagnostics = runtime.submit_input("/lsp diagnostics").await.unwrap();
         assert!(diagnostics.iter().any(|event| match event {
-            RuntimeEvent::MessageDelta { content, .. } => content.contains("unused variable"),
+            RuntimeEvent::Modal { content, .. } => content.contains("unused variable"),
             _ => false,
         }));
 
         let symbols = runtime.submit_input("/lsp symbols").await.unwrap();
         assert!(symbols.iter().any(|event| match event {
-            RuntimeEvent::MessageDelta { content, .. } => content.contains("run_session"),
+            RuntimeEvent::Modal { content, .. } => content.contains("run_session"),
             _ => false,
         }));
     }
@@ -7274,7 +7521,7 @@ tokio = "1.44"
         let events: Vec<RuntimeEvent> = rx.try_iter().collect();
         assert!(
             events.iter().any(
-                |event| matches!(event, RuntimeEvent::MessageDelta { content, .. } if content.contains("Charm Help"))
+                |event| matches!(event, RuntimeEvent::Modal { content, .. } if content.contains("Charm Help"))
             )
         );
         assert!(

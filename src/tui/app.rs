@@ -456,7 +456,17 @@ pub fn command_catalog() -> Vec<CommandItem> {
         },
         CommandItem {
             command: "/model <id>",
-            description: "Pin a model for this session",
+            description: "Switch provider/model for this session",
+            category: CommandCategory::Session,
+        },
+        CommandItem {
+            command: "/provider",
+            description: "Show provider connection status",
+            category: CommandCategory::Session,
+        },
+        CommandItem {
+            command: "/provider connect <id>",
+            description: "Show provider setup instructions",
             category: CommandCategory::Session,
         },
         CommandItem {
@@ -549,6 +559,36 @@ pub fn command_catalog() -> Vec<CommandItem> {
             description: "Show indexed symbol jumps",
             category: CommandCategory::Inspect,
         },
+        CommandItem {
+            command: "/audit",
+            description: "Show recent runtime audit events",
+            category: CommandCategory::Inspect,
+        },
+        CommandItem {
+            command: "/audit insights",
+            description: "Show repeated failure insights",
+            category: CommandCategory::Inspect,
+        },
+        CommandItem {
+            command: "/audit replay",
+            description: "Replay recent audit timeline",
+            category: CommandCategory::Inspect,
+        },
+        CommandItem {
+            command: "/evidence",
+            description: "Browse all evidence references",
+            category: CommandCategory::Inspect,
+        },
+        CommandItem {
+            command: "/evidence repo",
+            description: "Browse repository evidence",
+            category: CommandCategory::Inspect,
+        },
+        CommandItem {
+            command: "/evidence refs",
+            description: "Browse external references",
+            category: CommandCategory::Inspect,
+        },
     ]
 }
 
@@ -588,6 +628,7 @@ pub enum Overlay {
     Providers,
     Mcp,
     Skills,
+    TextModal,
 }
 
 impl Overlay {
@@ -728,6 +769,8 @@ pub struct SessionApp {
     pub transcript_area: Option<Rect>,
     pub composer_area: Option<Rect>,
     pub provider_filter: Option<String>,
+    pub modal_title: String,
+    pub modal_content: String,
     pub skills: Vec<SkillEntry>,
     /// Which role is currently streaming. `None` means no stream is
     /// in-flight, so the next `StreamDelta` must open a new transcript row
@@ -785,6 +828,8 @@ impl Default for SessionApp {
             transcript_area: None,
             composer_area: None,
             provider_filter: None,
+            modal_title: String::new(),
+            modal_content: String::new(),
             skills: Vec::new(),
             active_stream_role: None,
         }
@@ -898,6 +943,14 @@ impl SessionApp {
                     }
                 }
                 self.auto_scroll = true;
+            }
+            RuntimeEvent::Modal { title, content } => {
+                self.active_stream_role = None;
+                self.modal_title = title;
+                self.modal_content = content;
+                self.overlay = Overlay::TextModal;
+                self.dialog_state.scroll = 0;
+                self.dialog_state.selected = 0;
             }
             RuntimeEvent::StreamDelta {
                 role,
@@ -1851,8 +1904,8 @@ fn handle_overlay_key(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<boo
         _ => {}
     }
 
-    if app.overlay == Overlay::Help {
-        // Help has no filter — arrow keys scroll.
+    if matches!(app.overlay, Overlay::Help | Overlay::TextModal) {
+        // Text overlays have no filter; arrow keys scroll.
         match key.code {
             KeyCode::Up => {
                 app.dialog_state.scroll = app.dialog_state.scroll.saturating_sub(1);
@@ -2117,7 +2170,7 @@ fn current_overlay_options(app: &SessionApp) -> Vec<DialogOption> {
         Overlay::Providers => providers_options(app),
         Overlay::Mcp => mcp_options(app),
         Overlay::Skills => skills_options(app),
-        Overlay::Help | Overlay::None => Vec::new(),
+        Overlay::Help | Overlay::TextModal | Overlay::None => Vec::new(),
     }
 }
 
@@ -2193,12 +2246,15 @@ fn models_options(app: &SessionApp) -> Vec<DialogOption> {
             } else {
                 Style::default().fg(app.theme.dim)
             };
-            DialogOption::new(model.model_id.clone(), model.display.clone())
-                .description(model.model_id.clone())
-                .category(provider_label)
-                .footer(model.provider.clone())
-                .marker(marker, marker_style)
-                .disabled(!connected)
+            DialogOption::new(
+                canonical_model_value(&model.provider, &model.model_id),
+                model.display.clone(),
+            )
+            .description(model.model_id.clone())
+            .category(provider_label)
+            .footer(model.provider.clone())
+            .marker(marker, marker_style)
+            .disabled(!connected)
         })
         .collect()
 }
@@ -2276,7 +2332,7 @@ fn providers_options(app: &SessionApp) -> Vec<DialogOption> {
     const PROVIDERS: &[(&str, &str)] = &[
         ("openrouter", "OpenRouter"),
         ("openai", "OpenAI"),
-        ("openai_codex", "OpenAI Codex"),
+        ("openai-codex", "OpenAI Codex"),
         ("anthropic", "Anthropic Claude"),
         ("google", "Google Gemini"),
         ("ollama", "Ollama (local)"),
@@ -2308,7 +2364,7 @@ fn providers_options(app: &SessionApp) -> Vec<DialogOption> {
 fn provider_display_name(id: &str) -> String {
     match id {
         "openai" => "OpenAI",
-        "openai_codex" => "OpenAI Codex",
+        "openai-codex" => "OpenAI Codex",
         "anthropic" => "Anthropic",
         "google" => "Google",
         "openrouter" => "OpenRouter",
@@ -2320,17 +2376,8 @@ fn provider_display_name(id: &str) -> String {
 
 fn provider_has_auth(id: &str) -> bool {
     match id {
-        "openai" => std::env::var("OPENAI_API_KEY").is_ok(),
-        "openai_codex" => {
-            if std::env::var("OPENAI_API_KEY").is_ok() {
-                return true;
-            }
-            if let Some(home) = dirs_home() {
-                home.join(".codex/auth.json").exists()
-            } else {
-                false
-            }
-        }
+        "openai" => std::env::var("OPENAI_API_KEY").is_ok() || codex_auth_has_openai_key(),
+        "openai-codex" => codex_auth_has_access_token(),
         "anthropic" => std::env::var("ANTHROPIC_API_KEY").is_ok(),
         "google" => {
             std::env::var("GEMINI_API_KEY").is_ok() || std::env::var("GOOGLE_API_KEY").is_ok()
@@ -2348,13 +2395,70 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 fn provider_auth_hint(id: &str) -> String {
     match id {
         "openai" => "Set OPENAI_API_KEY".to_string(),
-        "openai_codex" => "Set OPENAI_API_KEY or login with `codex`".to_string(),
+        "openai-codex" => "Run `codex login`".to_string(),
         "anthropic" => "Set ANTHROPIC_API_KEY".to_string(),
         "google" => "Set GEMINI_API_KEY or GOOGLE_API_KEY".to_string(),
         "openrouter" => "Set OPENROUTER_API_KEY".to_string(),
         "ollama" => "Run `ollama serve` locally".to_string(),
         _ => String::new(),
     }
+}
+
+fn provider_connection_modal_content(id: &str) -> String {
+    match id {
+        "openai" => {
+            "Set OPENAI_API_KEY in the shell that launches Charm.\n\nExample:\n  export OPENAI_API_KEY=\"sk-...\"\n\nThen switch with:\n  /model openai/gpt-4.1".to_string()
+        }
+        "openai-codex" => {
+            "OpenAI Codex reuses Codex CLI auth.\n\nRun:\n  codex login\n\nThen switch with:\n  /model openai-codex/gpt-5.1-codex".to_string()
+        }
+        "anthropic" => {
+            "Set ANTHROPIC_API_KEY in the shell that launches Charm.\n\nExample:\n  export ANTHROPIC_API_KEY=\"sk-ant-...\"\n\nThen switch with:\n  /model anthropic/claude-sonnet-4-20250514".to_string()
+        }
+        "google" => {
+            "Set GEMINI_API_KEY or GOOGLE_API_KEY in the shell that launches Charm.\n\nExample:\n  export GEMINI_API_KEY=\"...\"\n\nThen switch with:\n  /model google/gemini-2.5-pro".to_string()
+        }
+        "ollama" => {
+            "Run Ollama locally, then choose an installed model.\n\nExample:\n  ollama serve\n  ollama pull qwen3-coder:30b\n\nThen switch with:\n  /model ollama/qwen3-coder:30b".to_string()
+        }
+        "openrouter" => {
+            "Set OPENROUTER_API_KEY in the shell that launches Charm.\n\nExample:\n  export OPENROUTER_API_KEY=\"sk-or-...\"\n\nThen switch with:\n  /model openrouter/moonshotai/kimi-k2.6".to_string()
+        }
+        other => format!("Unknown provider `{other}`."),
+    }
+}
+
+fn canonical_model_value(provider: &str, model_id: &str) -> String {
+    format!("{provider}/{model_id}")
+}
+
+fn codex_auth_has_openai_key() -> bool {
+    codex_auth_value()
+        .and_then(|value| {
+            value
+                .get("OPENAI_API_KEY")
+                .and_then(|key| key.as_str())
+                .map(|key| !key.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
+fn codex_auth_has_access_token() -> bool {
+    codex_auth_value()
+        .and_then(|value| {
+            value
+                .get("tokens")
+                .and_then(|tokens| tokens.get("access_token"))
+                .and_then(|token| token.as_str())
+                .map(|token| !token.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
+fn codex_auth_value() -> Option<serde_json::Value> {
+    let home = dirs_home()?;
+    let body = std::fs::read_to_string(home.join(".codex/auth.json")).ok()?;
+    serde_json::from_str(&body).ok()
 }
 
 fn mcp_options(app: &SessionApp) -> Vec<DialogOption> {
@@ -2441,8 +2545,12 @@ fn submit_overlay_selection(app: &mut SessionApp) {
     match app.overlay {
         Overlay::Palette => {
             let cleaned = strip_placeholders(&value);
-            app.input.buffer = cleaned;
-            app.input.cursor = app.input.buffer.len();
+            if palette_command_executes_immediately(&cleaned) {
+                send_slash(app, &cleaned);
+            } else {
+                app.input.buffer = cleaned;
+                app.input.cursor = app.input.buffer.len();
+            }
         }
         Overlay::Sessions => {
             send_slash(app, &format!("/session {}", value));
@@ -2452,7 +2560,7 @@ fn submit_overlay_selection(app: &mut SessionApp) {
                 send_slash(app, &format!("/model {}", value));
             } else {
                 app.toast = Some((
-                    format!("Provider not connected. Press Ctrl+Shift+P to connect."),
+                    "Provider not connected. Press Ctrl+Shift+P to connect.".to_string(),
                     Instant::now(),
                 ));
             }
@@ -2479,13 +2587,18 @@ fn submit_overlay_selection(app: &mut SessionApp) {
             send_slash(app, &format!("/autonomy {}", value));
         }
         Overlay::Providers => {
-            // Hint the user on how to connect — we don't have an in-TUI
-            // auth flow yet.
-            let hint = provider_auth_hint(&value);
-            app.toast = Some((
-                format!("{}: {hint}", provider_display_name(&value)),
-                Instant::now(),
-            ));
+            if provider_has_auth(&value) {
+                app.provider_filter = Some(value);
+                app.overlay = Overlay::ModelSwitcher;
+                app.dialog_state.reset();
+                return;
+            }
+            open_text_modal(
+                app,
+                format!("{} Connection", provider_display_name(&value)),
+                provider_connection_modal_content(&value),
+            );
+            return;
         }
         Overlay::Mcp => {
             send_slash(app, "/mcp refresh");
@@ -2496,10 +2609,36 @@ fn submit_overlay_selection(app: &mut SessionApp) {
             app.input.buffer = format!("/workflow {}", value);
             app.input.cursor = app.input.buffer.len();
         }
-        Overlay::Help | Overlay::None => {}
+        Overlay::Help | Overlay::TextModal | Overlay::None => {}
     }
 
     app.overlay = Overlay::None;
+    app.provider_filter = None;
+    app.dialog_state.reset();
+}
+
+fn palette_command_executes_immediately(command: &str) -> bool {
+    matches!(
+        command,
+        "/help"
+            | "/audit"
+            | "/audit insights"
+            | "/audit replay"
+            | "/evidence"
+            | "/evidence repo"
+            | "/evidence refs"
+            | "/mcp"
+            | "/lsp"
+            | "/lsp diagnostics"
+            | "/lsp symbols"
+            | "/provider"
+    )
+}
+
+fn open_text_modal(app: &mut SessionApp, title: impl Into<String>, content: impl Into<String>) {
+    app.modal_title = title.into();
+    app.modal_content = content.into();
+    app.overlay = Overlay::TextModal;
     app.provider_filter = None;
     app.dialog_state.reset();
 }
@@ -2603,6 +2742,8 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp) {
 
     if app.overlay == Overlay::Help {
         render_help_overlay(frame, app);
+    } else if app.overlay == Overlay::TextModal {
+        render_text_modal(frame, app);
     } else if app.overlay.is_dialog_select() {
         render_dialog_overlay(frame, app);
     }
@@ -2685,7 +2826,7 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp) {
         Overlay::Providers => (
             "Providers",
             "Search providers...",
-            vec![KeybindHint::new("↵", "how to connect")],
+            vec![KeybindHint::new("↵", "models/connect")],
             None,
         ),
         Overlay::Mcp => (
@@ -2700,7 +2841,7 @@ fn render_dialog_overlay(frame: &mut ratatui::Frame<'_>, app: &mut SessionApp) {
             vec![KeybindHint::new("↵", "insert")],
             None,
         ),
-        Overlay::Help | Overlay::None => return,
+        Overlay::Help | Overlay::TextModal | Overlay::None => return,
     };
 
     let props = DialogSelectProps {
@@ -3938,7 +4079,48 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
                     .style(Style::default().bg(theme.bg_secondary))
                     .padding(Padding::new(1, 1, 1, 1)),
             )
-            .scroll((app.overlay_index as u16, 0))
+            .scroll((app.dialog_state.scroll, 0))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_text_modal(frame: &mut ratatui::Frame<'_>, app: &SessionApp) {
+    let theme = &app.theme;
+    let area = centered_rect(72, 76, frame.area());
+    frame.render_widget(Clear, area);
+
+    let mut lines: Vec<Line> = app
+        .modal_content
+        .lines()
+        .map(|line| Line::from(line.to_string()))
+        .collect();
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Esc to close, ↑/↓ to scroll.",
+        Style::default().fg(theme.dim),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        format!(" {} ", app.modal_title),
+                        Style::default()
+                            .fg(theme.dock_title)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.border_focused))
+                    .style(Style::default().bg(theme.bg_secondary))
+                    .padding(Padding::new(1, 1, 1, 1)),
+            )
+            .scroll((app.dialog_state.scroll, 0))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -4794,6 +4976,47 @@ mod tests {
         .unwrap();
 
         assert_eq!(rx.try_recv().unwrap(), "/approvals deny deny1234");
+    }
+
+    #[test]
+    fn modal_event_opens_scrollable_text_modal() {
+        let mut app = SessionApp::default();
+
+        app.apply_event(RuntimeEvent::Modal {
+            title: "Audit".to_string(),
+            content: "line one\nline two".to_string(),
+        });
+
+        assert_eq!(app.overlay, Overlay::TextModal);
+        assert_eq!(app.modal_title, "Audit");
+        assert!(app.modal_content.contains("line two"));
+        assert_eq!(app.dialog_state.scroll, 0);
+    }
+
+    #[test]
+    fn palette_executes_modal_slash_command_instead_of_inserting_it() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = SessionApp::default();
+        app.input_sender = Some(tx);
+        app.overlay = Overlay::Palette;
+        app.dialog_state.filter = "/help".to_string();
+
+        submit_overlay_selection(&mut app);
+
+        assert_eq!(rx.try_recv().unwrap(), "/help");
+        assert!(app.input.as_str().is_empty());
+    }
+
+    #[test]
+    fn provider_overlay_connected_provider_opens_filtered_model_switcher() {
+        let mut app = SessionApp::default();
+        app.overlay = Overlay::Providers;
+        app.dialog_state.filter = "ollama".to_string();
+
+        submit_overlay_selection(&mut app);
+
+        assert_eq!(app.overlay, Overlay::ModelSwitcher);
+        assert_eq!(app.provider_filter.as_deref(), Some("ollama"));
     }
 
     #[test]
