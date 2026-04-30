@@ -10,6 +10,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::{Duration, timeout};
 
+const MCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Default, Deserialize)]
 struct McpRegistry {
     #[serde(default)]
@@ -434,7 +436,7 @@ impl McpClient {
             "params": params,
         }))
         .await?;
-        self.wait_for_response(id).await
+        self.wait_for_response(id, method).await
     }
 
     async fn notify(&mut self, method: &str, params: Value) -> anyhow::Result<()> {
@@ -454,11 +456,13 @@ impl McpClient {
         Ok(())
     }
 
-    async fn wait_for_response(&mut self, expected_id: i64) -> anyhow::Result<Value> {
+    async fn wait_for_response(&mut self, expected_id: i64, method: &str) -> anyhow::Result<Value> {
         loop {
-            let line = timeout(Duration::from_secs(3), self.stdout.next_line())
+            let line = timeout(MCP_RESPONSE_TIMEOUT, self.stdout.next_line())
                 .await
-                .context("timed out waiting for MCP response")??
+                .with_context(|| {
+                    format!("timed out waiting for MCP response to {method} id={expected_id}")
+                })??
                 .ok_or_else(|| anyhow!("MCP server closed stdout"))?;
 
             let payload: Value = serde_json::from_str(&line)

@@ -52,7 +52,7 @@
 - [x] Run `rtk git diff --check`.
 - [x] Run `rtk cargo check --all-targets`.
 - [x] Run `rtk cargo test --all-targets`.
-- [x] Run `rtk cargo clippy --all-targets` (0 errors, existing warnings remain).
-- [ ] Run `rtk cargo clippy --all-targets -- -D warnings` (blocked by existing repository-wide lint warnings).
+- [x] Run `rtk cargo clippy --all-targets`.
+- [x] Run `rtk cargo clippy --all-targets --all-features -- -D warnings`.
 - [x] Run `rtk cargo build --release`.
 - [x] Start `target/release/charm new` and `target/release/charm model ollama/qwen3-coder:30b` in a PTY and verify `/connect openrouter`, auth wizard, masked secret entry, model picker transition, and `CHARM_HOME/auth.json` save.
