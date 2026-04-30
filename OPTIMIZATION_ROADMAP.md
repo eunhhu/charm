@@ -46,7 +46,7 @@ TaskContract
 
 ## 현재 진행 요약
 
-- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, repeated-failure precedent gate, GitHub issue/discussion precedent provider, source-aware write/command-target scope guard, command cancel, persistent read-range FileCache, TokenSaver-backed `/compact`, slash audit/replay UI, TUI read-only parallel tool execution.
+- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, repeated-failure precedent gate, GitHub issue/discussion precedent provider, source-aware write/command-target scope guard, command cancel, persistent read-range FileCache, TokenSaver-backed `/compact`, slash audit/replay UI, TUI read-only parallel tool execution, mixed tool-call read-prefix scheduling.
 - **부분/Wired**: Context7/local package/registry/web reference provider, trace linkage, side-effect scope inference.
 - **남음**: mutating tool scheduling 고도화, persistent evidence browser, sub-agent result PR/export workflow.
 
@@ -284,7 +284,7 @@ let results = join_all(futures).await;
 - [x] `FastExecutor`를 `AgentLoop` read-only batch 경로에 연결
 - [x] mutating/shell tools는 ordered tail로 분리
 - [x] TUI `SessionRuntime` 병렬 실행 연결
-  - Status: Wired for safe read/search batches. `SessionRuntime` now emits all starts before batch execution, records ordered tool results with original `tool_call_id`s, traces `parallel_tool_batch`, and keeps mutating/approval-gated tools ordered.
+  - Status: Wired for safe read/search batches, including mixed responses where consecutive read chunks precede ordered writes/approvals. `SessionRuntime` emits all starts before batch execution, records ordered tool results with original `tool_call_id`s, traces `parallel_tool_batch`, and keeps mutating/approval-gated tools ordered.
 
 ### Phase D: RTK (Retrieval Toolkit) 고도화
 

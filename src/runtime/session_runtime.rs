@@ -676,15 +676,40 @@ impl SessionRuntime {
             return Ok(ToolCallFlow::Continue);
         }
 
-        if self.can_parallelize_tool_batch(&prepared) {
-            for item in &prepared {
+        let mut index = 0usize;
+        while index < prepared.len() {
+            let batch_len = self.parallel_tool_batch_len(&prepared[index..]);
+            if batch_len > 1 {
+                let batch = &prepared[index..index + batch_len];
+                for item in batch {
+                    emit(RuntimeEvent::ToolCallStarted {
+                        execution: item.execution.clone(),
+                    });
+                }
+
+                let results = self.execute_parallel_tool_batch(batch).await?;
+                for (item, result) in batch.iter().zip(results.into_iter()) {
+                    self.store_tool_result_message(
+                        &item.call,
+                        &item.tool_name,
+                        item.id.clone(),
+                        &result,
+                    )
+                    .await?;
+                    emit(RuntimeEvent::ToolCallFinished {
+                        execution: item.execution.clone(),
+                        result,
+                    });
+                }
+                index += batch_len;
+                continue;
+            }
+
+            let item = &prepared[index];
+            if let Some(result) = self.scope_guard_result(&item.call, &item.tool_name) {
                 emit(RuntimeEvent::ToolCallStarted {
                     execution: item.execution.clone(),
                 });
-            }
-
-            let results = self.execute_parallel_tool_batch(&prepared).await?;
-            for (item, result) in prepared.iter().zip(results.into_iter()) {
                 self.store_tool_result_message(
                     &item.call,
                     &item.tool_name,
@@ -696,34 +721,20 @@ impl SessionRuntime {
                     execution: item.execution.clone(),
                     result,
                 });
-            }
-            return Ok(ToolCallFlow::Continue);
-        }
-
-        for item in prepared {
-            if let Some(result) = self.scope_guard_result(&item.call, &item.tool_name) {
-                emit(RuntimeEvent::ToolCallStarted {
-                    execution: item.execution.clone(),
-                });
-                self.store_tool_result_message(&item.call, &item.tool_name, item.id, &result)
-                    .await?;
-                emit(RuntimeEvent::ToolCallFinished {
-                    execution: item.execution,
-                    result,
-                });
+                index += 1;
                 continue;
             }
 
             if requires_tool_approval(self.autonomy, &item.call) {
                 let approval = ApprovalRequest {
                     id: Uuid::new_v4().to_string(),
-                    tool_name: item.tool_name,
+                    tool_name: item.tool_name.clone(),
                     summary: item.execution.summary.clone(),
-                    risk: item.risk,
+                    risk: item.risk.clone(),
                     status: ApprovalStatus::Pending,
                     created_at: Utc::now(),
                     tool_arguments: Some(serialize_tool_call(&item.call)?),
-                    tool_call_id: Some(item.id),
+                    tool_call_id: Some(item.id.clone()),
                 };
                 self.snapshot.approvals.push(approval.clone());
                 self.refresh_counts();
@@ -744,27 +755,33 @@ impl SessionRuntime {
             if let Some(event) = self.running_command_event(&result) {
                 emit(event);
             }
-            self.store_tool_result_message(&item.call, &item.tool_name, item.id, &result)
+            self.store_tool_result_message(&item.call, &item.tool_name, item.id.clone(), &result)
                 .await?;
             emit(RuntimeEvent::ToolCallFinished {
-                execution: item.execution,
+                execution: item.execution.clone(),
                 result,
             });
+            index += 1;
         }
 
         Ok(ToolCallFlow::Continue)
     }
 
-    fn can_parallelize_tool_batch(&self, prepared: &[PreparedToolCall]) -> bool {
-        prepared.len() > 1
-            && prepared.iter().all(|item| {
-                tool_can_run_in_parallel_batch(&item.call)
-                    && matches!(item.risk, RiskClass::SafeRead)
-                    && !requires_tool_approval(self.autonomy, &item.call)
-                    && self
-                        .scope_guard_result(&item.call, &item.tool_name)
-                        .is_none()
-            })
+    fn parallel_tool_batch_len(&self, prepared: &[PreparedToolCall]) -> usize {
+        let len = prepared
+            .iter()
+            .take_while(|item| self.can_parallelize_tool_item(item))
+            .count();
+        if len > 1 { len } else { 0 }
+    }
+
+    fn can_parallelize_tool_item(&self, item: &PreparedToolCall) -> bool {
+        tool_can_run_in_parallel_batch(&item.call)
+            && matches!(item.risk, RiskClass::SafeRead)
+            && !requires_tool_approval(self.autonomy, &item.call)
+            && self
+                .scope_guard_result(&item.call, &item.tool_name)
+                .is_none()
     }
 
     async fn execute_parallel_tool_batch(
@@ -4446,7 +4463,10 @@ tokio = "1.44"
         .await
         .unwrap();
 
-        let events = runtime.submit_input("Read then write src files").await.unwrap();
+        let events = runtime
+            .submit_input("Read then write src files")
+            .await
+            .unwrap();
 
         let tool_event_order = events
             .iter()

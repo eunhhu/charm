@@ -121,7 +121,7 @@ RUST_LOG=debug charm ...
 - 제한사항: 매크로, const/static, 고급 trait/generic 처리
 
 ### Fast Executor
-`tools/fast_executor.rs`는 `AgentLoop`와 TUI `SessionRuntime`의 read-only batch 경로에 연결되어 있습니다. TUI runtime은 safe read/search batch만 병렬 실행하고, start/finish event order, trace event, provider `tool_call_id` alignment를 보존합니다. Mutating, shell, approval-gated calls는 순차 실행을 유지합니다.
+`tools/fast_executor.rs`는 `AgentLoop`와 TUI `SessionRuntime`의 read-only batch 경로에 연결되어 있습니다. TUI runtime은 safe read/search batch와 mixed response 안의 consecutive read/search chunk만 병렬 실행하고, start/finish event order, trace event, provider `tool_call_id` alignment를 보존합니다. Mutating, shell, approval-gated calls는 순차 실행을 유지합니다.
 
 ## 기여 가이드라인
 

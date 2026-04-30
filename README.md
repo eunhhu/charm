@@ -307,7 +307,7 @@ rtk cargo test
 
 - **Rust 심볼 인덱싱**: 함수, 구조체, enum, impl 메서드 지원 (매크로, const/static, 고급 trait/generic 처리는 제한적)
 - **컴파일 워닝**: 다수의 unused variable/function 경고 존재
-- **Fast Executor**: `AgentLoop`와 TUI `SessionRuntime`의 독립 read-only batch 경로에 연결됨. TUI는 start/finish event ordering, trace, provider `tool_call_id` alignment를 보존하고, mutating/approval-gated tools는 순차 실행합니다.
+- **Fast Executor**: `AgentLoop`와 TUI `SessionRuntime`의 독립 read-only batch 경로에 연결됨. TUI는 mixed tool-call 응답에서도 consecutive read/search chunk를 병렬 실행하고, start/finish event ordering, trace, provider `tool_call_id` alignment를 보존하며 mutating/approval-gated tools는 순차 실행합니다.
 - **캐시 시스템**: `ToolCache`는 검색류 결과, `FileCache`는 persistent `read_range` 파일 읽기에 적용됩니다.
 - **Delegate 모드**: 실험적 기능
 
