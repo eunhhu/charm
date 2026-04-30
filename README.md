@@ -295,6 +295,7 @@ User task
 - **Read path cache**: `ToolRegistry`의 `read_range`는 `.charm/cache/file-cache.json` backed `FileCache`를 사용해 세션 간 반복 파일 읽기 비용을 줄입니다.
 - **Evidence browser**: `/evidence`, `/evidence repo`, `/evidence refs`가 저장된 세션 evidence/reference pack을 `.charm/sessions/<id>/`에서 읽어 요약합니다.
 - **Sub-agent export**: `/agent export <id>`가 sub-agent worktree status/diff/file snapshot을 `.charm/exports/` markdown artifact로 저장합니다.
+- **Sub-agent PR draft**: `/agent pr <id>`가 remote 인증 없이 검토 가능한 PR title/body/test plan markdown을 생성합니다.
 
 ### 빌드 상태 확인
 ```bash

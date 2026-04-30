@@ -1729,6 +1729,9 @@ impl SessionRuntime {
             ["/agent", "export", id] | ["/agents", "export", id] => {
                 Ok(Some(self.export_subagent_result(id)?))
             }
+            ["/agent", "pr", id] | ["/agents", "pr", id] => {
+                Ok(Some(self.draft_subagent_pr(id)?))
+            }
             ["/agent", "merge", id] | ["/agents", "merge", id] => {
                 Ok(Some(self.merge_subagent_result(id)?))
             }
@@ -2375,7 +2378,7 @@ impl SessionRuntime {
             ));
         }
         lines.push(
-            "Use /agent diff <id>, /agent export <id>, /agent merge <id>, /agent cleanup <id>, or /agent kill <id>."
+            "Use /agent diff <id>, /agent export <id>, /agent pr <id>, /agent merge <id>, /agent cleanup <id>, or /agent kill <id>."
                 .to_string(),
         );
         lines.join("\n")
@@ -2595,6 +2598,82 @@ impl SessionRuntime {
                     "Exported sub-agent {} review artifact to {}.",
                     short_id(&self.snapshot.background_jobs[index]),
                     export_path.display()
+                ),
+            },
+        ])
+    }
+
+    pub fn draft_subagent_pr(&mut self, id_prefix: &str) -> anyhow::Result<Vec<RuntimeEvent>> {
+        let Some(index) = self.find_subagent_job(id_prefix) else {
+            return Ok(vec![RuntimeEvent::MessageDelta {
+                role: "system".to_string(),
+                content: format!("No sub-agent matches '{id_prefix}'."),
+            }]);
+        };
+        let job = self.snapshot.background_jobs[index].clone();
+        let (worktree_path, changed_files) = self.subagent_worktree_details(&job)?;
+        let export_path = job
+            .metadata
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|metadata| metadata.get("export_path"))
+            .and_then(Value::as_str)
+            .unwrap_or("(not exported yet)");
+
+        let mut draft = String::new();
+        draft.push_str(&format!("# Pull Request Draft: {}\n\n", job.title));
+        draft.push_str("## Title\n\n");
+        draft.push_str(&job.title);
+        draft.push_str("\n\n## Summary\n\n");
+        draft.push_str(&format!("- {}\n", job.detail));
+        draft.push_str(&format!("- Sub-agent job: {}\n", job.id));
+        draft.push_str(&format!("- Source worktree: {}\n", worktree_path.display()));
+        draft.push_str(&format!("- Review artifact: {}\n", export_path));
+        draft.push_str("\n## Changed Files\n\n");
+        if changed_files.is_empty() {
+            draft.push_str("- (none)\n");
+        } else {
+            for rel in &changed_files {
+                draft.push_str(&format!("- `{rel}`\n"));
+            }
+        }
+        draft.push_str("\n## Test Plan\n\n");
+        draft.push_str("- Review the sub-agent export artifact before merging.\n");
+        draft.push_str("- Run the project verification commands after applying the changes.\n");
+        draft.push_str("\n## Notes\n\n");
+        draft.push_str(
+            "Generated locally by Charm. Create the remote PR only after reviewing and merging the isolated worktree changes.\n",
+        );
+
+        let export_dir = self.workspace_root.join(".charm").join("exports");
+        std::fs::create_dir_all(&export_dir)?;
+        let draft_path = export_dir.join(format!(
+            "subagent-{}-pr.md",
+            sanitize_export_filename(&job.id)
+        ));
+        std::fs::write(&draft_path, draft)?;
+
+        if let Some(metadata) = self.snapshot.background_jobs[index].metadata.as_mut()
+            && let Some(obj) = metadata.as_object_mut()
+        {
+            obj.insert(
+                "pr_draft_path".to_string(),
+                Value::String(draft_path.display().to_string()),
+            );
+            obj.insert(
+                "pr_drafted_at".to_string(),
+                Value::String(Utc::now().to_rfc3339()),
+            );
+        }
+        let job = self.snapshot.background_jobs[index].clone();
+        Ok(vec![
+            RuntimeEvent::BackgroundJobUpdated { job },
+            RuntimeEvent::MessageDelta {
+                role: "system".to_string(),
+                content: format!(
+                    "Wrote sub-agent PR draft for {} to {}.",
+                    short_id(&self.snapshot.background_jobs[index]),
+                    draft_path.display()
                 ),
             },
         ])
@@ -3420,6 +3499,7 @@ Slash commands
   /agent spawn <task>    Start a background sub-agent
   /agent list|diff <id>  Inspect sub-agent output
   /agent export <id>     Export sub-agent review artifact
+  /agent pr <id>         Write a local PR draft artifact
   /agent merge|cleanup <id>  Apply or remove sub-agent worktree
   /agent kill <id>      Cancel a sub-agent
   /approvals             Show pending approvals
@@ -3464,7 +3544,7 @@ Autonomy levels (see docs/charm-strategy.md § Autonomy Profiles)
 
 Coming soon
   • Auto model routing via `charm delegate` (Planner/Worker).
-  • Sub-agent result PR workflow.
+  • Remote GitHub PR publishing from reviewed sub-agent output.
 "#
     .to_string()
 }
@@ -6079,6 +6159,64 @@ tokio = "1.44"
         assert!(export.contains("export test"));
         assert!(export.contains("subagent-output.txt"));
         assert!(export.contains("ready to export"));
+    }
+
+    #[tokio::test]
+    async fn agent_pr_writes_pull_request_draft_for_subagent_result() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+        let model = fake_model(Vec::new());
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            model,
+        )
+        .await
+        .unwrap();
+
+        let worktree = create_test_worktree(dir.path(), "pr-job");
+        std::fs::write(worktree.join("subagent-output.txt"), "ready for pr").unwrap();
+        runtime.snapshot.background_jobs.push(BackgroundJob {
+            id: "pr-job-1234".to_string(),
+            title: "pr draft test".to_string(),
+            status: BackgroundJobStatus::Completed,
+            detail: "implemented isolated change".to_string(),
+            kind: BackgroundJobKind::SubAgent,
+            progress: Some(100),
+            metadata: Some(serde_json::json!({
+                "worktree_path": worktree,
+                "changed_files": ["subagent-output.txt"],
+                "export_path": "/tmp/subagent-export.md",
+                "turns": 2
+            })),
+        });
+
+        let events = runtime.submit_input("/agent pr pr-job").await.unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta { content, .. } if content.contains("Wrote sub-agent PR draft")
+        )));
+        let metadata = runtime.snapshot.background_jobs[0]
+            .metadata
+            .as_ref()
+            .unwrap();
+        let draft_path = metadata
+            .get("pr_draft_path")
+            .and_then(Value::as_str)
+            .expect("pr_draft_path");
+        let draft = std::fs::read_to_string(draft_path).unwrap();
+        assert!(draft.contains("pr draft test"));
+        assert!(draft.contains("implemented isolated change"));
+        assert!(draft.contains("subagent-output.txt"));
+        assert!(draft.contains("/tmp/subagent-export.md"));
     }
 
     #[tokio::test]
