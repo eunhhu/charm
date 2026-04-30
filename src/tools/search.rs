@@ -1,9 +1,18 @@
 use crate::core::{ToolResult, resolve_workspace_path};
 use serde_json::Value;
+use std::io::ErrorKind;
 use std::path::Path;
 use tokio::process::Command;
 
 pub async fn grep_search(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> {
+    grep_search_with_binary(args, cwd, "rg").await
+}
+
+async fn grep_search_with_binary(
+    args: Value,
+    cwd: &Path,
+    rg_binary: &str,
+) -> anyhow::Result<ToolResult> {
     let pattern = args["pattern"].as_str().unwrap_or("");
     let path_arg = args["path"].as_str().unwrap_or(".");
     let include = args["include"].as_str();
@@ -23,7 +32,7 @@ pub async fn grep_search(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> 
         }
     };
 
-    let mut cmd = Command::new("rg");
+    let mut cmd = Command::new(rg_binary);
     cmd.arg("-n")
         .arg("--color=never")
         .arg("-F")
@@ -33,7 +42,19 @@ pub async fn grep_search(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> 
         cmd.arg("-g").arg(inc);
     }
 
-    let output = cmd.output().await?;
+    let output = match cmd.output().await {
+        Ok(output) => output,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            let lines = fallback_grep_lines(pattern, &resolved, include)?;
+            return Ok(grep_result_from_lines(
+                lines,
+                output_mode,
+                path_arg,
+                &resolved,
+            ));
+        }
+        Err(err) => return Err(err.into()),
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     if !output.status.success() && stdout.is_empty() {
@@ -50,22 +71,55 @@ pub async fn grep_search(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> 
         });
     }
 
-    let lines: Vec<&str> = stdout.lines().filter(|line| !line.is_empty()).collect();
-    let matched_files: Vec<String> = lines
+    let lines: Vec<String> = stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(grep_result_from_lines(
+        lines,
+        output_mode,
+        path_arg,
+        &resolved,
+    ))
+}
+
+fn grep_result_from_lines(
+    lines: Vec<String>,
+    output_mode: &str,
+    path_arg: &str,
+    resolved: &Path,
+) -> ToolResult {
+    if lines.is_empty() {
+        return ToolResult {
+            success: true,
+            output: "(no matches)".to_string(),
+            error: None,
+            metadata: Some(serde_json::json!({
+                "search_path": path_arg,
+                "resolved_path": resolved.display().to_string(),
+                "match_count": 0,
+                "matched_files": []
+            })),
+        };
+    }
+
+    let mut matched_files: Vec<String> = lines
         .iter()
         .filter_map(|line| line.split(':').next())
         .map(|value| value.to_string())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
+    matched_files.sort();
 
     let result = match output_mode {
         "files_with_matches" => matched_files.join("\n"),
         "count" => lines.len().to_string(),
-        _ => stdout.to_string(),
+        _ => lines.join("\n"),
     };
 
-    Ok(ToolResult {
+    ToolResult {
         success: true,
         output: result,
         error: None,
@@ -75,7 +129,59 @@ pub async fn grep_search(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> 
             "match_count": lines.len(),
             "matched_files": matched_files
         })),
-    })
+    }
+}
+
+fn fallback_grep_lines(
+    pattern: &str,
+    resolved: &Path,
+    include: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    for entry in walkdir::WalkDir::new(resolved)
+        .into_iter()
+        .filter_entry(|entry| !is_skipped_search_dir(entry.path()))
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if !include_allows_path(path, resolved, include) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for (index, line) in content.lines().enumerate() {
+            if line.contains(pattern) {
+                lines.push(format!("{}:{}:{}", path.display(), index + 1, line));
+            }
+        }
+    }
+    Ok(lines)
+}
+
+fn is_skipped_search_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, ".git" | "target" | "node_modules"))
+}
+
+fn include_allows_path(path: &Path, root: &Path, include: Option<&str>) -> bool {
+    let Some(include) = include else {
+        return true;
+    };
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    glob_match(include, file_name) || glob_match(include, &rel)
 }
 
 pub async fn glob_search(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> {
@@ -170,4 +276,43 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     regex::Regex::new(&format!("^{}$", regex))
         .map(|re| re.is_match(name))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn grep_search_falls_back_when_rg_binary_is_missing() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src").join("main.rs"),
+            "fn panic_path() { panic!(\"boom\"); }\n",
+        )
+        .unwrap();
+
+        let result = grep_search_with_binary(
+            serde_json::json!({
+                "pattern": "panic_path",
+                "output_mode": "content"
+            }),
+            dir.path(),
+            "__missing_rg_for_test__",
+        )
+        .await
+        .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("src/main.rs:1:fn panic_path"));
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("match_count"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+    }
 }
