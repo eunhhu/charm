@@ -14,7 +14,7 @@ impl Indexer {
 
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
-            .filter_entry(|e| Self::should_visit(e))
+            .filter_entry(Self::should_visit)
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
@@ -49,11 +49,17 @@ impl Indexer {
     fn should_visit(entry: &walkdir::DirEntry) -> bool {
         let name = entry.file_name().to_string_lossy();
         if entry.file_type().is_dir() {
-            match name.as_ref() {
-                "node_modules" | ".git" | "target" | "dist" | "build" | "__pycache__" | ".venv"
-                | "venv" => false,
-                _ => true,
-            }
+            !matches!(
+                name.as_ref(),
+                "node_modules"
+                    | ".git"
+                    | "target"
+                    | "dist"
+                    | "build"
+                    | "__pycache__"
+                    | ".venv"
+                    | "venv"
+            )
         } else {
             true
         }
@@ -67,16 +73,6 @@ impl Indexer {
             "rs" => Some("rust".to_string()),
             _ => None,
         }
-    }
-
-    fn index_python(
-        path: &std::path::Path,
-        rel_path: &str,
-        index: &mut Index,
-    ) -> anyhow::Result<()> {
-        let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_python::LANGUAGE.into())?;
-        Self::index_python_with_parser(&mut parser, path, rel_path, index)
     }
 
     fn index_python_with_parser(
@@ -218,12 +214,6 @@ impl Indexer {
             }
         }
         None
-    }
-
-    fn index_js(path: &std::path::Path, rel_path: &str, index: &mut Index) -> anyhow::Result<()> {
-        let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_javascript::LANGUAGE.into())?;
-        Self::index_js_with_parser(&mut parser, path, rel_path, index)
     }
 
     fn index_js_with_parser(

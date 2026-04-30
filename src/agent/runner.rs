@@ -1,6 +1,6 @@
 use crate::agent::parser::ToolParser;
 use crate::agent::prompt::{AgentMode, PromptAssembler};
-use crate::core::{ProgressState, ToolCall, ToolResult, VerificationStatus, WorkspaceState};
+use crate::core::{ToolCall, ToolResult, WorkspaceState};
 use crate::harness::{
     SessionStore,
     session::{Session, SessionStatus},
@@ -19,7 +19,6 @@ pub struct AgentRunner {
     registry: ToolRegistry,
     assembler: PromptAssembler,
     workspace: WorkspaceState,
-    progress: ProgressState,
     tool_budget: usize,
     model: String,
     workspace_root: std::path::PathBuf,
@@ -54,13 +53,6 @@ impl AgentRunner {
                 .with_provider(&prompt_model_hint)
                 .with_mode(mode),
             workspace,
-            progress: ProgressState {
-                current_objective: String::new(),
-                active_substep: String::new(),
-                waiting_reason: None,
-                changed_files: Vec::new(),
-                verification_status: VerificationStatus::Pending,
-            },
             tool_budget: 20,
             model: request_model,
             workspace_root: workspace_root.to_path_buf(),

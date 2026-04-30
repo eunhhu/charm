@@ -294,6 +294,7 @@ User task
 - **Command lifecycle**: non-blocking command는 `poll_command`로 조회하고 `cancel_command`로 취소할 수 있습니다.
 - **Read path cache**: `ToolRegistry`의 `read_range`는 `.charm/cache/file-cache.json` backed `FileCache`를 사용해 세션 간 반복 파일 읽기 비용을 줄입니다.
 - **Evidence browser**: `/evidence`, `/evidence repo`, `/evidence refs`가 저장된 세션 evidence/reference pack을 `.charm/sessions/<id>/`에서 읽어 요약합니다.
+- **Audit insights**: `/audit insights [n]`가 반복 실패, missed context, missing reference risk를 trace에서 분석하고 candidate workflow/rule/memory를 제안합니다.
 - **Sub-agent export**: `/agent export <id>`가 sub-agent worktree status/diff/file snapshot을 `.charm/exports/` markdown artifact로 저장합니다.
 - **Sub-agent PR draft**: `/agent pr <id>`가 remote 인증 없이 검토 가능한 PR title/body/test plan markdown을 생성합니다.
 

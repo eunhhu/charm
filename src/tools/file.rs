@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::path::Path;
 use tokio::fs;
 
+#[allow(dead_code)]
 pub async fn read_range(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> {
     let file_path = args["file_path"].as_str().unwrap_or("");
     let offset = args["offset"].as_u64().map(|v| v as usize).unwrap_or(1);

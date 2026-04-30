@@ -24,6 +24,7 @@ async fn get_storage() -> Arc<Mutex<Vec<TrajectoryEntry>>> {
         .clone()
 }
 
+#[allow(dead_code)]
 pub async fn store_trajectory_entry(
     role: &str,
     content: &str,
@@ -96,7 +97,7 @@ pub async fn trajectory_search(args: Value) -> anyhow::Result<ToolResult> {
         } else {
             entry.content.clone()
         };
-        output.push_str(&format!("{}", preview));
+        output.push_str(&preview);
 
         if entry.tool_calls.is_some() || entry.tool_results.is_some() {
             output.push_str("\n[contains tool interactions]");

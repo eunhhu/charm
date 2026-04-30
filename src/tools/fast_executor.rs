@@ -413,37 +413,6 @@ fn system_time_from_unix_nanos(nanos: u128) -> SystemTime {
     UNIX_EPOCH + Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
 }
 
-/// Streaming tool result - don't wait for completion
-pub struct StreamingToolResult {
-    pub tool_name: String,
-    pub chunks: tokio::sync::mpsc::Receiver<Result<String, String>>,
-}
-
-impl StreamingToolResult {
-    pub async fn collect(self) -> ToolResult {
-        let mut output = String::new();
-        let mut error = None;
-
-        let mut receiver = self.chunks;
-        while let Some(chunk) = receiver.recv().await {
-            match chunk {
-                Ok(data) => output.push_str(&data),
-                Err(e) => {
-                    error = Some(e);
-                    break;
-                }
-            }
-        }
-
-        ToolResult {
-            success: error.is_none(),
-            output,
-            error,
-            metadata: None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

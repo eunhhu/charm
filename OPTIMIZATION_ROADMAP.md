@@ -46,9 +46,9 @@ TaskContract
 
 ## 현재 진행 요약
 
-- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, repeated-failure precedent gate, GitHub issue/discussion precedent provider, source-aware write/command-target scope guard, command cancel, persistent read-range FileCache, TokenSaver-backed `/compact`, slash audit/replay UI, `/evidence` persistent evidence browser, `/agent export` sub-agent review artifact, `/agent pr` local PR draft, TUI read-only parallel tool execution, mixed tool-call read-prefix scheduling, mutating tool scheduling barrier.
+- **완료/Wired**: TaskContract 생성, repo evidence 수집, ReferencePack 수집, PromptCompiler section rendering, TokenSaver minified trace, approval gate, repo evidence gate, verification gate, repeated-failure precedent gate, GitHub issue/discussion precedent provider, source-aware write/command-target scope guard, command cancel, persistent read-range FileCache, TokenSaver-backed `/compact`, slash audit/replay/insights UI, `/evidence` persistent evidence browser, `/agent export` sub-agent review artifact, `/agent pr` local PR draft, TUI read-only parallel tool execution, mixed tool-call read-prefix scheduling, mutating tool scheduling barrier, command full-log refs, provider prompt golden snapshots, compile warning cleanup.
 - **부분/Wired**: Context7/local package/registry/web reference provider, trace linkage, side-effect scope inference.
-- **남음**: optional remote GitHub PR publish, compile warning cleanup, provider별 prompt golden snapshot 확대.
+- **남음**: optional remote GitHub PR publish, Clippy pedantic warning cleanup, tokenizer/context budget 정확도, embedding index/background indexing.
 
 ## 제품 레이어 로드맵
 
@@ -166,7 +166,7 @@ pub struct MinifiedView {
 - [x] provider-specific rendering
   - Status: Scaffolded. provider hint 기반 rendering 시작점 있음.
 - [x] section snapshot tests
-  - Status: Basic tests present. provider별 golden snapshot 확대 필요.
+  - Status: Provider prompt golden snapshots cover Anthropic/OpenAI/Moonshot/Google/xAI/default, including current model-family resolver aliases such as OpenAI `o*`.
 
 ```rust
 pub struct PromptSection {
@@ -188,8 +188,10 @@ pub struct PromptSection {
   - Status: Partially Wired. turn_id 기반 trace와 verification update 존재. edit diff 단위 linkage 강화 필요.
 - [x] command output hash and full log ref
   - Status: Wired. blocking command, completed poll output, timeout output은 `.charm/logs/commands/<command_id>.log`에 full output을 저장하고 `ToolResult.metadata`에 `log_ref`, `output_hash`, `output_bytes`, `output_truncated`를 남김. 모델-facing output이 RTK/filter로 줄면 full log ref는 보존하고 `rendered_output_bytes`를 추가.
-- [ ] repeated failure / missed context / missing reference 분석
-- [ ] candidate rules, workflows, memories 제안
+- [x] repeated failure / missed context / missing reference 분석
+  - Status: Wired. `/audit insights [n]`가 trace를 분석해 반복 tool failure, policy block 기반 missed context, verification gap, reference event 부재 기반 missing reference risk를 표시.
+- [x] candidate rules, workflows, memories 제안
+  - Status: Wired. `/audit insights`가 repeated failure, repo evidence miss, verification gap, missing reference risk에 대해 candidate workflow/rule/memory를 제안.
 
 ## 성능 최적화 로드맵
 

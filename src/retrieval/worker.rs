@@ -92,44 +92,6 @@ impl RetrievalWorker {
         results
     }
 
-    fn parse_semantic_output(output: &str, query: &str) -> Vec<Evidence> {
-        let mut results = Vec::new();
-        let lines: Vec<&str> = output.lines().collect();
-        let mut i = 0;
-        while i < lines.len() {
-            let line = lines[i];
-            if line.starts_with('[') {
-                let parts: Vec<&str> = line.split("] ").collect();
-                if parts.len() >= 2 {
-                    let name_part = parts[1];
-                    let file_start = name_part
-                        .rfind(' ')
-                        .map(|p| &name_part[p + 1..])
-                        .unwrap_or(name_part);
-                    let rank = Self::score(query, line);
-                    let mut snippet = String::new();
-                    i += 1;
-                    while i < lines.len() && !lines[i].starts_with('[') {
-                        snippet.push_str(lines[i]);
-                        snippet.push('\n');
-                        i += 1;
-                    }
-                    results.push(Evidence {
-                        source: "semantic".to_string(),
-                        rank,
-                        file_path: file_start.to_string(),
-                        line: 0,
-                        snippet: snippet.trim().to_string(),
-                        context: None,
-                    });
-                    continue;
-                }
-            }
-            i += 1;
-        }
-        results
-    }
-
     fn score(query: &str, text: &str) -> f32 {
         let q = query.to_lowercase();
         let t = text.to_lowercase();

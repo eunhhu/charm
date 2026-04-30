@@ -1724,6 +1724,14 @@ impl SessionRuntime {
                 role: "assistant".to_string(),
                 content: self.render_audit_summary(50),
             }])),
+            ["/audit", "insights"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
+                role: "assistant".to_string(),
+                content: self.render_audit_insights(100),
+            }])),
+            ["/audit", "insights", limit] => Ok(Some(vec![RuntimeEvent::MessageDelta {
+                role: "assistant".to_string(),
+                content: self.render_audit_insights(parse_audit_limit(limit, 100)),
+            }])),
             ["/audit", "replay"] => Ok(Some(vec![RuntimeEvent::MessageDelta {
                 role: "assistant".to_string(),
                 content: self.render_audit_replay(20),
@@ -2039,6 +2047,83 @@ impl SessionRuntime {
         let mut lines = vec![format!("Trace Replay: last {} entries", entries.len())];
         for entry in entries {
             lines.push(format_trace_entry(&entry));
+        }
+        lines.join("\n")
+    }
+
+    fn render_audit_insights(&self, limit: usize) -> String {
+        let entries = match self.trace_store.read_recent(limit) {
+            Ok(entries) => entries,
+            Err(err) => return format!("Audit Insights unavailable: {err}"),
+        };
+        if entries.is_empty() {
+            return "Audit Insights: no trace entries for this session yet.".to_string();
+        }
+
+        let insights = analyze_trace_insights(&entries);
+        let mut lines = vec![format!("Audit Insights: {} trace entries", entries.len())];
+
+        if insights.repeated_failures.is_empty()
+            && insights.policy_blocks == 0
+            && insights.verification_gaps == 0
+            && !insights.missing_reference_risk
+        {
+            lines.push("No strong repeated-failure or missing-context signals.".to_string());
+            return lines.join("\n");
+        }
+
+        if !insights.repeated_failures.is_empty() {
+            lines.push("Repeated failures:".to_string());
+            for failure in &insights.repeated_failures {
+                let logs = if failure.log_refs.is_empty() {
+                    "logs=none".to_string()
+                } else {
+                    format!("logs={}", failure.log_refs.join(", "))
+                };
+                lines.push(format!(
+                    "  - {} x{}: {} ({})",
+                    failure.tool_name, failure.count, failure.signature, logs
+                ));
+            }
+        }
+
+        if insights.missing_reference_risk {
+            lines.push(format!(
+                "Missing reference risk: {} failed tool results, {} reference events.",
+                insights.failed_tools, insights.reference_events
+            ));
+        }
+        if insights.policy_blocks > 0 {
+            lines.push(format!(
+                "Missed context: {} policy block(s).",
+                insights.policy_blocks
+            ));
+        }
+        if insights.verification_gaps > 0 {
+            lines.push(format!(
+                "Verification gaps: {} completion claim(s) lacked verification.",
+                insights.verification_gaps
+            ));
+        }
+
+        let candidates = insights.candidates();
+        if !candidates.workflows.is_empty() {
+            lines.push("Candidate workflows:".to_string());
+            for item in candidates.workflows {
+                lines.push(format!("  - {item}"));
+            }
+        }
+        if !candidates.rules.is_empty() {
+            lines.push("Candidate rules:".to_string());
+            for item in candidates.rules {
+                lines.push(format!("  - {item}"));
+            }
+        }
+        if !candidates.memories.is_empty() {
+            lines.push("Candidate memories:".to_string());
+            for item in candidates.memories {
+                lines.push(format!("  - {item}"));
+            }
         }
         lines.join("\n")
     }
@@ -3130,6 +3215,161 @@ fn parse_audit_limit(raw: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+#[derive(Debug, Clone)]
+struct RepeatedFailureInsight {
+    tool_name: String,
+    signature: String,
+    count: usize,
+    log_refs: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct TraceInsights {
+    repeated_failures: Vec<RepeatedFailureInsight>,
+    failed_tools: usize,
+    policy_blocks: usize,
+    verification_gaps: usize,
+    reference_events: usize,
+    missing_reference_risk: bool,
+}
+
+#[derive(Debug, Default)]
+struct CandidateInsights {
+    workflows: Vec<String>,
+    rules: Vec<String>,
+    memories: Vec<String>,
+}
+
+impl TraceInsights {
+    fn candidates(&self) -> CandidateInsights {
+        let mut candidates = CandidateInsights::default();
+        if !self.repeated_failures.is_empty() {
+            candidates.workflows.push(
+                "After the same command fails twice, inspect the full log_ref and search precedents before retrying edits.".to_string(),
+            );
+        }
+        if self.policy_blocks > 0 {
+            candidates.rules.push(
+                "Before mutating files, gather repo evidence for the exact target scope."
+                    .to_string(),
+            );
+        }
+        if self.verification_gaps > 0 {
+            candidates.rules.push(
+                "Do not claim completion until the verification gate has observed a passing check."
+                    .to_string(),
+            );
+        }
+        if self.missing_reference_risk {
+            candidates.memories.push(
+                "Repeated tool/API failures should trigger a reference pack or external precedent search before another implementation attempt.".to_string(),
+            );
+        }
+        candidates
+    }
+}
+
+#[derive(Debug, Default)]
+struct FailureCluster {
+    tool_name: String,
+    signature: String,
+    count: usize,
+    log_refs: Vec<String>,
+}
+
+fn analyze_trace_insights(entries: &[TraceEntry]) -> TraceInsights {
+    let mut insights = TraceInsights::default();
+    let mut clusters = BTreeMap::<String, FailureCluster>::new();
+
+    for entry in entries {
+        match entry.event.as_str() {
+            "tool_result" => {
+                if !entry
+                    .payload
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+                {
+                    insights.failed_tools += 1;
+                    let tool_name = entry
+                        .payload
+                        .get("tool_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown_tool")
+                        .to_string();
+                    let signature = failure_signature_from_trace_payload(&entry.payload);
+                    let key = format!("{tool_name}\n{signature}");
+                    let cluster = clusters.entry(key).or_insert_with(|| FailureCluster {
+                        tool_name,
+                        signature,
+                        count: 0,
+                        log_refs: Vec::new(),
+                    });
+                    cluster.count += 1;
+                    if let Some(log_ref) = trace_payload_log_ref(&entry.payload)
+                        && !cluster.log_refs.iter().any(|existing| existing == log_ref)
+                    {
+                        cluster.log_refs.push(log_ref.to_string());
+                    }
+                }
+            }
+            "tool_policy_blocked" => insights.policy_blocks += 1,
+            "verification_gap" => insights.verification_gaps += 1,
+            "reference_gate" | "external_precedent_required" => insights.reference_events += 1,
+            _ => {}
+        }
+    }
+
+    insights.repeated_failures = clusters
+        .into_values()
+        .filter(|cluster| cluster.count >= 2)
+        .map(|cluster| RepeatedFailureInsight {
+            tool_name: cluster.tool_name,
+            signature: cluster.signature,
+            count: cluster.count,
+            log_refs: cluster.log_refs,
+        })
+        .collect();
+    insights.repeated_failures.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.tool_name.cmp(&b.tool_name))
+            .then_with(|| a.signature.cmp(&b.signature))
+    });
+    insights.missing_reference_risk = insights.failed_tools >= 2 && insights.reference_events == 0;
+    insights
+}
+
+fn failure_signature_from_trace_payload(payload: &Value) -> String {
+    ["error", "output", "minified_output"]
+        .iter()
+        .filter_map(|field| payload.get(field).and_then(Value::as_str))
+        .flat_map(str::lines)
+        .find_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed == "---stderr---" {
+                None
+            } else {
+                Some(truncate_for_prompt(trimmed, 180))
+            }
+        })
+        .or_else(|| {
+            payload
+                .get("metadata")
+                .and_then(|metadata| metadata.get("output_hash"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "unknown failure".to_string())
+}
+
+fn trace_payload_log_ref(payload: &Value) -> Option<&str> {
+    payload
+        .get("metadata")
+        .and_then(|metadata| metadata.get("log_ref"))
+        .and_then(Value::as_str)
+}
+
 fn format_trace_entry(entry: &TraceEntry) -> String {
     let turn = entry
         .turn_id
@@ -3598,6 +3838,7 @@ Slash commands
   /safe                  Shortcut: /autonomy conservative
   /compact               Roll old turns into a TokenSaver-backed summary
   /audit                 Show trace counts, policy blocks, and failures
+  /audit insights [n]    Analyze repeated failures and suggest rules/workflows
   /audit replay [n]      Replay recent trace events
   /evidence [repo|refs]  Browse persisted repo evidence and reference packs
   /clear                 Clear transcript (keep system prompt)
@@ -5462,6 +5703,72 @@ tokio = "1.44"
     }
 
     #[tokio::test]
+    async fn audit_insights_reports_repeated_failures_and_candidate_actions() {
+        let dir = tempdir().unwrap();
+        let (mut runtime, _) = SessionRuntime::bootstrap(
+            dir.path(),
+            "demo-model".to_string(),
+            "openrouter".to_string(),
+            InteractiveRequest {
+                prompt: None,
+                new_session: true,
+                continue_last: false,
+                session_id: None,
+            },
+            fake_model(Vec::new()),
+        )
+        .await
+        .unwrap();
+        for log_ref in [".charm/logs/commands/a.log", ".charm/logs/commands/b.log"] {
+            runtime
+                .trace(
+                    Some("turn-fail"),
+                    "tool_result",
+                    serde_json::json!({
+                        "tool_name": "run_command",
+                        "success": false,
+                        "error": "error[E0432]: unresolved import crate::missing",
+                        "metadata": {
+                            "log_ref": log_ref,
+                            "output_hash": "fnv1a64:abc"
+                        }
+                    }),
+                )
+                .unwrap();
+        }
+        runtime
+            .trace(
+                Some("turn-fail"),
+                "tool_policy_blocked",
+                serde_json::json!({
+                    "metadata": {"blocked_by": "repo_evidence_gate"}
+                }),
+            )
+            .unwrap();
+        runtime
+            .trace(
+                Some("turn-fail"),
+                "verification_gap",
+                serde_json::json!({"claim": "done"}),
+            )
+            .unwrap();
+
+        let events = runtime.submit_input("/audit insights").await.unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::MessageDelta { content, .. }
+                if content.contains("Audit Insights")
+                    && content.contains("Repeated failures")
+                    && content.contains("unresolved import")
+                    && content.contains(".charm/logs/commands/a.log")
+                    && content.contains("Missing reference risk")
+                    && content.contains("Candidate workflows")
+                    && content.contains("Candidate rules")
+        )));
+    }
+
+    #[tokio::test]
     async fn evidence_command_reads_persisted_session_evidence() {
         let dir = tempdir().unwrap();
         let (mut runtime, _) = SessionRuntime::bootstrap(
@@ -6703,16 +7010,6 @@ tokio = "1.44"
         Arc::new(FakeStreamingModel {
             chunks: std::sync::Mutex::new(chunks),
             fallback_message: None,
-        })
-    }
-
-    fn streaming_model_with_fallback(
-        chunks: Vec<StreamChunk>,
-        fallback: Message,
-    ) -> Arc<dyn RuntimeModel> {
-        Arc::new(FakeStreamingModel {
-            chunks: std::sync::Mutex::new(chunks),
-            fallback_message: Some(fallback),
         })
     }
 
