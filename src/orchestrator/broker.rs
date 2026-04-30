@@ -125,10 +125,10 @@ impl Broker {
     fn extract_files_changed(results: &[crate::core::ToolResult]) -> Vec<String> {
         let mut files = HashSet::new();
         for result in results {
-            if let Some(meta) = &result.metadata {
-                if let Some(fp) = meta.get("file_path").and_then(|v| v.as_str()) {
-                    files.insert(fp.to_string());
-                }
+            if let Some(meta) = &result.metadata
+                && let Some(fp) = meta.get("file_path").and_then(|v| v.as_str())
+            {
+                files.insert(fp.to_string());
             }
         }
         files.into_iter().collect()

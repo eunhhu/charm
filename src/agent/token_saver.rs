@@ -140,6 +140,12 @@ pub struct TokenSaver {
     seen_hashes: HashSet<u64>,
 }
 
+impl Default for TokenSaver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TokenSaver {
     pub fn new() -> Self {
         Self {
@@ -407,12 +413,11 @@ impl TokenSaver {
             }
         }
 
-        let mut omissions = Vec::new();
-        omissions.push(Omission {
+        let omissions = vec![Omission {
             kind: OmissionKind::RedundantContext,
             count: 0,
             description: "Elided prose, kept code examples".to_string(),
-        });
+        }];
 
         (code_blocks.join("\n\n"), Vec::new(), omissions)
     }

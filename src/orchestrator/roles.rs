@@ -68,10 +68,10 @@ Respond in JSON format:
     }
 
     fn extract_json(text: &str) -> String {
-        if let Some(start) = text.find('{') {
-            if let Some(end) = text.rfind('}') {
-                return text[start..=end].to_string();
-            }
+        if let Some(start) = text.find('{')
+            && let Some(end) = text.rfind('}')
+        {
+            return text[start..=end].to_string();
         }
         text.to_string()
     }
@@ -154,10 +154,10 @@ Rules:
     }
 
     fn extract_json(text: &str) -> String {
-        if let Some(start) = text.find('{') {
-            if let Some(end) = text.rfind('}') {
-                return text[start..=end].to_string();
-            }
+        if let Some(start) = text.find('{')
+            && let Some(end) = text.rfind('}')
+        {
+            return text[start..=end].to_string();
         }
         text.to_string()
     }
@@ -168,10 +168,10 @@ Rules:
             let after = &json[start + pattern.len()..];
             if let Some(colon) = after.find(':') {
                 let rest = &after[colon + 1..].trim_start();
-                if rest.starts_with('"') {
-                    if let Some(end) = rest[1..].find('"') {
-                        return Some(rest[1..end + 1].to_string());
-                    }
+                if rest.starts_with('"')
+                    && let Some(end) = rest[1..].find('"')
+                {
+                    return Some(rest[1..end + 1].to_string());
                 }
             }
         }

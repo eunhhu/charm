@@ -652,8 +652,10 @@ mod tests {
             DialogOption::new("b", "banana").category("fruit"),
             DialogOption::new("c", "carrot").category("veg"),
         ];
-        let mut state = DialogSelectState::default();
-        state.filter = "ap".to_string();
+        let state = DialogSelectState {
+            filter: "ap".to_string(),
+            ..Default::default()
+        };
         let (rows, filtered) = filter_and_flatten(&opts, &state, true);
         assert_eq!(filtered.len(), 1);
         assert_eq!(opts[filtered[0]].value, "a");

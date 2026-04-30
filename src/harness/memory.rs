@@ -44,24 +44,23 @@ impl MemoryStore {
                 (i, similarity)
             })
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            && score >= threshold
         {
-            if score >= threshold {
-                let existing = &self.entries[idx];
-                let merged =
-                    if existing.content.contains(content) || content.contains(&existing.content) {
-                        if existing.content.len() > content.len() {
-                            existing.content.clone()
-                        } else {
-                            content.to_string()
-                        }
+            let existing = &self.entries[idx];
+            let merged =
+                if existing.content.contains(content) || content.contains(&existing.content) {
+                    if existing.content.len() > content.len() {
+                        existing.content.clone()
                     } else {
-                        format!("{}\n\n--- updated ---\n\n{}", existing.content, content)
-                    };
-                let id = existing.id.clone();
-                self.entries[idx].content = merged;
-                self.entries[idx].created_at = chrono::Utc::now().to_rfc3339();
-                return id;
-            }
+                        content.to_string()
+                    }
+                } else {
+                    format!("{}\n\n--- updated ---\n\n{}", existing.content, content)
+                };
+            let id = existing.id.clone();
+            self.entries[idx].content = merged;
+            self.entries[idx].created_at = chrono::Utc::now().to_rfc3339();
+            return id;
         }
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -91,7 +90,7 @@ impl MemoryStore {
     pub fn get_approved(&self, scope: Option<&str>) -> Vec<&MemoryEntry> {
         self.entries
             .iter()
-            .filter(|e| e.approved && scope.map_or(true, |s| e.scope == s))
+            .filter(|e| e.approved && scope.is_none_or(|s| e.scope == s))
             .collect()
     }
 

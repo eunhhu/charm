@@ -32,11 +32,11 @@ impl ToolCache {
         let key = cache_key(tool, args);
         if self.store.contains_key(&key) {
             self.order.retain(|k| k != &key);
-        } else if self.order.len() >= self.capacity {
-            if let Some(oldest) = self.order.first().cloned() {
-                self.order.remove(0);
-                self.store.remove(&oldest);
-            }
+        } else if self.order.len() >= self.capacity
+            && let Some(oldest) = self.order.first().cloned()
+        {
+            self.order.remove(0);
+            self.store.remove(&oldest);
         }
         self.order.push(key.clone());
         self.store.insert(key, result);
@@ -51,5 +51,5 @@ impl ToolCache {
 }
 
 fn cache_key(tool: &str, args: &Value) -> String {
-    format!("{}:{}", tool, args.to_string())
+    format!("{}:{}", tool, args)
 }

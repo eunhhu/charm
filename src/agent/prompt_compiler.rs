@@ -148,6 +148,12 @@ pub struct PromptCompiler {
     default_budget: usize,
 }
 
+impl Default for PromptCompiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PromptCompiler {
     pub fn new() -> Self {
         Self {
@@ -362,6 +368,12 @@ pub struct PromptBuilder {
     compiler: PromptCompiler,
 }
 
+impl Default for PromptBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PromptBuilder {
     pub fn new() -> Self {
         Self {
@@ -514,8 +526,10 @@ mod tests {
             section_type: SectionType::SystemIdentity,
         });
 
-        let mut context = PromptContext::default();
-        context.token_budget_remaining = 100;
+        let context = PromptContext {
+            token_budget_remaining: 100,
+            ..Default::default()
+        };
 
         let compiled = compiler.compile(&context);
 

@@ -142,18 +142,18 @@ pub async fn write_file(args: Value, cwd: &Path) -> anyhow::Result<ToolResult> {
         }
     };
 
-    if let Some(parent) = resolved.parent() {
-        if let Err(e) = fs::create_dir_all(parent).await {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("{}", e)),
-                metadata: Some(serde_json::json!({
-                    "file_path": file_path,
-                    "resolved_path": resolved.display().to_string()
-                })),
-            });
-        }
+    if let Some(parent) = resolved.parent()
+        && let Err(e) = fs::create_dir_all(parent).await
+    {
+        return Ok(ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!("{}", e)),
+            metadata: Some(serde_json::json!({
+                "file_path": file_path,
+                "resolved_path": resolved.display().to_string()
+            })),
+        });
     }
 
     if let Err(e) = fs::write(&resolved, content).await {

@@ -230,10 +230,10 @@ impl OpenAiCompatibleClient {
                 if byte_buffer.last() == Some(&b'\r') {
                     byte_buffer.pop();
                 }
-                if let Ok(line) = std::str::from_utf8(&byte_buffer) {
-                    if let Some(Ok(stream_chunk)) = parse_sse_line(line) {
-                        let _ = tx.send(Ok(stream_chunk)).await;
-                    }
+                if let Ok(line) = std::str::from_utf8(&byte_buffer)
+                    && let Some(Ok(stream_chunk)) = parse_sse_line(line)
+                {
+                    let _ = tx.send(Ok(stream_chunk)).await;
                 }
             }
         });

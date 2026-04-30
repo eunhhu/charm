@@ -23,10 +23,10 @@ impl Indexer {
             let rel_str = rel.to_string_lossy().to_string();
 
             if let Some(lang) = Self::detect_language(path) {
-                if let Ok(metadata) = std::fs::metadata(path) {
-                    if metadata.len() > 1_000_000 {
-                        continue;
-                    }
+                if let Ok(metadata) = std::fs::metadata(path)
+                    && metadata.len() > 1_000_000
+                {
+                    continue;
                 }
 
                 match lang.as_str() {

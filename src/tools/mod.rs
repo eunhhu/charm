@@ -123,15 +123,14 @@ impl ToolRegistry {
             }
             "write_file" => {
                 let result = file::write_file(args, &self.cwd).await?;
-                if result.success {
-                    if let Some(path) = result
+                if result.success
+                    && let Some(path) = result
                         .metadata
                         .as_ref()
                         .and_then(|meta| meta.get("resolved_path"))
                         .and_then(|path| path.as_str())
-                    {
-                        self.file_cache.invalidate(Path::new(path));
-                    }
+                {
+                    self.file_cache.invalidate(Path::new(path));
                 }
                 Ok(result)
             }

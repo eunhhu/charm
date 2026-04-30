@@ -34,7 +34,7 @@ impl Spinner {
 }
 
 pub fn header(text: &str) -> String {
-    format!("\n{}", text.bold().underline().to_string())
+    format!("\n{}", text.bold().underline())
 }
 
 pub fn section(title: &str, content: &str) -> String {

@@ -122,7 +122,7 @@ impl CheckpointManager {
 
         let tree = commit.tree()?;
         self.repo.checkout_tree(
-            &tree.as_object(),
+            tree.as_object(),
             Some(git2::build::CheckoutBuilder::new().force()),
         )?;
         self.repo.set_head_detached(commit.id())?;

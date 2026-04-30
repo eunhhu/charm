@@ -240,12 +240,11 @@ impl AgentRunner {
                             if let Some(path) = meta.get("file_path").and_then(|v| v.as_str()) {
                                 self.touched_files.insert(path.to_string());
                             }
-                            if let Some(path) = meta.get("resolved_path").and_then(|v| v.as_str()) {
-                                if let Ok(rel) =
+                            if let Some(path) = meta.get("resolved_path").and_then(|v| v.as_str())
+                                && let Ok(rel) =
                                     std::path::Path::new(path).strip_prefix(&self.workspace_root)
-                                {
-                                    self.touched_files.insert(rel.to_string_lossy().to_string());
-                                }
+                            {
+                                self.touched_files.insert(rel.to_string_lossy().to_string());
                             }
                         }
                         tool_results.push((id, result.clone()));

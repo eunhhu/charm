@@ -149,6 +149,12 @@ pub struct ReferenceBroker {
     http_post: HttpPost,
 }
 
+impl Default for ReferenceBroker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReferenceBroker {
     pub fn new() -> Self {
         Self {
@@ -226,12 +232,12 @@ impl ReferenceBroker {
         let cache_key = format!("{}@{:?}", package.name, package.version);
 
         // Check cache first
-        if let Some(cached) = self.cache.get(&cache_key) {
-            if let Some(fetched_at) = cached.fetched_at {
-                let age = chrono::Utc::now().signed_duration_since(fetched_at);
-                if age.num_hours() < self.cache_ttl_hours as i64 {
-                    return Ok(cached.clone());
-                }
+        if let Some(cached) = self.cache.get(&cache_key)
+            && let Some(fetched_at) = cached.fetched_at
+        {
+            let age = chrono::Utc::now().signed_duration_since(fetched_at);
+            if age.num_hours() < self.cache_ttl_hours as i64 {
+                return Ok(cached.clone());
             }
         }
 
@@ -1200,7 +1206,7 @@ fn github_repo_from_url(raw: &str) -> Option<(String, String)> {
 
     let normalized = trimmed.strip_prefix("git+").unwrap_or(trimmed);
     let parsed = reqwest::Url::parse(normalized).ok()?;
-    if parsed.host_str()?.to_ascii_lowercase() != "github.com" {
+    if !parsed.host_str()?.eq_ignore_ascii_case("github.com") {
         return None;
     }
     let mut segments = parsed.path_segments()?;

@@ -27,6 +27,19 @@ pub struct PromptAssembler {
     provider_hint: String,
 }
 
+pub struct SessionPromptContext<'a> {
+    pub workspace: &'a WorkspaceState,
+    pub intent: RouterIntent,
+    pub autonomy: AutonomyLevel,
+    pub preflight: &'a WorkspacePreflight,
+    pub lsp: &'a LspSnapshot,
+    pub mcp: &'a McpSnapshot,
+    pub task_contract: Option<&'a TaskContract>,
+    pub verification: &'a VerificationState,
+    pub repo_evidence: &'a [Evidence],
+    pub reference_packs: &'a [ReferencePack],
+}
+
 impl PromptAssembler {
     pub fn new(workspace_root: &Path) -> Self {
         Self {
@@ -54,16 +67,16 @@ impl PromptAssembler {
         evidence: Vec<String>,
     ) -> String {
         let plan = self.plan_manager.load();
-        let mut parts = Vec::new();
-
-        parts.push(system_identity());
-        parts.push(communication_style());
-        parts.push(provider_specific_rules(&self.provider_hint));
-        parts.push(tool_calling_rules());
-        parts.push(making_code_changes_rules());
-        parts.push(debugging_rules());
-        parts.push(memory_rules());
-        parts.push(mode_rules(&self.mode));
+        let mut parts = vec![
+            system_identity(),
+            communication_style(),
+            provider_specific_rules(&self.provider_hint),
+            tool_calling_rules(),
+            making_code_changes_rules(),
+            debugging_rules(),
+            memory_rules(),
+            mode_rules(&self.mode),
+        ];
 
         let rules = RulesLoader::load_all(&self.workspace_root);
         if !rules.is_empty() {
@@ -109,29 +122,17 @@ impl PromptAssembler {
         parts.join("\n\n")
     }
 
-    pub fn assemble_session_system(
-        &self,
-        workspace: &WorkspaceState,
-        intent: RouterIntent,
-        autonomy: AutonomyLevel,
-        preflight: &WorkspacePreflight,
-        lsp: &LspSnapshot,
-        mcp: &McpSnapshot,
-        task_contract: Option<&TaskContract>,
-        verification: &VerificationState,
-        repo_evidence: &[Evidence],
-        reference_packs: &[ReferencePack],
-    ) -> String {
-        let mut parts = Vec::new();
-
-        parts.push(system_identity());
-        parts.push(communication_style());
-        parts.push(provider_specific_rules(&self.provider_hint));
-        parts.push(tool_calling_rules());
-        parts.push(making_code_changes_rules());
-        parts.push(debugging_rules());
-        parts.push(memory_rules());
-        parts.push(interactive_workflow_rules(intent, autonomy));
+    pub fn assemble_session_system(&self, context: SessionPromptContext<'_>) -> String {
+        let mut parts = vec![
+            system_identity(),
+            communication_style(),
+            provider_specific_rules(&self.provider_hint),
+            tool_calling_rules(),
+            making_code_changes_rules(),
+            debugging_rules(),
+            memory_rules(),
+            interactive_workflow_rules(context.intent, context.autonomy),
+        ];
 
         let rules = RulesLoader::load_all(&self.workspace_root);
         if !rules.is_empty() {
@@ -140,51 +141,56 @@ impl PromptAssembler {
 
         parts.push(format!(
             "## Workspace\n- Root: {}\n- Branch: {}\n- Dirty: {}\n",
-            workspace.root_path,
-            workspace.branch,
-            if workspace.dirty_files.is_empty() {
+            context.workspace.root_path,
+            context.workspace.branch,
+            if context.workspace.dirty_files.is_empty() {
                 "none".to_string()
             } else {
-                workspace.dirty_files.join(", ")
+                context.workspace.dirty_files.join(", ")
             }
         ));
 
         parts.push(format!(
             "## Preflight\n- Recent: {}\n- Suggested: {}\n",
-            preflight
+            context
+                .preflight
                 .recent_summary
                 .clone()
                 .unwrap_or_else(|| "none".to_string()),
-            if preflight.suggested_actions.is_empty() {
+            if context.preflight.suggested_actions.is_empty() {
                 "none".to_string()
             } else {
-                preflight.suggested_actions.join(" | ")
+                context.preflight.suggested_actions.join(" | ")
             }
         ));
 
         parts.push(format!(
             "## LSP\n- Ready: {}\n- Roots: {}\n- Diagnostics: {}\n- Symbols: {}\n- Servers: {}\n- Jumps: {}\n",
-            lsp.ready,
-            if lsp.active_roots.is_empty() {
+            context.lsp.ready,
+            if context.lsp.active_roots.is_empty() {
                 "none".to_string()
             } else {
-                lsp.active_roots.join(", ")
+                context.lsp.active_roots.join(", ")
             },
-            lsp.diagnostics.len(),
-            lsp.symbol_provider,
-            if lsp.servers.is_empty() {
+            context.lsp.diagnostics.len(),
+            context.lsp.symbol_provider,
+            if context.lsp.servers.is_empty() {
                 "none".to_string()
             } else {
-                lsp.servers
+                context
+                    .lsp
+                    .servers
                     .iter()
                     .map(|server| format!("{}:{}:{}", server.language, server.command, server.ready))
                     .collect::<Vec<_>>()
                     .join(", ")
             },
-            if lsp.symbol_jumps.is_empty() {
+            if context.lsp.symbol_jumps.is_empty() {
                 "none".to_string()
             } else {
-                lsp.symbol_jumps
+                context
+                    .lsp
+                    .symbol_jumps
                     .iter()
                     .take(5)
                     .map(|jump| format!("{}@{}:{}", jump.name, jump.file_path, jump.line))
@@ -195,11 +201,13 @@ impl PromptAssembler {
 
         parts.push(format!(
             "## MCP\n- Ready: {}\n- Servers: {}\n- Tools: {}\n",
-            mcp.ready,
-            if mcp.servers.is_empty() {
+            context.mcp.ready,
+            if context.mcp.servers.is_empty() {
                 "none".to_string()
             } else {
-                mcp.servers
+                context
+                    .mcp
+                    .servers
                     .iter()
                     .map(|server| {
                         format!(
@@ -210,18 +218,18 @@ impl PromptAssembler {
                     .collect::<Vec<_>>()
                     .join(", ")
             },
-            if mcp.tools.is_empty() {
+            if context.mcp.tools.is_empty() {
                 "none".to_string()
             } else {
-                mcp.tools.join(", ")
+                context.mcp.tools.join(", ")
             }
         ));
 
         parts.push(compiled_harness_rules(
-            task_contract,
-            verification,
-            repo_evidence,
-            reference_packs,
+            context.task_contract,
+            context.verification,
+            context.repo_evidence,
+            context.reference_packs,
         ));
 
         parts.join("\n\n")
@@ -527,18 +535,18 @@ mod tests {
             depth: ExecutionDepth::Deep,
         };
 
-        let prompt = assembler.assemble_session_system(
-            &workspace,
-            RouterIntent::Implement,
-            AutonomyLevel::Aggressive,
-            &WorkspacePreflight::default(),
-            &LspSnapshot::default(),
-            &McpSnapshot::default(),
-            Some(&contract),
-            &VerificationState::default(),
-            &[],
-            &[],
-        );
+        let prompt = assembler.assemble_session_system(SessionPromptContext {
+            workspace: &workspace,
+            intent: RouterIntent::Implement,
+            autonomy: AutonomyLevel::Aggressive,
+            preflight: &WorkspacePreflight::default(),
+            lsp: &LspSnapshot::default(),
+            mcp: &McpSnapshot::default(),
+            task_contract: Some(&contract),
+            verification: &VerificationState::default(),
+            repo_evidence: &[],
+            reference_packs: &[],
+        });
 
         assert!(prompt.contains("## Current Task Contract"));
         assert!(prompt.contains("characters omitted"));

@@ -47,6 +47,12 @@ pub enum ExecutionDepth {
 /// Concretizer that transforms vague requests into task contracts
 pub struct TaskConcretizer;
 
+impl Default for TaskConcretizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TaskConcretizer {
     pub fn new() -> Self {
         Self
@@ -488,7 +494,7 @@ mod tests {
         let request = "Refactor error handling";
         let score = TaskConcretizer::score_abstraction(request);
         assert!(
-            score >= 0.35 && score < 0.70,
+            (0.35..0.70).contains(&score),
             "Expected moderate score, got {}",
             score
         );

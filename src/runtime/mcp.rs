@@ -275,8 +275,8 @@ fn load_registry_checked(workspace_root: &Path) -> anyhow::Result<McpRegistry> {
 
     let raw = std::fs::read_to_string(&registry_path)
         .with_context(|| format!("failed to read {}", registry_path.display()))?;
-    Ok(serde_json::from_str::<McpRegistry>(&raw)
-        .with_context(|| format!("failed to parse {}", registry_path.display()))?)
+    serde_json::from_str::<McpRegistry>(&raw)
+        .with_context(|| format!("failed to parse {}", registry_path.display()))
 }
 
 async fn probe_tools(

@@ -70,7 +70,7 @@ pub fn parse_sse_line(line: &str) -> Option<Result<StreamChunk>> {
 
 pub fn parse_sse_stream(body: &str) -> Vec<StreamChunk> {
     body.lines()
-        .filter_map(|line| parse_sse_line(line))
+        .filter_map(parse_sse_line)
         .filter_map(|result| result.ok())
         .collect()
 }

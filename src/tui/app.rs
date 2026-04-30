@@ -34,24 +34,13 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
+#[derive(Default)]
 pub struct InputState {
     buffer: String,
     cursor: usize,
     history: Vec<String>,
     history_index: usize,
     saved_buffer: String,
-}
-
-impl Default for InputState {
-    fn default() -> Self {
-        Self {
-            buffer: String::new(),
-            cursor: 0,
-            history: Vec::new(),
-            history_index: 0,
-            saved_buffer: String::new(),
-        }
-    }
 }
 
 impl InputState {
@@ -1009,8 +998,8 @@ impl SessionApp {
                 ]));
                 if !execution.summary.is_empty() {
                     let summary_lines: Vec<&str> = execution.summary.lines().take(3).collect();
-                    for (i, line) in summary_lines.iter().enumerate() {
-                        let prefix = if i == 0 { " │ " } else { " │ " };
+                    for line in summary_lines {
+                        let prefix = " │ ";
                         self.transcript.push(Line::from(vec![
                             Span::styled(prefix, Style::default().fg(self.theme.dim)),
                             Span::styled(
@@ -1048,9 +1037,11 @@ impl SessionApp {
                         Style::default().fg(self.theme.dim),
                     ));
                 }
-                if !result.success && result.error.is_some() {
+                if !result.success
+                    && let Some(error) = result.error.as_ref()
+                {
                     spans.push(Span::styled(
-                        format!(" — {}", result.error.as_ref().unwrap()),
+                        format!(" — {error}"),
                         Style::default().fg(self.theme.error),
                     ));
                 }
@@ -1392,10 +1383,12 @@ pub fn run_session_tui(
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let mut app = SessionApp::default();
-    app.workspace_root = runtime.workspace_root().to_path_buf();
-    app.autonomy = runtime.autonomy();
-    app.current_model_display = runtime.model_display().to_string();
+    let mut app = SessionApp {
+        workspace_root: runtime.workspace_root().to_path_buf(),
+        autonomy: runtime.autonomy(),
+        current_model_display: runtime.model_display().to_string(),
+        ..Default::default()
+    };
     app.refresh_skills();
     app.apply_events(initial_events);
     rt.block_on(app.fetch_available_models());
@@ -1426,21 +1419,18 @@ fn run_loop(
     loop {
         app.tick_cursor();
         // Auto-dismiss toasts after ~2.5s.
-        if let Some((_, shown_at)) = &app.toast {
-            if shown_at.elapsed() > Duration::from_millis(2500) {
-                app.toast = None;
-            }
+        if let Some((_, shown_at)) = &app.toast
+            && shown_at.elapsed() > Duration::from_millis(2500)
+        {
+            app.toast = None;
         }
         terminal.draw(|frame| render(frame, app))?;
 
         while let Some(event) = bridge.try_recv() {
             match event {
                 AppEvent::Event(runtime_event) => {
-                    match &runtime_event {
-                        RuntimeEvent::StreamDone { .. } => {
-                            app.processing = false;
-                        }
-                        _ => {}
+                    if let RuntimeEvent::StreamDone { .. } = &runtime_event {
+                        app.processing = false;
                     }
                     app.apply_event(runtime_event);
                     app.auto_scroll = true;
@@ -1517,19 +1507,19 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut SessionApp) {
         MouseEventKind::Down(MouseButton::Left) => {
             if app.overlay.is_dialog_select() {
                 // Click on an option row selects and submits.
-                if let Some(layout) = &app.last_dialog_layout {
-                    if let Some(idx) = dialog::option_at_y(layout, mouse.row) {
-                        app.dialog_state.input_mode = InputMode::Mouse;
-                        // Find which position in the filtered list this
-                        // option occupies so "selected" stays in sync.
-                        let options = current_overlay_options(app);
-                        let state = &app.dialog_state;
-                        let (_, filtered) =
-                            dialog::filter_and_flatten(&options, state, current_overlay_flat(app));
-                        if let Some(pos) = filtered.iter().position(|i| *i == idx) {
-                            app.dialog_state.selected = pos;
-                            submit_overlay_selection(app);
-                        }
+                if let Some(layout) = &app.last_dialog_layout
+                    && let Some(idx) = dialog::option_at_y(layout, mouse.row)
+                {
+                    app.dialog_state.input_mode = InputMode::Mouse;
+                    // Find which position in the filtered list this
+                    // option occupies so "selected" stays in sync.
+                    let options = current_overlay_options(app);
+                    let state = &app.dialog_state;
+                    let (_, filtered) =
+                        dialog::filter_and_flatten(&options, state, current_overlay_flat(app));
+                    if let Some(pos) = filtered.iter().position(|i| *i == idx) {
+                        app.dialog_state.selected = pos;
+                        submit_overlay_selection(app);
                     }
                 }
             } else if inside(app.composer_area, mouse.column, mouse.row) {
@@ -1540,20 +1530,19 @@ fn handle_mouse_event(mouse: MouseEvent, app: &mut SessionApp) {
         MouseEventKind::Moved => {
             // Keep the mouse-mode flag sticky only while it's changing
             // selection on overlays.
-            if app.overlay.is_dialog_select() {
-                if let Some(layout) = &app.last_dialog_layout {
-                    if let Some(idx) = dialog::option_at_y(layout, mouse.row) {
-                        let options = current_overlay_options(app);
-                        let (_, filtered) = dialog::filter_and_flatten(
-                            &options,
-                            &app.dialog_state,
-                            current_overlay_flat(app),
-                        );
-                        if let Some(pos) = filtered.iter().position(|i| *i == idx) {
-                            app.dialog_state.selected = pos;
-                            app.dialog_state.input_mode = InputMode::Mouse;
-                        }
-                    }
+            if app.overlay.is_dialog_select()
+                && let Some(layout) = &app.last_dialog_layout
+                && let Some(idx) = dialog::option_at_y(layout, mouse.row)
+            {
+                let options = current_overlay_options(app);
+                let (_, filtered) = dialog::filter_and_flatten(
+                    &options,
+                    &app.dialog_state,
+                    current_overlay_flat(app),
+                );
+                if let Some(pos) = filtered.iter().position(|i| *i == idx) {
+                    app.dialog_state.selected = pos;
+                    app.dialog_state.input_mode = InputMode::Mouse;
                 }
             }
         }
@@ -1949,18 +1938,15 @@ fn key_char_is_uppercase(key: &KeyEvent) -> bool {
 /// Handle keystrokes while an overlay is active. Dialog overlays get a
 /// filter input + up/down navigation; Help is a static scroll.
 fn handle_overlay_key(key: KeyEvent, app: &mut SessionApp) -> anyhow::Result<bool> {
-    match key.code {
-        KeyCode::Esc => {
-            if app.overlay == Overlay::ProviderAuth {
-                app.provider_auth_input.clear();
-                app.provider_auth_provider.clear();
-            }
-            app.overlay = Overlay::None;
-            app.provider_filter = None;
-            app.dialog_state.reset();
-            return Ok(false);
+    if key.code == KeyCode::Esc {
+        if app.overlay == Overlay::ProviderAuth {
+            app.provider_auth_input.clear();
+            app.provider_auth_provider.clear();
         }
-        _ => {}
+        app.overlay = Overlay::None;
+        app.provider_filter = None;
+        app.dialog_state.reset();
+        return Ok(false);
     }
 
     if app.overlay == Overlay::ProviderAuth {
@@ -2256,7 +2242,7 @@ fn longest_common_prefix(strs: &[&str]) -> String {
             }
             end -= 1;
         }
-        while &first[..end] != &s[..end] {
+        while first[..end] != s[..end] {
             end -= 1;
             while end > 0 && (!first.is_char_boundary(end) || !s.is_char_boundary(end)) {
                 end -= 1;
@@ -3195,7 +3181,7 @@ fn wrap_single_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
                 }
                 remaining = &remaining[split_at..];
                 // Eat leading whitespace on continuation lines.
-                let trimmed = remaining.trim_start_matches(|c: char| c == ' ');
+                let trimmed = remaining.trim_start_matches(' ');
                 if trimmed.len() != remaining.len() && current_width >= width {
                     result.push(Line::from(std::mem::take(&mut current)));
                     current_width = 0;
@@ -4648,6 +4634,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::field_reassign_with_default)]
+
     use super::*;
     use crate::runtime::types::{ApprovalRequest, RuntimeEvent};
     use chrono::Utc;

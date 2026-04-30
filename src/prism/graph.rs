@@ -30,6 +30,12 @@ pub enum DependencyKind {
     Reference,
 }
 
+impl Default for DependencyGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DependencyGraph {
     pub fn new() -> Self {
         Self {
@@ -51,12 +57,12 @@ impl DependencyGraph {
 
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
-            .filter_entry(|e| Self::should_visit(e))
+            .filter_entry(Self::should_visit)
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
             let path = entry.path();
-            if let Some(rel) = path.strip_prefix(root).ok() {
+            if let Ok(rel) = path.strip_prefix(root) {
                 let rel_str = rel.to_string_lossy().to_string();
                 if let Ok(content) = std::fs::read_to_string(path) {
                     let node = Self::analyze_file(&rel_str, &content);
@@ -72,11 +78,18 @@ impl DependencyGraph {
     fn should_visit(entry: &walkdir::DirEntry) -> bool {
         let name = entry.file_name().to_string_lossy();
         if entry.file_type().is_dir() {
-            match name.as_ref() {
-                "node_modules" | ".git" | "target" | "dist" | "build" | "__pycache__" | ".venv"
-                | "venv" | ".charm" => false,
-                _ => true,
-            }
+            !matches!(
+                name.as_ref(),
+                "node_modules"
+                    | ".git"
+                    | "target"
+                    | "dist"
+                    | "build"
+                    | "__pycache__"
+                    | ".venv"
+                    | "venv"
+                    | ".charm"
+            )
         } else {
             true
         }
@@ -127,15 +140,15 @@ impl DependencyGraph {
                         symbols.push(name.to_string());
                     }
                 }
-            } else if line.starts_with("class ") {
-                if let Some(name) = line.split_whitespace().nth(1) {
-                    if let Some(end) = name.find('(') {
-                        symbols.push(name[..end].to_string());
-                    } else if let Some(end) = name.find(':') {
-                        symbols.push(name[..end].to_string());
-                    } else {
-                        symbols.push(name.to_string());
-                    }
+            } else if line.starts_with("class ")
+                && let Some(name) = line.split_whitespace().nth(1)
+            {
+                if let Some(end) = name.find('(') {
+                    symbols.push(name[..end].to_string());
+                } else if let Some(end) = name.find(':') {
+                    symbols.push(name[..end].to_string());
+                } else {
+                    symbols.push(name.to_string());
                 }
             }
         }
@@ -153,22 +166,22 @@ impl DependencyGraph {
                 imports.push(line.to_string());
             } else if line.starts_with("export ") {
                 exports.push(line.to_string());
-                if line.contains("function ") || line.contains("class ") {
-                    if let Some(name) = line.split_whitespace().last() {
-                        if let Some(end) = name.find('(') {
-                            symbols.push(name[..end].to_string());
-                        } else {
-                            symbols.push(name.to_string());
-                        }
-                    }
-                }
-            } else if line.starts_with("function ") || line.starts_with("class ") {
-                if let Some(name) = line.split_whitespace().nth(1) {
+                if (line.contains("function ") || line.contains("class "))
+                    && let Some(name) = line.split_whitespace().last()
+                {
                     if let Some(end) = name.find('(') {
                         symbols.push(name[..end].to_string());
                     } else {
                         symbols.push(name.to_string());
                     }
+                }
+            } else if (line.starts_with("function ") || line.starts_with("class "))
+                && let Some(name) = line.split_whitespace().nth(1)
+            {
+                if let Some(end) = name.find('(') {
+                    symbols.push(name[..end].to_string());
+                } else {
+                    symbols.push(name.to_string());
                 }
             }
         }
@@ -184,13 +197,13 @@ impl DependencyGraph {
             let line = line.trim();
             if line.starts_with("import ") {
                 imports.push(line.to_string());
-            } else if line.starts_with("func ") {
-                if let Some(name) = line.split_whitespace().nth(1) {
-                    if let Some(end) = name.find('(') {
-                        symbols.push(name[..end].to_string());
-                    } else {
-                        symbols.push(name.to_string());
-                    }
+            } else if line.starts_with("func ")
+                && let Some(name) = line.split_whitespace().nth(1)
+            {
+                if let Some(end) = name.find('(') {
+                    symbols.push(name[..end].to_string());
+                } else {
+                    symbols.push(name.to_string());
                 }
             }
         }
@@ -214,10 +227,10 @@ impl DependencyGraph {
                         symbols.push(name.to_string());
                     }
                 }
-            } else if line.starts_with("struct ") || line.starts_with("pub struct ") {
-                if let Some(name) = line.split_whitespace().nth(1) {
-                    symbols.push(name.to_string());
-                }
+            } else if (line.starts_with("struct ") || line.starts_with("pub struct "))
+                && let Some(name) = line.split_whitespace().nth(1)
+            {
+                symbols.push(name.to_string());
             }
         }
     }
@@ -250,7 +263,7 @@ impl DependencyGraph {
             .replace("\"", "");
 
         for path in paths {
-            let file_name = path.split('/').last().unwrap_or(path);
+            let file_name = path.split('/').next_back().unwrap_or(path);
             let file_stem = file_name.split('.').next().unwrap_or(file_name);
 
             if import_clean.contains(file_stem) {

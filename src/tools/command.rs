@@ -173,7 +173,7 @@ pub async fn run_command(args: Value, default_cwd: &Path) -> anyhow::Result<Tool
                         .status
                         .code()
                         .or(entry.exit_code)
-                        .or_else(|| if entry.cancelled { Some(130) } else { None });
+                        .or(if entry.cancelled { Some(130) } else { None });
                     entry.stdout = String::from_utf8_lossy(&out.stdout).to_string();
                     entry.stderr = String::from_utf8_lossy(&out.stderr).to_string();
                     if entry.cancelled && entry.stderr.is_empty() {

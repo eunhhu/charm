@@ -127,11 +127,11 @@ fn run_interactive_session(
     ))?;
     events.extend(prepared.initial_events);
 
-    if let Some(prompt) = auto_prompt {
-        if !prompt.trim().is_empty() {
-            let prompt_events = runtime.block_on(session_runtime.submit_input(&prompt))?;
-            events.extend(prompt_events);
-        }
+    if let Some(prompt) = auto_prompt
+        && !prompt.trim().is_empty()
+    {
+        let prompt_events = runtime.block_on(session_runtime.submit_input(&prompt))?;
+        events.extend(prompt_events);
     }
 
     charm::tui::app::run_session_tui(session_runtime, runtime, events)

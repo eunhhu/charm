@@ -150,20 +150,20 @@ pub async fn analyze_test_results(args: Value, _cwd: &Path) -> anyhow::Result<To
     // Simple parsing for common test output patterns
     for line in test_output.lines() {
         let line_lower = line.to_lowercase();
-        if line_lower.contains("test result: ok") || line_lower.contains("passed") {
-            if let Some(n) = extract_number_before(&line_lower, "passed") {
-                passed += n;
-            }
+        if (line_lower.contains("test result: ok") || line_lower.contains("passed"))
+            && let Some(n) = extract_number_before(&line_lower, "passed")
+        {
+            passed += n;
         }
-        if line_lower.contains("test result: failed") || line_lower.contains("failed") {
-            if let Some(n) = extract_number_before(&line_lower, "failed") {
-                failed += n;
-            }
+        if (line_lower.contains("test result: failed") || line_lower.contains("failed"))
+            && let Some(n) = extract_number_before(&line_lower, "failed")
+        {
+            failed += n;
         }
-        if line_lower.contains("skipped") {
-            if let Some(n) = extract_number_before(&line_lower, "skipped") {
-                skipped += n;
-            }
+        if line_lower.contains("skipped")
+            && let Some(n) = extract_number_before(&line_lower, "skipped")
+        {
+            skipped += n;
         }
     }
 

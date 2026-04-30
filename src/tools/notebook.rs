@@ -76,7 +76,7 @@ pub async fn read_notebook(args: Value, cwd: &Path) -> anyhow::Result<ToolResult
             }
         ));
         if idx < notebook.cells.len() - 1 {
-            output.push_str("\n");
+            output.push('\n');
         }
     }
 
@@ -121,13 +121,13 @@ pub async fn read_notebook_cell(args: Value, cwd: &Path) -> anyhow::Result<ToolR
         cell_index, cell.cell_type, cell.execution_count, source
     );
 
-    if let Some(ref outputs) = cell.outputs {
-        if !outputs.is_empty() {
-            output.push_str("\n\n--- Output ---\n");
-            for out in outputs {
-                if let Some(ref text) = out.text {
-                    output.push_str(&text.join(""));
-                }
+    if let Some(ref outputs) = cell.outputs
+        && !outputs.is_empty()
+    {
+        output.push_str("\n\n--- Output ---\n");
+        for out in outputs {
+            if let Some(ref text) = out.text {
+                output.push_str(&text.join(""));
             }
         }
     }

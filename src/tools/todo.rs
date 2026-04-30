@@ -9,20 +9,15 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum TodoStatus {
     #[serde(rename = "pending")]
+    #[default]
     Pending,
     #[serde(rename = "in_progress")]
     InProgress,
     #[serde(rename = "completed")]
     Completed,
-}
-
-impl Default for TodoStatus {
-    fn default() -> Self {
-        TodoStatus::Pending
-    }
 }
 
 impl std::fmt::Display for TodoStatus {

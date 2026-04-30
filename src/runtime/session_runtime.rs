@@ -9,7 +9,7 @@ use super::types::{
 use super::workspace::{build_preflight, collect_lsp_snapshot, refresh_lsp_snapshot};
 use crate::agent::context_compressor::ContextCompressor;
 use crate::agent::parser::{ParsedToolCall, ToolParser};
-use crate::agent::prompt::PromptAssembler;
+use crate::agent::prompt::{PromptAssembler, SessionPromptContext};
 use crate::agent::reference_broker::{
     FindingKind, PackageId, RawFinding, ReferenceBroker, ReferenceConfidence, ReferencePack,
     ReferenceSourceKind,
@@ -169,8 +169,6 @@ impl SessionRuntime {
                 Some(snapshot) => SessionSelection::Existing(snapshot.metadata),
                 None => SessionSelection::New,
             }
-        } else if request.continue_last {
-            store.smart_continue()?
         } else {
             store.smart_continue()?
         };
@@ -480,18 +478,20 @@ impl SessionRuntime {
     }
 
     fn refresh_system_prompt(&mut self) {
-        let system = self.prompt_assembler.assemble_session_system(
-            &self.workspace_state,
-            self.snapshot.metadata.router_intent,
-            self.autonomy,
-            &self.preflight,
-            &self.lsp,
-            &self.mcp,
-            self.snapshot.current_task_contract.as_ref(),
-            &self.snapshot.verification,
-            &self.snapshot.repo_evidence,
-            &self.snapshot.reference_packs,
-        );
+        let system = self
+            .prompt_assembler
+            .assemble_session_system(SessionPromptContext {
+                workspace: &self.workspace_state,
+                intent: self.snapshot.metadata.router_intent,
+                autonomy: self.autonomy,
+                preflight: &self.preflight,
+                lsp: &self.lsp,
+                mcp: &self.mcp,
+                task_contract: self.snapshot.current_task_contract.as_ref(),
+                verification: &self.snapshot.verification,
+                repo_evidence: &self.snapshot.repo_evidence,
+                reference_packs: &self.snapshot.reference_packs,
+            });
         self.snapshot.messages[0] = Message {
             role: "system".to_string(),
             content: Some(system),
@@ -1267,20 +1267,20 @@ impl SessionRuntime {
                 }),
             )?;
 
-            if let Some(content) = response.content.clone() {
-                if !content.trim().is_empty() {
-                    self.append_transcript("assistant", content.clone());
-                    events.push(RuntimeEvent::MessageDelta {
-                        role: "assistant".to_string(),
-                        content: content.clone(),
-                    });
-                    let has_tool_calls = response
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|calls| !calls.is_empty());
-                    if !has_tool_calls {
-                        events.extend(self.verification_gap_event(&content));
-                    }
+            if let Some(content) = response.content.clone()
+                && !content.trim().is_empty()
+            {
+                self.append_transcript("assistant", content.clone());
+                events.push(RuntimeEvent::MessageDelta {
+                    role: "assistant".to_string(),
+                    content: content.clone(),
+                });
+                let has_tool_calls = response
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty());
+                if !has_tool_calls {
+                    events.extend(self.verification_gap_event(&content));
                 }
             }
 
@@ -1379,15 +1379,15 @@ impl SessionRuntime {
                 match result {
                     Ok(chunk) => {
                         for choice in &chunk.choices {
-                            if let Some(ref content) = choice.delta.content {
-                                if !content.is_empty() {
-                                    accumulated_content.push_str(content);
-                                    let _ = event_tx.send(RuntimeEvent::StreamDelta {
-                                        role: "assistant".to_string(),
-                                        content: content.clone(),
-                                        model: chunk.model.clone(),
-                                    });
-                                }
+                            if let Some(ref content) = choice.delta.content
+                                && !content.is_empty()
+                            {
+                                accumulated_content.push_str(content);
+                                let _ = event_tx.send(RuntimeEvent::StreamDelta {
+                                    role: "assistant".to_string(),
+                                    content: content.clone(),
+                                    model: chunk.model.clone(),
+                                });
                             }
                         }
                         chunks.push(chunk);
@@ -1439,10 +1439,10 @@ impl SessionRuntime {
             )?;
 
             let assistant_content_for_gap = choice.message.content.clone();
-            if let Some(ref content) = assistant_content_for_gap {
-                if !content.trim().is_empty() {
-                    self.append_transcript("assistant", content.clone());
-                }
+            if let Some(ref content) = assistant_content_for_gap
+                && !content.trim().is_empty()
+            {
+                self.append_transcript("assistant", content.clone());
             }
 
             let all_tool_call_ids: Vec<String> = choice
@@ -1537,23 +1537,23 @@ impl SessionRuntime {
             }),
         )?;
 
-        if let Some(content) = response.content.clone() {
-            if !content.trim().is_empty() {
-                let _ = event_tx.send(RuntimeEvent::MessageDelta {
-                    role: "assistant".to_string(),
-                    content: content.clone(),
-                });
-                self.append_transcript("assistant", content.clone());
-                let has_tool_calls = response
-                    .tool_calls
-                    .as_ref()
-                    .is_some_and(|calls| !calls.is_empty());
-                let gap_event = (!has_tool_calls)
-                    .then(|| self.verification_gap_event(&content))
-                    .flatten();
-                if let Some(event) = gap_event {
-                    let _ = event_tx.send(event);
-                }
+        if let Some(content) = response.content.clone()
+            && !content.trim().is_empty()
+        {
+            let _ = event_tx.send(RuntimeEvent::MessageDelta {
+                role: "assistant".to_string(),
+                content: content.clone(),
+            });
+            self.append_transcript("assistant", content.clone());
+            let has_tool_calls = response
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty());
+            let gap_event = (!has_tool_calls)
+                .then(|| self.verification_gap_event(&content))
+                .flatten();
+            if let Some(event) = gap_event {
+                let _ = event_tx.send(event);
             }
         }
 
@@ -2502,18 +2502,16 @@ impl SessionRuntime {
             }))
         };
         let removed = ContextCompressor::compact_now(&mut self.snapshot.messages, 12);
-        if removed > 0 {
-            if let Some(minified) = minified_evidence.as_ref() {
-                if let Some(summary) = self
-                    .snapshot
-                    .messages
-                    .get_mut(1)
-                    .and_then(|message| message.content.as_mut())
-                {
-                    summary.push_str("\nTokenSaver evidence:\n");
-                    summary.push_str(&minified.text);
-                }
-            }
+        if removed > 0
+            && let Some(minified) = minified_evidence.as_ref()
+            && let Some(summary) = self
+                .snapshot
+                .messages
+                .get_mut(1)
+                .and_then(|message| message.content.as_mut())
+        {
+            summary.push_str("\nTokenSaver evidence:\n");
+            summary.push_str(&minified.text);
         }
         self.refresh_system_prompt();
         let after = self.snapshot.messages.len();

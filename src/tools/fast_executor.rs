@@ -279,14 +279,15 @@ impl FileCache {
         let metadata = tokio::fs::metadata(path).await?;
         let modified = metadata.modified()?;
 
-        if let Some(cached) = self.cache.get_mut(&key) {
-            if modified == cached.modified && metadata.len() == cached.len {
-                cached.access_count = cached.access_count.saturating_add(1);
-                return Ok(CachedRead {
-                    content: cached.content.clone(),
-                    cache_hit: true,
-                });
-            }
+        if let Some(cached) = self.cache.get_mut(&key)
+            && modified == cached.modified
+            && metadata.len() == cached.len
+        {
+            cached.access_count = cached.access_count.saturating_add(1);
+            return Ok(CachedRead {
+                content: cached.content.clone(),
+                cache_hit: true,
+            });
         }
         self.invalidate(path);
 

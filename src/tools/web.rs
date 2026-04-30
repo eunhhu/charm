@@ -162,10 +162,10 @@ pub async fn http_request(args: Value) -> anyhow::Result<ToolResult> {
     }
 
     // Add body for POST/PUT/PATCH
-    if let Some(body_str) = body {
-        if method == "POST" || method == "PUT" || method == "PATCH" {
-            request_builder = request_builder.body(body_str.to_string());
-        }
+    if let Some(body_str) = body
+        && (method == "POST" || method == "PUT" || method == "PATCH")
+    {
+        request_builder = request_builder.body(body_str.to_string());
     }
 
     let response = request_builder

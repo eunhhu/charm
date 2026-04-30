@@ -27,10 +27,10 @@ impl RetrievalWorker {
                 &self.cwd,
             )
             .await;
-            if let Ok(result) = grep_result {
-                if result.success {
-                    all_evidence.extend(Self::parse_grep_output(&result.output, q));
-                }
+            if let Ok(result) = grep_result
+                && result.success
+            {
+                all_evidence.extend(Self::parse_grep_output(&result.output, q));
             }
 
             if let Some(ref index) = self.index {
